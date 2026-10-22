@@ -2305,22 +2305,43 @@ class ResyncTest(PlexFixture):
         self.drain()
         self.assertEqual(self.read("Movies/Heathers (1989)/Heathers v2.mkv"), self.fake.parts[1203])
 
-    def test_changed_file_retry_never_gives_up_an_existing_copy(self):
-        self.copy("102")
+    def test_changed_file_retry_keeps_the_copy_for_resync(self):
         for mode in ("redownload", "recover"):
             with self.subTest(mode=mode):
-                rid = self.row("102")["id"]
-                self.store.transition(rid, lambda r: True, status="failed", mode=mode,
-                                      error=worker.CHANGED + ": test")
-                self.new_part(self.movie(102), 1302 if mode == "redownload" else 1402,
-                              file=f"/data/Media/Movies/Loose {mode}.mkv", size=125_000)
-                r = self.c.post(f"/api/jobs/{rid}/retry")
-                self.assertEqual(r.status_code, 409)
-                job = self.store.job(rid)
-                self.assertEqual((job["status"], job["dest_rel"]), ("cancelled", LOOSE))
-                self.assertTrue(os.path.isfile(self.m(LOOSE)))             # the old video is still there
-                self.assertIn(LOOSE, store_mod.owned(job))
-                self.store.transition(rid, lambda r: True, status="done", mode=None, error=None)
+                self.copy("102")
+                old = self.row("102")
+                if mode == "redownload":
+                    os.remove(self.m(LOOSE))
+                    self.apply("102", "102")
+                else:                                                  # a lost final rename
+                    shutil.copyfile(self.m(LOOSE), self.m(LOOSE) + paths.PART_SUFFIX)
+                    self.assertTrue(self.store.requeue_lost(old["id"]))
+                m = self.movie(102)
+                new = bytes((i * 7 + len(mode)) % 251 for i in range(m["size"] + 5_000))
+                self.fake.parts[m["part"]], m["size"] = new, len(new)  # Plex's file changes meanwhile
+                self.drain()
+                job = self.store.job(old["id"])
+                self.assertEqual((job["status"], job["mode"]), ("failed", mode))
+                self.assertTrue(job["error"].startswith(worker.CHANGED), job["error"])
+
+                r = self.c.post(f"/api/jobs/{old['id']}/retry")
+                self.assertEqual((r.status_code, r.json()["code"]), (409, "changed"))
+                job = self.store.job(old["id"])
+                self.assertEqual((job["status"], job["mode"], job["error"], job["dest_rel"]),
+                                 ("done", None, None, LOOSE))
+                self.assertEqual(self.store.status_map(["102"], "srv1"), {"102": "done"})   # no plain Copy offered
+                self.assertFalse(os.path.lexists(self.m(LOOSE) + paths.PART_SUFFIX))
+
+                self.assertEqual(self.kinds("102"), {"102": "upgraded"})
+                self.assertEqual(self.apply("102", "102").json()["upgrades"], 1)
+                self.drain()
+                self.assertEqual(self.store.job(old["id"])["status"], "removed")
+                done = self.row("102")
+                self.assertEqual((done["mode"], done["dest_rel"]), ("upgrade", LOOSE))
+                self.assertEqual(self.read(LOOSE), new)
+                self.assertEqual(self.check("102")["items"], [])
+                self.c.post(f"/api/jobs/{done['id']}/remove")
+                self.assertFalse(os.path.lexists(self.m(LOOSE)))
 
     # servers -----------------------------------------------------------------
     def test_jobs_of_another_server_wait(self):

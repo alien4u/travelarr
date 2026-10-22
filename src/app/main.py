@@ -386,9 +386,11 @@ def create_app(data_dir: str | None = None, media_root: str | None = None,
         if j["server_id"] and j["server_id"] != store.get("server_id"):
             return err(409, "This job belongs to another Plex server; select it first.", "other_server")
         if j["mode"] in ("redownload", "recover") and (j["error"] or "").startswith(CHANGED):
-            # an existing copy: replacing it with Plex's new file is a re-sync (download first,
-            # then retire the old copy), never a retry that gives the old file up first
-            if store.transition(job_id, lambda r: r["status"] == "failed", status="cancelled",
+            # an existing copy: it stays a copy, and replacing it with Plex's new file is a
+            # re-sync (download first, then retire the old copy), never a retry that gives it up first
+            if store.transition(job_id, lambda r: r["status"] == "failed" and r["mode"] in ("redownload", "recover")
+                                and (r["error"] or "").startswith(CHANGED),
+                                status="done", mode=None, error=None, bytes_done=int(j["size"]), validator=None,
                                 note="Plex changed the file; run Re-sync"):
                 dl.cleanup(job_id)
             return err(409, "Plex changed the file; run Re-sync to replace the copy safely", "changed")
