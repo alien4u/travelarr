@@ -1,0 +1,97 @@
+# Tests every change, then publishes ghcr.io/alien4u/travelarr:
+#   main      -> :latest (the only tag that moves; every main push runs, so the newest commit always publishes)
+#   tag vX.Y.Z -> :X.Y.Z (must match VERSION in src/app/main.py; never overwritten)
+name: image
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Whole runs per ref, one at a time. A newer push replaces a run still waiting, so on main the newest commit always
+# runs last, and the tip check below stops an older run from moving latest.
+concurrency:
+  group: image-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r src/requirements.txt -r src/requirements-dev.txt
+      - name: Unit tests
+        working-directory: src
+        run: python -m unittest discover -s tests -t .
+
+  image:
+    needs: test
+    # A manual run on any other branch or tag tests only.
+    if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    env:
+      IMAGE: ghcr.io/alien4u/travelarr
+    steps:
+      - uses: actions/checkout@v4
+      - name: Pick the tag
+        id: tag
+        run: |
+          version=$(sed -n 's/^VERSION = "\(.*\)"$/\1/p' src/app/main.py)
+          if [ -z "$version" ]; then echo "::error::VERSION not found in src/app/main.py"; exit 1; fi
+          if [ "$GITHUB_REF_TYPE" = tag ]; then
+            if [ "$GITHUB_REF_NAME" != "v$version" ]; then
+              echo "::error::tag $GITHUB_REF_NAME does not match VERSION $version"; exit 1
+            fi
+            echo "tag=$version" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=latest" >> "$GITHUB_OUTPUT"
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+      - name: Log in to GHCR
+        run: echo "$TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+        env:
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build
+        run: |
+          docker build --platform linux/amd64 \
+            --label org.opencontainers.image.revision="$GITHUB_SHA" \
+            --label org.opencontainers.image.version="${{ steps.tag.outputs.version }}" \
+            -t "$IMAGE:${{ steps.tag.outputs.tag }}" src
+      - name: Push
+        shell: bash
+        env:
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          tag="${{ steps.tag.outputs.tag }}"
+          if [ "$GITHUB_REF_TYPE" = tag ]; then
+            # 200: the version exists already, 404: free; anything else stops the release
+            bearer=$(curl -fsS -u "$GITHUB_ACTOR:$TOKEN" \
+              "https://ghcr.io/token?scope=repository:alien4u/travelarr:pull" | jq -r .token)
+            code=$(curl -sS -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $bearer" \
+              -H "Accept: application/vnd.oci.image.index.v1+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.docker.distribution.manifest.v2+json" \
+              "https://ghcr.io/v2/alien4u/travelarr/manifests/$tag")
+            case "$code" in
+              200) echo "::error::$IMAGE:$tag already exists; version tags are never overwritten"; exit 1 ;;
+              404) ;;
+              *) echo "::error::could not check whether $IMAGE:$tag exists (HTTP $code)"; exit 1 ;;
+            esac
+          else
+            tip=$(git ls-remote origin refs/heads/main | cut -f1)
+            if ! [[ "$tip" =~ ^[0-9a-f]{40}$ ]]; then
+              echo "::error::could not read the tip of main"; exit 1
+            fi
+            if [ "$tip" != "$GITHUB_SHA" ]; then
+              echo "main moved on to $tip; its own run publishes latest"; exit 0
+            fi
+          fi
+          docker push "$IMAGE:$tag"

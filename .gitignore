@@ -1,0 +1,13 @@
+# Local run data: the database holds the Plex sign-in. Never commit it.
+local/
+*.db
+*.db-wal
+*.db-shm
+*.db-journal
+*.sqlite*
+
+.venv/
+.idea/
+__pycache__/
+*.pyc
+.DS_Store

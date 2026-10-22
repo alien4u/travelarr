@@ -1,0 +1,1649 @@
+"""
+End-to-end: the real travelarr app (FastAPI + PlexGateway + Downloader)
+against a fake Plex server over real HTTP, writing to a temp media folder.
+
+Run:  python -m unittest discover -s tests -v
+"""
+import base64
+import contextlib
+import json
+import os
+import re
+import shutil
+import socket
+import sqlite3
+import sys
+import tempfile
+import threading
+import time
+import types
+import unittest
+import urllib.parse
+from unittest import mock
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+import requests  # noqa: E402
+import urllib3  # noqa: E402
+from fastapi.testclient import TestClient  # noqa: E402
+
+from app import paths, plexgw, worker  # noqa: E402
+from app import main as main_mod  # noqa: E402
+from app import store as store_mod  # noqa: E402
+from app.main import create_app  # noqa: E402
+from app.plexgw import PlexGateway  # noqa: E402
+
+HEAT = "Movies/Heat (1995)/Heat (1995).mkv"            # part 1001, 300,000 bytes, with subtitles
+LOOSE = "Movies/Loose Movie.mkv"                        # part 1002, 120,000 bytes
+from tests.fakeplex import TOKEN, FakeAccount, FakeConn, FakePlex  # noqa: E402
+
+
+class PlexFixture(unittest.TestCase):
+    """The real app on a fake Plex server, writing to a temp media folder."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="travelarr2-")
+        self.media = os.path.join(self.tmp, "media")
+        os.makedirs(os.path.join(self.media, "TV-Shows"))
+        os.makedirs(os.path.join(self.media, "Movies"))
+        self.fake = FakePlex()
+
+        def factory(store):
+            gw = PlexGateway(store, "test")
+            gw.plex_tv = self.fake.url
+            gw.account = lambda: FakeAccount(self.fake, gw.session)
+            return gw
+
+        self.app = create_app(data_dir=os.path.join(self.tmp, "config"), media_root=self.media,
+                              password="", gateway_factory=factory, start_worker=False)
+        self.store, self.gw, self.dl = self.app.state.store, self.app.state.gw, self.app.state.dl
+        self.dl.backoff = 0.01
+        self.dl.chunk = 16 * 1024
+        self.c = TestClient(self.app)
+        self.c.__enter__()
+
+    def tearDown(self):
+        self.c.__exit__(None, None, None)
+        self.fake.stop()
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    # helpers ---------------------------------------------------------------
+    def sign_in_and_connect(self):
+        self.assertFalse(self.c.get("/api/state").json()["signedIn"])
+        url = self.c.post("/api/auth/start").json()["url"]
+        self.assertIn("app.plex.tv/auth", url)
+        self.assertIn("code=abcd", url)
+        self.assertFalse(self.c.post("/api/auth/check").json()["signedIn"])  # not approved yet
+        self.assertTrue(self.c.post("/api/auth/check").json()["signedIn"])
+        srv = self.c.get("/api/servers").json()["servers"]
+        self.assertEqual(srv[0]["name"], "Home")
+        r = self.c.post("/api/server", json={"id": "srv1", "name": "Home"})
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(r.json()["conn"]["kind"], "local")
+
+    def drain(self):
+        while True:
+            job = self.store.next_queued()
+            if not job:
+                return
+            self.dl._process(job)
+
+    def m(self, rel):
+        return os.path.join(self.media, rel)
+
+    def connect(self):
+        return self.c.post("/api/connect")
+
+    def choose(self, **body):
+        return self.c.post("/api/server", json={"id": "srv1", "name": "Home", **body})
+
+    def hanging_port(self):
+        """A port that accepts TCP connections but never answers."""
+        s = socket.socket()
+        s.bind(("127.0.0.1", 0))
+        s.listen(8)
+        self.addCleanup(s.close)
+        return s, s.getsockname()[1]
+
+    def trickle_port(self, mode):
+        """A server that answers one byte at a time and never finishes, either inside
+        the headers or inside a declared body."""
+        srv = socket.socket()
+        srv.bind(("127.0.0.1", 0))
+        srv.listen(8)
+        stop = threading.Event()
+        head = b"HTTP/1.1 200 OK\r\n" if mode == "headers" else \
+            b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 1000\r\n\r\n"
+
+        def drip(c):
+            try:
+                c.sendall(head)
+                while not stop.is_set():
+                    c.sendall(b"x")
+                    time.sleep(0.1)
+            except OSError:
+                pass
+            finally:
+                c.close()
+
+        def serve():
+            while not stop.is_set():
+                try:
+                    c, _ = srv.accept()
+                except OSError:
+                    return
+                threading.Thread(target=drip, args=(c,), daemon=True).start()
+        threading.Thread(target=serve, daemon=True).start()
+        self.addCleanup(srv.close)
+        self.addCleanup(stop.set)
+        return srv.getsockname()[1]
+
+    @staticmethod
+    def refused_ports(n):
+        socks = [socket.socket() for _ in range(n)]
+        for s in socks:
+            s.bind(("127.0.0.1", 0))
+        ports = [s.getsockname()[1] for s in socks]
+        for s in socks:
+            s.close()
+        return ports
+
+    def token_requests(self, since=0):
+        return [r for r in self.fake.requests[since:]
+                if "X-Plex-Token" in r[1] or any(k.lower() == "x-plex-token" for k in r[2])]
+
+    @staticmethod
+    def slots_free(wait=5.0):
+        end = time.monotonic() + wait
+        while True:
+            got = 0
+            while got < 32 and plexgw._probe_slots.acquire(blocking=False):
+                got += 1
+            for _ in range(got):
+                plexgw._probe_slots.release()
+            if got == 32 or time.monotonic() > end:
+                return got == 32
+            time.sleep(0.1)
+
+
+class AppTest(PlexFixture):
+    def test_full_flow(self):
+        self.sign_in_and_connect()
+        st = self.c.get("/api/state").json()
+        self.assertEqual(st["user"], "alien")
+
+        libs = self.c.get("/api/libraries").json()["libraries"]
+        self.assertEqual([(l["key"], l["type"]) for l in libs], [("1", "movie"), ("2", "show")])
+
+        movies = self.c.get("/api/library/1?start=0&size=2").json()
+        self.assertEqual(movies["total"], 3)
+        self.assertEqual([i["title"] for i in movies["items"]], ["Heat", "Heathers"])
+        self.assertEqual(movies["items"][0]["size"], 300_000)
+        page2 = self.c.get("/api/library/1?start=2&size=2").json()
+        self.assertEqual([i["title"] for i in page2["items"]], ["Loose Movie"])
+        found = self.c.get("/api/library/1?q=heathers").json()
+        self.assertEqual([i["title"] for i in found["items"]], ["Heathers"])
+
+        wl = self.c.get("/api/watchlist").json()["items"]
+        self.assertEqual([(w["title"], w["inLibrary"]) for w in wl],
+                         [("Heat", True), ("Show A", True), ("Not Owned", False)])
+
+        show = self.c.get("/api/item/200").json()
+        self.assertEqual([s["index"] for s in show["seasons"]], [1, 2])
+        ep = show["seasons"][0]["episodes"][1]
+        self.assertEqual(ep["dest"], "TV-Shows/Show A/Season 01/Show A - S01E02 - Second.mkv")
+        self.assertFalse(ep["watched"])
+        self.assertTrue(show["seasons"][0]["episodes"][0]["watched"])
+
+        # Queue: the show (unwatched only) + Heat + a loose movie file
+        r = self.c.post("/api/queue", json={"keys": ["200"], "mode": "unwatched"}).json()
+        self.assertEqual(r["added"], 2)
+        r = self.c.post("/api/queue", json={"keys": ["101", "102"], "source": "watchlist"}).json()
+        self.assertEqual(r["added"], 2)
+        r = self.c.post("/api/queue", json={"keys": ["101", "202"]}).json()
+        self.assertEqual((r["added"], r["skipped"]), (0, 2))   # no duplicates
+        self.assertEqual(r["warning"], f"Everything selected is already on {self.dl.device} or in the queue.")
+
+        self.drain()
+
+        for v in self.fake.movies[:2] + self.fake.episodes[1:]:
+            rel = paths.dest_rel_for(v["file"], ["/data/Media/Movies", "/data/Media/TV-Shows"], "x")
+            with open(self.m(rel), "rb") as fh:
+                self.assertEqual(fh.read(), self.fake.parts[v["part"]], rel)
+        self.assertFalse(os.path.exists(self.m("TV-Shows/Show A/Season 01/Show A - S01E01 - Pilot.mkv")))
+        self.assertTrue(os.path.isfile(self.m("Movies/Loose Movie.mkv")))
+
+        # Subtitles: external text subs written with Infuse/Plex naming,
+        # embedded skipped, image-based skipped, fake XML body rejected.
+        heat = "Movies/Heat (1995)/Heat (1995)"
+        with open(self.m(heat + ".es.srt")) as fh:
+            self.assertIn("Hola", fh.read())
+        self.assertTrue(os.path.isfile(self.m(heat + ".en.forced.srt")))
+        self.assertFalse(os.path.exists(self.m(heat + ".de.srt")))
+        self.assertFalse(any(f.endswith(".fr.srt") for f in os.listdir(self.m("Movies/Heat (1995)"))))
+        self.assertTrue(os.path.isfile(self.m("TV-Shows/Show A/Season 01/Show A - S01E02 - Second.es.srt")))
+
+        hist = self.c.get("/api/jobs?view=history").json()["jobs"]
+        self.assertEqual(len(hist), 4)
+        self.assertTrue(all(j["status"] == "done" and j["finished_at"] for j in hist))
+        heat_job = next(j for j in hist if j["title"] == "Heat")
+        self.assertEqual((heat_job["subs_done"], heat_job["subs_total"]), (2, 4))
+        self.assertIn("image-based", heat_job["error"])
+        self.assertIn("not a subtitle", heat_job["error"])
+        self.assertEqual(heat_job["source"], "watchlist")
+        self.assertFalse([f for f in self._all_files() if f.endswith(paths.PART_SUFFIX)])
+
+        # Badges
+        movies = self.c.get("/api/library/1").json()["items"]
+        self.assertEqual({i["title"]: i.get("copy") for i in movies}["Heat"], "done")
+        shows = self.c.get("/api/library/2").json()["items"]
+        self.assertEqual(shows[0]["copy"]["done"], 2)
+
+        # Remove the show: files, its subs and now-empty folders go; roots and
+        # files travelarr did not create stay.
+        keep = self.m("TV-Shows/Show A/Season 01/notes-i-made.txt")
+        with open(keep, "w") as fh:
+            fh.write("mine")
+        r = self.c.post("/api/remove", json={"showKeys": ["200"]}).json()
+        self.assertEqual(r["results"], {"removed": 2})
+        self.assertFalse(os.path.exists(self.m("TV-Shows/Show A/Season 01/Show A - S01E02 - Second.mkv")))
+        self.assertFalse(os.path.exists(self.m("TV-Shows/Show A/Season 01/Show A - S01E02 - Second.es.srt")))
+        self.assertFalse(os.path.exists(self.m("TV-Shows/Show A/Season 02")))   # emptied, removed
+        self.assertTrue(os.path.isfile(keep))
+        self.assertTrue(os.path.isdir(self.m("TV-Shows")))
+
+        # Remove a loose movie: the Movies root must survive even though it is now empty-ish
+        self.c.post("/api/remove", json={"ratingKeys": ["102"]})
+        self.assertFalse(os.path.exists(self.m("Movies/Loose Movie.mkv")))
+        self.assertTrue(os.path.isdir(self.m("Movies")))
+
+        hist = self.c.get("/api/jobs?view=history").json()["jobs"]
+        removed = [j for j in hist if j["status"] == "removed"]
+        self.assertEqual(len(removed), 3)
+        self.assertTrue(all(j["removed_at"] for j in removed))
+
+        # Re-adding after removal is allowed and creates a new history row
+        r = self.c.post("/api/queue", json={"keys": ["102"]}).json()
+        self.assertEqual(r["added"], 1)
+
+        # Thumbnails are proxied and cached
+        r1 = self.c.get("/api/thumb?path=/library/metadata/101/thumb/1")
+        self.assertEqual(r1.status_code, 200)
+        self.assertTrue(r1.content.startswith(b"\xff\xd8"))
+        before = len(self.fake.requests)
+        self.c.get("/api/thumb?path=/library/metadata/101/thumb/1")
+        self.assertEqual(len(self.fake.requests), before)
+        self.assertEqual(self.c.get("/api/thumb?path=http://evil/x").status_code, 400)
+
+    def _all_files(self):
+        for root, _d, files in os.walk(self.media):
+            for f in files:
+                yield os.path.join(root, f)
+
+    def test_resume_after_dropped_connection(self):
+        self.sign_in_and_connect()
+        self.fake.drop_after[1001] = 100_000
+        self.c.post("/api/queue", json={"keys": ["101"]})
+        self.drain()
+        with open(self.m("Movies/Heat (1995)/Heat (1995).mkv"), "rb") as fh:
+            self.assertEqual(fh.read(), self.fake.parts[1001])
+        ranges = [r[2].get("Range") for r in self.fake.requests if "/library/parts/1001/" in r[1]]
+        self.assertEqual(ranges[0], None)
+        self.assertTrue(ranges[1] and ranges[1].startswith("bytes=") and ranges[1] != "bytes=0-", ranges)
+        self.assertEqual(self.store.jobs("history")[0]["status"], "done")
+
+    def test_server_ignoring_range_restarts_cleanly(self):
+        self.sign_in_and_connect()
+        self.fake.drop_after[1001] = 100_000
+        self.fake.ignore_range.add(1001)
+        self.c.post("/api/queue", json={"keys": ["101"]})
+        self.drain()
+        with open(self.m("Movies/Heat (1995)/Heat (1995).mkv"), "rb") as fh:
+            self.assertEqual(fh.read(), self.fake.parts[1001])
+
+    def test_xml_instead_of_file_fails_job(self):
+        self.sign_in_and_connect()
+        self.fake.xml_instead.add(1003)
+        self.c.post("/api/queue", json={"keys": ["103"]})
+        self.drain()
+        j = self.store.jobs("history")[0]
+        self.assertEqual(j["status"], "failed")
+        self.assertIn("instead of the file", j["error"])
+        self.assertFalse(os.path.exists(self.m("Movies/Heathers (1989)/Heathers (1989).mkv")))
+        # retry after the server is fixed
+        self.fake.xml_instead.clear()
+        self.c.post(f"/api/jobs/{j['id']}/retry")
+        self.drain()
+        self.assertEqual(self.store.job(j["id"])["status"], "done")
+
+    def test_show_with_selected_episodes_is_one_request(self):
+        self.sign_in_and_connect()
+        before = len(self.fake.requests)
+        r = self.c.post("/api/queue", json={"keys": ["200"], "mode": "all", "only": ["201", "203"]}).json()
+        self.assertEqual(r["added"], 2)
+        titles = sorted(j["title"] for j in self.store.jobs("active"))
+        self.assertEqual(titles, ["Pilot", "Third"])   # watched Pilot included because it was picked
+        meta = [x for x in self.fake.requests[before:] if "/library/metadata/" in x[1]]
+        self.assertEqual(len(meta), 2)                  # the show + its episode list, not one per episode
+
+    def test_cancel_removes_partial(self):
+        self.sign_in_and_connect()
+        self.c.post("/api/queue", json={"keys": ["101"]})
+        job = self.store.next_queued()
+        self.dl.cancel(job["id"])
+        self.dl._process(job)
+        self.assertEqual(self.store.job(job["id"])["status"], "cancelled")
+        self.assertFalse(os.path.exists(self.m("Movies/Heat (1995)/Heat (1995).mkv" + paths.PART_SUFFIX)))
+
+    def test_space_reserve_blocks_download(self):
+        self.sign_in_and_connect()
+        self.c.post("/api/settings", json={"reserveGb": 10 ** 7})
+        self.c.post("/api/queue", json={"keys": ["101"]})
+        self.drain()
+        j = self.store.jobs("history")[0]
+        self.assertEqual(j["status"], "failed")
+        self.assertIn("free space", j["error"])
+
+    def test_recently_added(self):
+        self.sign_in_and_connect()
+
+        def sorts_sent(since):
+            return {dict(urllib.parse.parse_qsl(urllib.parse.urlsplit(r[1]).query)).get("sort")
+                    for r in self.fake.requests[since:] if re.search(r"/library/sections/\d+/all", r[1])}
+        n = len(self.fake.requests)
+        d = self.c.get("/api/library/1?sort=recent").json()
+        self.assertEqual([(i["title"], i["addedAt"]) for i in d["items"]],    # Heat and Heathers tie: by title
+                         [("Loose Movie", 1_700_000_300), ("Heat", 1_700_000_200), ("Heathers", 1_700_000_200)])
+        self.assertEqual(d["total"], 3)
+        self.assertEqual(sorts_sent(n), {"addedAt:desc,titleSort"})
+        pages = [self.c.get(f"/api/library/1?sort=recent&start={s}&size=1").json()["items"] for s in range(3)]
+        self.assertEqual([p[0]["title"] for p in pages], ["Loose Movie", "Heat", "Heathers"])
+        found = self.c.get("/api/library/1?sort=recent&q=hea").json()["items"]
+        self.assertEqual([i["title"] for i in found], ["Heat", "Heathers"])
+
+        n = len(self.fake.requests)
+        show = self.c.get("/api/library/2?sort=recent").json()["items"][0]
+        self.assertEqual(sorts_sent(n), {"episode.addedAt:desc,titleSort"})   # newest episode, not the show
+        self.assertNotIn("addedAt", show)
+        n = len(self.fake.requests)
+        self.c.get("/api/library/2")
+        self.assertEqual(sorts_sent(n), {"titleSort"})
+
+        r = self.c.get("/api/library/1?sort=bogus")
+        self.assertEqual((r.status_code, r.json()["code"]), (400, "bad_request"))
+        self.assertEqual([i["title"] for i in self.c.get("/api/library/1").json()["items"]],
+                         ["Heat", "Heathers", "Loose Movie"])
+
+    def test_existing_identical_file_is_adopted(self):
+        self.sign_in_and_connect()
+        dest = self.m("Movies/Heathers (1989)/Heathers (1989).mkv")
+        os.makedirs(os.path.dirname(dest))
+        with open(dest, "wb") as fh:
+            fh.write(self.fake.parts[1003])
+        self.c.post("/api/queue", json={"keys": ["103"]})
+        self.drain()
+        j = self.store.jobs("history")[0]
+        self.assertEqual(j["status"], "done")
+        self.assertEqual(j["note"], worker.ADOPTED.format(self.dl.device))
+        self.assertFalse(any("/library/parts/1003/" in r[1] for r in self.fake.requests))
+
+    def test_unreachable_server_reports_not_ready(self):
+        self.sign_in_and_connect()
+        real = self.fake.url
+        self.fake.url = "http://127.0.0.1:9"   # nothing listens there
+        self.gw.invalidate()
+        r = self.c.get("/api/libraries")
+        self.assertEqual(r.status_code, 409)
+        self.assertIn("Cannot reach Home", r.json()["error"])
+        # within the cool-down window it answers fast without retrying
+        self.assertEqual(self.c.get("/api/watchlist").status_code, 409)
+        self.fake.url = real
+        self.assertEqual(self.c.post("/api/connect").status_code, 200)
+
+    def test_not_signed_in(self):
+        r = self.c.get("/api/libraries")
+        self.assertEqual(r.status_code, 409)
+        self.assertEqual(r.json()["code"], "not_ready")
+
+    def test_ui_is_served(self):
+        r = self.c.get("/")
+        self.assertEqual(r.status_code, 200)
+        self.assertIn("travelarr", r.text)
+        self.assertEqual(self.c.get("/static/app.js").status_code, 200)
+
+    # connection selection ----------------------------------------------------
+    def test_probes_never_send_the_token(self):
+        self.sign_in_and_connect()
+        probes = [r for r in self.fake.requests if r[1].startswith("/identity")]
+        self.assertTrue(probes)
+        self.assertFalse([r for r in self.token_requests() if r[1].startswith("/identity")])
+
+    def test_priority_fallback_to_remote(self):
+        self.sign_in_and_connect()
+        dead = self.refused_ports(1)[0]
+        self.fake.conns = [FakeConn(f"http://127.0.0.1:{dead}"), FakeConn(self.fake.url, local=False)]
+        conn = self.connect().json()["conn"]
+        self.assertEqual((conn["kind"], conn["url"]), ("remote", self.fake.url))
+
+    def test_fast_local_does_not_wait_for_slow_remote(self):
+        self.sign_in_and_connect()
+        hang, port = self.hanging_port()
+        self.fake.conns = [FakeConn(self.fake.url), FakeConn(f"http://127.0.0.1:{port}", local=False)]
+        t = time.monotonic()
+        conn = self.connect().json()["conn"]
+        self.assertLess(time.monotonic() - t, 1.5)
+        self.assertEqual(conn["kind"], "local")
+        hang.close()
+        self.assertTrue(self.slots_free())
+
+    def test_slow_local_waits_only_until_deadline(self):
+        self.sign_in_and_connect()
+        hang, port = self.hanging_port()
+        self.fake.conns = [FakeConn(f"http://127.0.0.1:{port}"), FakeConn(self.fake.url, local=False)]
+        with mock.patch.object(plexgw, "PROBE_READ", 30), mock.patch.object(plexgw, "PROBE_DEADLINE", 1.0):
+            t = time.monotonic()
+            conn = self.connect().json()["conn"]
+            elapsed = time.monotonic() - t
+        self.assertEqual(conn["kind"], "remote")
+        self.assertTrue(0.8 <= elapsed <= 2.5, elapsed)
+        hang.close()
+        self.assertTrue(self.slots_free())
+
+    def test_wrong_server_identity_is_rejected(self):
+        self.sign_in_and_connect()
+        self.fake.identity_id = "someone-else"
+        before = len(self.fake.requests)
+        r = self.connect()
+        self.assertEqual((r.status_code, r.json()["code"]), (409, "not_ready"))
+        self.assertEqual(self.token_requests(before), [])
+
+    def test_identity_redirect_and_oversized_body_are_rejected(self):
+        self.sign_in_and_connect()
+        self.fake.identity_redirect = True
+        self.assertEqual(self.connect().status_code, 409)
+        self.fake.identity_redirect = False
+        self.fake.identity_pad = 70_000
+        self.assertEqual(self.connect().status_code, 409)
+        self.fake.identity_pad = 0
+        self.assertEqual(self.connect().status_code, 200)
+
+    def test_transport_policy(self):
+        self.sign_in_and_connect()
+        self.fake.conns = [FakeConn("http://a:1"),
+                           FakeConn("https://b:2", local=False, httpuri="http://b:2")]
+        res = FakeAccount(self.fake, None).resources()[0]
+        self.assertEqual(PlexGateway._auto_candidates(res), ["https://b:2", "http://a:1", "http://b:2"])
+        self.fake.https_required = True
+        res = FakeAccount(self.fake, None).resources()[0]
+        self.assertEqual(PlexGateway._auto_candidates(res), ["https://b:2"])
+        # end to end: an https-only server with only http addresses is never contacted
+        self.fake.conns = None
+        before = len(self.fake.requests)
+        self.assertEqual(self.connect().status_code, 409)
+        self.assertEqual(len(self.fake.requests), before)
+
+    def test_fixed_address(self):
+        self.sign_in_and_connect()
+        port = self.fake.url.rsplit(":", 1)[1]
+        self.assertEqual(self.choose(preferredUrl=self.fake.url).json()["conn"]["kind"], "manual")
+        self.assertEqual(self.choose(preferredUrl=f"HTTP://127.0.0.1:{port}/").json()["conn"]["kind"], "manual")
+        for bad in (self.fake.url + "/library", self.fake.url + "?x=1", f"http://u:p@127.0.0.1:{port}",
+                    "http://127.0.0.1:99999"):
+            with self.assertLogs("travelarr.plex", "WARNING"):
+                self.assertEqual(self.choose(preferredUrl=bad).json()["conn"]["kind"], "local", bad)
+        self.fake.https_required = True
+        before = len(self.fake.requests)
+        with self.assertLogs("travelarr.plex", "WARNING"):
+            self.assertEqual(self.choose(preferredUrl=self.fake.url).status_code, 409)
+        self.assertEqual(self.token_requests(before), [])
+
+    def test_failure_after_probe_is_not_ready(self):
+        self.sign_in_and_connect()
+        self.fake.root_status = 500
+        r = self.connect()
+        self.assertEqual((r.status_code, r.json()["code"]), (409, "not_ready"))
+        self.assertIn("answered at", r.json()["error"])
+
+    def test_relay_never_gets_token_over_http(self):
+        self.sign_in_and_connect()
+        self.assertEqual(self.choose(allowRelay=True).status_code, 200)
+        dead = self.refused_ports(1)[0]
+        self.fake.conns = [FakeConn(f"http://127.0.0.1:{dead}"),
+                           FakeConn(self.fake.url, local=False, relay=True)]
+        before = len(self.fake.requests)
+        self.assertEqual(self.connect().status_code, 409)
+        self.assertEqual(self.token_requests(before), [])
+        self.fake.conns = [FakeConn("https://r1:8443", local=False, relay=True, httpuri="http://r1:8443"),
+                           FakeConn("http://r2:80", local=False, relay=True)]
+        res = FakeAccount(self.fake, None).resources()[0]
+        self.assertEqual(PlexGateway._relay_candidates(res), ["https://r1:8443"])
+
+    def test_fixed_address_never_logged_raw(self):
+        self.sign_in_and_connect()
+        with self.assertLogs("travelarr.plex", "WARNING") as cm:
+            r = self.choose(preferredUrl="https://user:s3cret@host.invalid:32400/p?token=abc#f")
+        self.assertEqual(r.json()["conn"]["kind"], "local")
+        out = "\n".join(cm.output)
+        for secret in ("s3cret", "user:", "token=abc", "/p?"):
+            self.assertNotIn(secret, out)
+        self.assertIn("https://host.invalid:32400", out)
+        with self.assertLogs("travelarr.plex", "WARNING") as cm:
+            self.assertEqual(self.choose(preferredUrl="not a url").json()["conn"]["kind"], "local")
+        self.assertIn("<unparseable address>", "\n".join(cm.output))
+        self.assertNotIn("not a url", "\n".join(cm.output))
+
+    def test_probe_saturation(self):
+        self.sign_in_and_connect()
+        self.assertTrue(self.slots_free())
+        held = 0
+        while plexgw._probe_slots.acquire(blocking=False):
+            held += 1
+        try:
+            before = len(self.fake.requests)
+            with self.assertLogs("travelarr.plex", "WARNING"):
+                r = self.connect()
+            self.assertEqual(r.status_code, 409)
+            self.assertIn("still pending", r.json()["error"])
+            self.assertEqual(len(self.fake.requests), before)
+        finally:
+            for _ in range(held):
+                plexgw._probe_slots.release()
+        self.assertEqual(self.connect().json()["conn"]["kind"], "local")
+
+    def test_redirects_keep_token_safe(self):
+        self.sign_in_and_connect()
+        other = FakePlex()
+        self.addCleanup(other.stop)
+        self.fake.redirect_to = other.url + "/library/sections"
+        self.gw.session.get(self.fake.url + "/redir", headers={"X-Plex-Token": TOKEN}, timeout=5)
+        self.assertTrue(other.requests)
+        self.assertFalse([r for r in other.requests if any(k.lower() == "x-plex-token" for k in r[2])])
+
+        def target(url, location):
+            r = requests.Response()
+            r.url, r.status_code = url, 302
+            r.headers["Location"] = location
+            return self.gw.session.get_redirect_target(r)
+        with self.assertLogs("travelarr.plex", "WARNING"):
+            self.assertIsNone(target("https://a.example/x", "http://a.example/y"))
+        self.assertEqual(target("https://a.example/x", "/y"), "/y")
+        self.assertEqual(target("https://a.example/x", "https://b.example/y"), "https://b.example/y")
+
+    def test_relay_candidate_cap(self):
+        self.sign_in_and_connect()
+        self.choose(allowRelay=True)
+        self.fake.conns = [FakeConn(f"https://127.0.0.1:{p}", local=False, relay=True)
+                           for p in self.refused_ports(5)]
+        calls, real = [], plexgw._identity
+
+        def spy(url, deadline, token=None):
+            if token:
+                calls.append(url)
+            return real(url, deadline, token)
+        with mock.patch.object(plexgw, "_identity", spy):
+            r = self.connect()
+        self.assertEqual(r.status_code, 409)
+        self.assertEqual(len(calls), 3)
+
+    def test_relay_wall_clock(self):
+        self.sign_in_and_connect()
+        self.choose(allowRelay=True)
+        hang, port = self.hanging_port()   # accepts TCP, never answers the TLS handshake
+        self.fake.conns = [FakeConn(f"https://127.0.0.1:{port}", local=False, relay=True)]
+        with mock.patch.object(plexgw, "RELAY_DEADLINE", 1.0):
+            t = time.monotonic()
+            r = self.connect()
+            elapsed = time.monotonic() - t
+        self.assertEqual(r.status_code, 409)
+        self.assertTrue(0.8 <= elapsed <= 2.5, elapsed)
+        self.assertTrue(self.slots_free(3))   # freed by the deadline, socket still open
+
+    def test_trickling_peer_cannot_hold_probe_slots(self):
+        self.sign_in_and_connect()
+        for mode in ("headers", "body"):
+            port = self.trickle_port(mode)
+            self.fake.conns = [FakeConn(f"http://127.0.0.1:{port}"), FakeConn(self.fake.url, local=False)]
+            with mock.patch.object(plexgw, "PROBE_DEADLINE", 1.0):
+                t = time.monotonic()
+                conn = self.connect().json()["conn"]
+                elapsed = time.monotonic() - t
+            self.assertEqual(conn["kind"], "remote", mode)
+            self.assertTrue(0.8 <= elapsed <= 2.5, (mode, elapsed))
+            self.assertTrue(self.slots_free(3), mode)   # the peer is still dripping
+
+    def test_probe_connect_shares_deadline_across_addresses(self):
+        class BlackHole:   # every connect attempt hangs for its whole timeout
+            def __init__(self, *a):
+                self.timeout = None
+
+            def settimeout(self, t):
+                self.timeout = t
+
+            def connect(self, addr):
+                time.sleep(self.timeout)
+                raise TimeoutError("timed out")
+
+            def close(self):
+                pass
+        five = [(socket.AF_INET, socket.SOCK_STREAM, 6, "", (f"10.0.0.{i}", 80)) for i in range(5)]
+        fake_socket = types.SimpleNamespace(getaddrinfo=lambda *a, **kw: five, socket=BlackHole,
+                                            SOCK_STREAM=socket.SOCK_STREAM, SHUT_RDWR=socket.SHUT_RDWR)
+        with mock.patch.object(plexgw, "socket", fake_socket):
+            t = time.monotonic()
+            self.assertIsNone(plexgw._identity("http://five.invalid", time.monotonic() + 1.0))
+        self.assertLess(time.monotonic() - t, 1.6)   # not 5 x PROBE_CONNECT
+
+    def test_relay_token_rejected_is_auth_error(self):
+        self.sign_in_and_connect()
+        self.choose(allowRelay=True)
+        self.fake.conns = [FakeConn("https://r1.invalid:8443", local=False, relay=True)]
+        with mock.patch.object(plexgw, "_identity", lambda url, deadline, token=None: plexgw._Rejected()):
+            r = self.connect()
+        self.assertEqual((r.status_code, r.json()["code"]), (409, "auth"))
+
+    def test_saturation_with_fixed_address(self):
+        self.sign_in_and_connect()
+        self.assertEqual(self.choose(preferredUrl=self.fake.url, allowRelay=True).json()["conn"]["kind"], "manual")
+        self.fake.conns = []
+        self.assertTrue(self.slots_free())
+        held = 0
+        while plexgw._probe_slots.acquire(blocking=False):
+            held += 1
+        try:
+            with self.assertLogs("travelarr.plex", "WARNING"):
+                r = self.connect()
+            self.assertIn("still pending", r.json()["error"])
+        finally:
+            for _ in range(held):
+                plexgw._probe_slots.release()
+        self.assertEqual(self.connect().json()["conn"]["kind"], "manual")
+
+
+class DownloadTest(PlexFixture):
+    """Live speed and resume robustness."""
+
+    def setUp(self):
+        super().setUp()
+        self.sign_in_and_connect()
+
+    def read(self, rel):
+        with open(self.m(rel), "rb") as fh:
+            return fh.read()
+
+    def part(self, rel):
+        return self.m(rel) + paths.PART_SUFFIX
+
+    def ranges(self, pid):
+        return [r[2].get("Range") for r in self.fake.requests if f"/library/parts/{pid}/" in r[1]]
+
+    def queue(self, rk):
+        self.c.post("/api/queue", json={"keys": [rk]})
+        return self.store.next_queued()["id"]
+
+    def retry(self, jid):
+        self.c.post(f"/api/jobs/{jid}/retry")
+        self.drain()
+
+    def fail_once_with_partial(self, rk="102", pid=1002, cut=100_000):
+        """A failed job holding a validated partial: one drop, no retries."""
+        jid = self.queue(rk)
+        self.fake.drop_after[pid] = cut
+        self.dl.max_attempts = 1
+        self.drain()
+        self.dl.max_attempts = worker.MAX_ATTEMPTS
+        j = self.store.job(jid)
+        self.assertEqual(j["status"], "failed")
+        self.assertGreater(j["bytes_done"], worker.OVERLAP)
+        return j
+
+    # speed -------------------------------------------------------------------
+    def test_rate_window(self):
+        clock = [1000.0]
+        job = {"id": 1, "kind": "movie", "title": "x", "year": None, "size": 100 << 20, "bytes_done": 0}
+        with mock.patch.object(worker.time, "monotonic", lambda: clock[0]):
+            dl = self.dl
+            dl._begin(job)
+            self.assertEqual(dl.snapshot()["speed"], 0.0)            # no time has passed yet
+            for _ in range(30):
+                clock[0] += 0.1
+                dl._note(1_000_000)
+            self.assertAlmostEqual(dl.snapshot()["speed"], 10_000_000, delta=500_000)
+            for _ in range(20):
+                clock[0] += 0.1
+                dl._note(1_000_000)
+            clock[0] += 2.5                                           # stalled for 2.5 s
+            self.assertTrue(2_500_000 <= dl.snapshot()["speed"] <= 7_500_000)
+            clock[0] += 3.0                                           # stalled longer than the window
+            self.assertEqual(dl.snapshot()["speed"], 0.0)
+            dl._begin(job)
+            for _ in range(40):                                       # 40 MiB in 0.4 s: shown, not "starting"
+                clock[0] += 0.01
+                dl._note(1 << 20)
+            self.assertGreater(dl.snapshot()["speed"], 0)
+            dl.current = None
+
+    def test_live_speed_and_states(self):
+        pid = 1002
+        data = bytes((i * 13) % 251 for i in range(6_000_000))
+        self.fake.parts[pid] = data
+        self.fake.movies[1]["size"] = len(data)
+        self.fake.rate[pid] = 1_000_000
+        self.fake.drop_after[pid] = 4_500_000
+        self.dl.backoff = 1.0
+        job = self.store.job(self.queue("102"))
+        self.dl.transitions.clear()
+        bad, seen, stop = [], [], threading.Event()
+
+        def poll():   # also the concurrency check: never an exception, always coherent
+            while not stop.is_set():
+                try:
+                    s = self.dl.snapshot()
+                except Exception as e:  # noqa: BLE001
+                    bad.append(repr(e))
+                    return
+                if s:
+                    if not (s["state"] in ("connecting", "downloading", "retrying", "finishing")
+                            and 0 <= s["bytes"] <= s["size"] and s["speed"] >= 0
+                            and (s["retry_in"] is not None) == (s["state"] == "retrying")):
+                        bad.append(s)
+                    seen.append((time.monotonic(), s))
+                time.sleep(0.01)
+        poller = threading.Thread(target=poll, daemon=True)
+        t0 = time.monotonic()
+        poller.start()
+        self.dl._process(job)
+        stop.set()
+        poller.join()
+        self.assertEqual(bad, [])
+        self.assertEqual(self.read(LOOSE), data)
+        mid = [s for t, s in seen if 2 <= t - t0 <= 4]
+        self.assertTrue(mid)
+        for s in mid:
+            self.assertEqual(s["state"], "downloading")
+            self.assertTrue(600_000 <= s["speed"] <= 1_400_000, s["speed"])
+        it = iter(self.dl.transitions)
+        want = ["connecting", "downloading", "retrying", "connecting", "downloading", "finishing"]
+        self.assertTrue(all(x in it for x in want), list(self.dl.transitions))
+        retrying = [s for _, s in seen if s["state"] == "retrying"]
+        self.assertTrue(retrying)
+        self.assertTrue(all(0 <= s["retry_in"] <= 1 for s in retrying))
+        speeds = [s["speed"] for s in retrying]
+        self.assertTrue(all(b <= a for a, b in zip(speeds, speeds[1:])), speeds)
+
+    # resume validation ---------------------------------------------------------
+    def test_resume_rejects_wrong_range(self):
+        self.fake.drop_after[1002] = 100_000
+        self.fake.bad_range_once.add(1002)
+        self.queue("102")
+        self.drain()
+        self.assertEqual(self.read(LOOSE), self.fake.parts[1002])
+        # refused before writing, then resumed at the same point: no damage to repair later
+        r = self.ranges(1002)
+        self.assertEqual(len(r), 3, r)
+        self.assertIsNone(r[0])
+        self.assertTrue(r[1] and r[1] == r[2], r)
+
+    def test_same_size_change_restarts_from_zero(self):
+        # changed only in the first 1000 bytes: the overlap check alone would not notice
+        new = bytes(b ^ 0xFF for b in self.fake.parts[1002][:1000]) + self.fake.parts[1002][1000:]
+        self.fake.drop_after[1002] = 100_000
+        self.fake.replace_on_drop[1002] = new
+        self.queue("102")
+        with self.assertLogs("travelarr.worker", "WARNING") as cm:
+            self.drain()
+        self.assertIn("again from the beginning", "\n".join(cm.output))
+        self.assertEqual(self.read(LOOSE), new)
+        self.assertEqual(self.ranges(1002)[-1], None)     # a fresh request after the ranged one
+
+    def test_changed_size_fails_then_retry_queues_again(self):
+        new = self.fake.parts[1002] + b"more"
+        self.fake.drop_after[1002] = 100_000
+        self.fake.replace_on_drop[1002] = new
+        jid = self.queue("102")
+        self.drain()
+        j = self.store.job(jid)
+        self.assertEqual(j["status"], "failed")
+        self.assertTrue(j["error"].startswith(worker.CHANGED), j["error"])
+        self.assertFalse(os.path.lexists(self.part(LOOSE)))
+        self.assertEqual((j["bytes_done"], j["validator"]), (0, None))
+        self.fake.movies[1]["size"] = len(new)            # what Plex now reports
+        self.assertEqual(self.c.post(f"/api/jobs/{jid}/retry").json()["requeued"], 1)
+        j = self.store.job(jid)
+        self.assertEqual((j["status"], j["note"]), ("cancelled", "queued again"))
+        self.drain()
+        self.assertEqual(self.read(LOOSE), new)
+
+    def test_416_on_resume_means_changed(self):
+        self.fake.drop_after[1002] = 100_000
+        self.fake.range_416.add(1002)
+        jid = self.queue("102")
+        self.drain()
+        self.assertTrue(self.store.job(jid)["error"].startswith(worker.CHANGED))
+        self.assertFalse(os.path.lexists(self.part(LOOSE)))
+
+    def test_recovered_drops_do_not_exhaust_retries(self):
+        self.fake.drop_every[1001] = 100_000
+        self.dl.max_attempts = 3
+        jid = self.queue("101")
+        self.drain()
+        self.assertEqual(self.store.job(jid)["status"], "done")
+        self.assertEqual(self.read(HEAT), self.fake.parts[1001])
+        self.assertGreater(len(self.ranges(1001)), 3)
+
+    def test_repeated_unvalidated_drops_give_up(self):
+        self.fake.no_etag.add(1002)
+        self.fake.drop_every[1002] = 100_000
+        self.dl.max_attempts = 3
+        jid = self.queue("102")
+        self.drain()
+        self.assertIn("gave up after 3 attempts", self.store.job(jid)["error"])
+        self.assertEqual(self.ranges(1002), [None, None, None])
+
+    def test_unvalidated_download_is_never_resumed(self):
+        self.fake.no_etag.add(1002)
+        self.fake.drop_after[1002] = 100_000
+        self.fake.weak_etag.add(1001)
+        self.fake.drop_after[1001] = 100_000
+        self.queue("102")
+        self.queue("101")
+        self.drain()
+        self.assertEqual(self.ranges(1002), [None, None])
+        self.assertEqual(self.ranges(1001), [None, None])
+        self.assertEqual(self.read(LOOSE), self.fake.parts[1002])
+        self.assertEqual(self.read(HEAT), self.fake.parts[1001])
+
+    def test_encoded_body_is_refused(self):
+        self.fake.encoding.add(1002)
+        jid = self.queue("102")
+        self.drain()
+        self.assertIn("encoded", self.store.job(jid)["error"])
+
+    def test_excess_body_never_grows_partial_past_size(self):
+        size = 120_000
+        self.fake.drop_after[1002] = 100_000
+        self.fake.extra_bytes[1002] = 5000
+        real = os.pwrite
+        over = []
+
+        def pwrite(fd, data, off):
+            if off + len(data) > size:
+                over.append((off, len(data)))
+            return real(fd, data, off)
+        self.queue("102")
+        with mock.patch.object(worker.os, "pwrite", pwrite), self.assertLogs("travelarr.worker", "INFO") as cm:
+            self.drain()
+        self.assertEqual(over, [])
+        self.assertIn("more data than", "\n".join(cm.output))
+        self.assertEqual(self.ranges(1002)[-1], f"bytes={size - worker.OVERLAP}-")
+        self.assertEqual(self.read(LOOSE), self.fake.parts[1002])
+
+    def test_short_writes_are_completed(self):
+        real = os.pwrite
+        self.queue("101")
+        with mock.patch.object(worker.os, "pwrite", lambda fd, data, off: real(fd, bytes(data[:1000]), off)):
+            self.drain()
+        self.assertEqual(self.read(HEAT), self.fake.parts[1001])
+
+    def test_unknown_size_is_learned_before_writing(self):
+        job = self.gw.plan(["102"])[0]
+        job["size"] = 0
+        self.store.add_jobs([job])
+        jid = self.store.next_queued()["id"]
+        order, sizes = [], []
+        real_update, real_pwrite, real_note = self.store.update, os.pwrite, self.dl._note
+
+        def update(i, **f):
+            if "size" in f:
+                order.append(("size", f["size"]))
+            return real_update(i, **f)
+
+        def pwrite(fd, data, off):
+            order.append(("write",))
+            return real_pwrite(fd, data, off)
+
+        def note(n):
+            real_note(n)
+            sizes.append(self.dl.snapshot()["size"])
+        with mock.patch.object(self.store, "update", update), mock.patch.object(worker.os, "pwrite", pwrite), \
+                mock.patch.object(self.dl, "_note", note):
+            self.drain()
+        self.assertEqual(order[0], ("size", 120_000))
+        self.assertTrue(sizes and all(s == 120_000 for s in sizes))
+        self.assertEqual(self.store.job(jid)["size"], 120_000)
+        self.assertEqual(self.read(LOOSE), self.fake.parts[1002])
+        # an answer that reveals no size at all
+        job = self.gw.plan(["103"])[0]
+        job["size"] = 0
+        self.store.add_jobs([job])
+        self.fake.no_length.add(1003)
+        self.drain()
+        self.assertIn("did not report the file size", self.store.jobs("history")[0]["error"])
+
+    # partial files on disk -----------------------------------------------------
+    def test_corrupt_tail_is_detected_on_resume(self):
+        j = self.fail_once_with_partial()
+        with open(self.part(LOOSE), "r+b") as fh:
+            fh.seek(j["bytes_done"] - 10)
+            b = fh.read(1)
+            fh.seek(-1, 1)
+            fh.write(bytes([b[0] ^ 0xFF]))
+        with self.assertLogs("travelarr.worker", "WARNING"):
+            self.retry(j["id"])
+        self.assertEqual(self.read(LOOSE), self.fake.parts[1002])
+
+    def test_unconfirmed_tail_is_discarded(self):
+        j = self.fail_once_with_partial()
+        with open(self.part(LOOSE), "ab") as fh:
+            fh.write(b"\0" * 5000)                  # what a power cut can leave past the last fsync
+        before = len(self.ranges(1002))
+        self.retry(j["id"])
+        self.assertEqual(self.ranges(1002)[before], f"bytes={j['bytes_done'] - worker.OVERLAP}-")
+        self.assertEqual(self.read(LOOSE), self.fake.parts[1002])
+
+    def test_complete_partial_is_verified_before_finalize(self):
+        jid = self.queue("102")
+        os.makedirs(os.path.dirname(self.part(LOOSE)), exist_ok=True)
+        with open(self.part(LOOSE), "wb") as fh:
+            fh.write(self.fake.parts[1002])
+        self.store.update(jid, bytes_done=120_000, validator=self.fake.validator(1002))
+        self.drain()
+        self.assertEqual(self.ranges(1002), [f"bytes={120_000 - worker.OVERLAP}-"])
+        self.assertEqual(self.store.job(jid)["status"], "done")
+        self.assertEqual(self.read(LOOSE), self.fake.parts[1002])
+
+    def test_complete_partial_with_bad_tail_restarts(self):
+        jid = self.queue("102")
+        os.makedirs(os.path.dirname(self.part(LOOSE)), exist_ok=True)
+        bad = bytearray(self.fake.parts[1002])
+        bad[-100] ^= 0xFF
+        with open(self.part(LOOSE), "wb") as fh:
+            fh.write(bad)
+        self.store.update(jid, bytes_done=120_000, validator=self.fake.validator(1002))
+        with self.assertLogs("travelarr.worker", "WARNING"):
+            self.drain()
+        self.assertEqual(self.ranges(1002), [f"bytes={120_000 - worker.OVERLAP}-", None])
+        self.assertEqual(self.read(LOOSE), self.fake.parts[1002])
+
+    def test_legacy_partial_is_not_trusted(self):
+        jid = self.queue("102")
+        os.makedirs(os.path.dirname(self.part(LOOSE)), exist_ok=True)
+        with open(self.part(LOOSE), "wb") as fh:
+            fh.write(self.fake.parts[1002][:80_000])
+        self.store.update(jid, bytes_done=80_000)      # written by a version without validators
+        self.drain()
+        self.assertEqual(self.ranges(1002), [None])
+        self.assertEqual(self.read(LOOSE), self.fake.parts[1002])
+
+    def test_old_database_gains_validator_column(self):
+        path = os.path.join(self.tmp, "old.db")
+        old = re.sub(r",\n\s*validator[^\n]*", "", store_mod.SCHEMA)
+        self.assertNotIn("validator", old)
+        db = sqlite3.connect(path)
+        db.executescript(old)
+        db.execute("INSERT INTO jobs(rating_key, kind, title, part_id, part_key, dest_rel, status) "
+                   "VALUES('1', 'movie', 't', 1, '/k', 'M/x.mkv', 'done')")
+        db.commit()
+        db.close()
+        s = store_mod.Store(path)
+        self.assertEqual((s.job(1)["title"], s.job(1)["validator"]), ("t", None))
+        s.close()
+        store_mod.Store(path).close()                   # a second open changes nothing
+
+    def test_lost_rename_is_found_at_startup(self):
+        jid = self.queue("102")
+        self.drain()
+        os.replace(self.m(LOOSE), self.part(LOOSE))     # the rename did not survive a power cut
+        self.dl._reconcile_done()
+        self.assertEqual(self.store.job(jid)["status"], "queued")
+        before = len(self.ranges(1002))
+        self.drain()
+        self.assertEqual(self.ranges(1002)[before:], [f"bytes={120_000 - worker.OVERLAP}-"])
+        self.assertEqual(self.read(LOOSE), self.fake.parts[1002])
+
+    def test_partial_wins_over_same_size_final(self):
+        j = self.fail_once_with_partial()
+        with open(self.m(LOOSE), "wb") as fh:
+            fh.write(b"x" * 120_000)                    # same name and size, other content
+        self.retry(j["id"])
+        self.assertNotEqual(self.store.job(j["id"])["note"], worker.ADOPTED.format(self.dl.device))
+        self.assertEqual(self.read(LOOSE), self.fake.parts[1002])
+
+    def test_stale_final_is_replaced_by_surviving_partial(self):
+        jid = self.queue("102")
+        self.drain()
+        os.replace(self.m(LOOSE), self.part(LOOSE))     # the completed partial survived a power cut...
+        with open(self.m(LOOSE), "wb") as fh:
+            fh.write(b"old" * 40_000)                   # ...and so did an older file at the final path
+        self.dl._reconcile_done()
+        self.assertEqual(self.store.job(jid)["status"], "queued")
+        self.drain()
+        self.assertEqual(self.read(LOOSE), self.fake.parts[1002])
+        self.assertFalse(os.path.lexists(self.part(LOOSE)))
+
+    def test_adopted_file_shows_complete_while_finishing(self):
+        os.makedirs(os.path.dirname(self.m(LOOSE)), exist_ok=True)
+        with open(self.m(LOOSE), "wb") as fh:
+            fh.write(self.fake.parts[1002])
+        seen, real = [], self.dl._subtitles
+
+        def subtitles(job):
+            seen.append(self.dl.snapshot())
+            return real(job)
+        self.queue("102")
+        with mock.patch.object(self.dl, "_subtitles", subtitles):
+            self.drain()
+        self.assertEqual((seen[0]["state"], seen[0]["bytes"], seen[0]["size"]), ("finishing", 120_000, 120_000))
+
+    def test_mixed_case_html_is_refused(self):
+        self.fake.content_type[1002] = "Text/HTML; charset=UTF-8"
+        jid = self.queue("102")
+        self.drain()
+        self.assertIn("instead of the file", self.store.job(jid)["error"])
+
+    def test_missing_length_on_known_size_means_changed(self):
+        self.fake.no_length.add(1002)
+        jid = self.queue("102")
+        self.drain()
+        j = self.store.job(jid)
+        self.assertTrue(j["error"].startswith(worker.CHANGED), j["error"])
+        self.assertFalse(os.path.lexists(self.part(LOOSE)))
+
+    def test_retry_reasons_are_short(self):
+        timeout = requests.ConnectionError(urllib3.exceptions.ReadTimeoutError(None, "/x", "Read timed out."))
+        self.assertEqual(worker._why(timeout), "Plex stopped sending data")
+        self.assertEqual(worker._why(requests.exceptions.ChunkedEncodingError("x")), "the connection dropped mid-file")
+        self.assertEqual(worker._why(requests.ConnectionError("stream ended early at 1 of 2 bytes")),
+                         "stream ended early at 1 of 2 bytes")
+
+    # durability ------------------------------------------------------------------
+    def test_fsync_before_progress_is_recorded(self):
+        events = []
+        real_fsync, real_pwrite, real_replace, real_update = os.fsync, os.pwrite, os.replace, self.store.update
+
+        def fsync(fd):
+            events.append(("fsync",))
+            return real_fsync(fd)
+
+        def pwrite(fd, data, off):
+            events.append(("write",))
+            return real_pwrite(fd, data, off)
+
+        def replace(a, b):
+            events.append(("replace",))
+            return real_replace(a, b)
+
+        def update(i, **f):
+            if f.get("bytes_done"):
+                events.append(("progress", f["bytes_done"]))
+            return real_update(i, **f)
+        self.fake.drop_after[1001] = 150_000
+        self.queue("101")
+        with mock.patch.object(worker, "CHECKPOINT_BYTES", 40_000), mock.patch.object(worker.os, "fsync", fsync), \
+                mock.patch.object(worker.os, "pwrite", pwrite), mock.patch.object(worker.os, "replace", replace), \
+                mock.patch.object(self.store, "update", update):
+            self.drain()
+        self.assertEqual(self.read(HEAT), self.fake.parts[1001])
+        dirty, progress = False, 0
+        for e in events:
+            if e[0] == "write":
+                dirty = True
+            elif e[0] == "fsync":
+                dirty = False
+            else:
+                self.assertFalse(dirty, e)
+                progress += e[0] == "progress"
+        self.assertGreaterEqual(progress, 3)
+        self.assertIn(("replace",), events)
+
+    def test_fsync_failure_keeps_last_confirmed_progress(self):
+        calls, real = [0], os.fsync
+
+        def fsync(fd):
+            calls[0] += 1
+            if calls[0] == 2:
+                raise OSError(5, "I/O error")
+            return real(fd)
+        jid = self.queue("101")
+        with mock.patch.object(worker, "CHECKPOINT_BYTES", 40_000), mock.patch.object(worker.os, "fsync", fsync):
+            self.drain()
+        j = self.store.job(jid)
+        self.assertEqual(j["status"], "failed")
+        self.assertIn("could not confirm data on disk", j["error"])
+        self.assertTrue(0 < j["bytes_done"] <= 40_000 + self.dl.chunk)     # the first checkpoint
+        self.assertTrue(os.path.exists(self.part(HEAT)))
+        self.retry(jid)
+        self.assertEqual(self.read(HEAT), self.fake.parts[1001])
+
+    def test_progress_store_failure_is_sticky(self):
+        n, later, real = [0], [], self.store.update
+
+        def update(i, **f):
+            if f.get("bytes_done"):
+                n[0] += 1
+                if n[0] == 2:
+                    raise sqlite3.OperationalError("disk I/O error")
+                if n[0] > 2:
+                    later.append(f)
+            return real(i, **f)
+        jid = self.queue("101")
+        with mock.patch.object(worker, "CHECKPOINT_BYTES", 40_000), mock.patch.object(self.store, "update", update):
+            self.drain()
+        j = self.store.job(jid)
+        self.assertIn("could not record progress", j["error"])
+        self.assertTrue(0 < j["bytes_done"] <= 40_000 + self.dl.chunk)
+        self.assertEqual(later, [])
+        self.retry(jid)
+        self.assertEqual(self.read(HEAT), self.fake.parts[1001])
+
+    def test_disk_error_wins_over_network_error(self):
+        self.fake.drop_after[1002] = 100_000
+        jid = self.queue("102")
+
+        def fsync(fd):
+            raise OSError(5, "I/O error")
+        with mock.patch.object(worker, "CHECKPOINT_BYTES", 10 ** 12), \
+                mock.patch.object(worker, "CHECKPOINT_SECS", 10 ** 6), mock.patch.object(worker.os, "fsync", fsync):
+            self.drain()
+        j = self.store.job(jid)
+        self.assertIn("could not confirm data on disk", j["error"])
+        self.assertEqual(len(self.ranges(1002)), 1)     # not retried
+        self.assertEqual(j["bytes_done"], 0)
+
+    # links -----------------------------------------------------------------------
+    def test_links_never_redirect_writes(self):
+        outside = os.path.join(self.tmp, "outside.bin")
+        with open(outside, "wb") as fh:
+            fh.write(b"precious" * 15_000)              # 120,000 bytes, same size as the movie
+        precious = open(outside, "rb").read()
+        os.makedirs(os.path.dirname(self.m(LOOSE)), exist_ok=True)
+        for make in (os.symlink, os.link):              # a planted partial
+            make(outside, self.part(LOOSE))
+            jid = self.queue("102")
+            self.drain()
+            self.assertEqual(self.read(LOOSE), self.fake.parts[1002])
+            self.assertFalse(os.path.islink(self.m(LOOSE)))
+            self.assertEqual(open(outside, "rb").read(), precious)
+            self.c.post(f"/api/jobs/{jid}/remove")
+        os.symlink(outside, self.m(LOOSE))              # a planted final of the right size
+        jid = self.queue("102")
+        self.drain()
+        self.assertNotEqual(self.store.job(jid)["note"], worker.ADOPTED.format(self.dl.device))
+        self.assertFalse(os.path.islink(self.m(LOOSE)))
+        self.assertEqual(self.read(LOOSE), self.fake.parts[1002])
+        self.assertEqual(open(outside, "rb").read(), precious)
+
+    def test_subtitle_links_never_redirect_writes(self):
+        outside = os.path.join(self.tmp, "outside.srt")
+        with open(outside, "wb") as fh:
+            fh.write(b"precious")
+        base = "Movies/Heat (1995)/Heat (1995)"
+        os.makedirs(os.path.dirname(self.m(HEAT)), exist_ok=True)
+        os.symlink(outside, self.m(base + ".es.srt") + paths.PART_SUFFIX)    # a planted temp file
+        os.symlink(outside, self.m(base + ".en.forced.srt"))                 # a planted sidecar
+        self.queue("101")
+        self.drain()
+        self.assertEqual(open(outside, "rb").read(), b"precious")
+        for rel in (base + ".es.srt", base + ".en.forced.srt"):
+            self.assertFalse(os.path.islink(self.m(rel)), rel)
+        with open(self.m(base + ".es.srt")) as fh:
+            self.assertIn("Hola", fh.read())
+
+
+    # cancel vs. claim ---------------------------------------------------------
+    def request_after_claim(self, action="cancel"):
+        """Run the queue, sending a request right after the worker claims each job."""
+        real, seen = self.store.claim, {}
+
+        def claim(job_id):
+            ok = real(job_id)
+            seen["result"] = self.c.post(f"/api/jobs/{job_id}/{action}").json()
+            seen["status"] = self.store.job(job_id)["status"]
+            return ok
+        with mock.patch.object(self.store, "claim", claim):
+            self.drain()
+        return seen
+
+    def test_cancel_before_claim(self):
+        jid = self.queue("102")
+        job = self.store.next_queued()
+        self.c.post(f"/api/jobs/{jid}/cancel")
+        self.dl._process(job)
+        self.assertEqual(self.store.job(jid)["status"], "cancelled")
+        self.assertEqual(self.ranges(1002), [])
+
+    def test_cancel_right_after_claim(self):
+        jid = self.queue("102")
+        self.assertEqual(self.request_after_claim()["status"], "downloading")
+        self.assertEqual(self.store.job(jid)["status"], "cancelled")
+        self.assertEqual(self.ranges(1002), [])
+        self.assertFalse(os.path.lexists(self.part(LOOSE)))
+
+    def test_cancel_right_after_claim_keeps_existing_file(self):
+        with open(self.m(LOOSE), "wb") as fh:
+            fh.write(self.fake.parts[1002])
+        jid = self.queue("102")
+        self.request_after_claim()
+        self.assertEqual(self.store.job(jid)["status"], "cancelled")
+        self.assertEqual(self.read(LOOSE), self.fake.parts[1002])
+
+    def test_cancel_just_before_the_rename(self):
+        jid = self.queue("102")
+        real = self.dl._fsync
+
+        def fsync(fd):
+            real(fd)
+            if os.fstat(fd).st_size == 120_000:
+                self.c.post(f"/api/jobs/{jid}/cancel")
+        with mock.patch.object(self.dl, "_fsync", fsync):
+            self.drain()
+        self.assertEqual(self.store.job(jid)["status"], "cancelled")
+        self.assertFalse(os.path.lexists(self.m(LOOSE)))
+        self.assertFalse(os.path.lexists(self.part(LOOSE)))
+
+    def subtitles_hook(self, fn):
+        real = self.gw.subtitle_streams
+
+        def subs(*a):
+            fn()
+            return real(*a)
+        return mock.patch.object(self.gw, "subtitle_streams", subs)
+
+    def test_cancel_after_the_last_check_finishes(self):
+        jid = self.queue("101")
+        with self.subtitles_hook(lambda: self.c.post(f"/api/jobs/{jid}/cancel")):
+            self.drain()
+        self.assertEqual(self.store.job(jid)["status"], "done")
+        self.assertNotIn(jid, self.dl._cancel)
+        self.assertEqual(self.read(HEAT), self.fake.parts[1001])
+
+    def test_remove_after_the_last_check_reports_cancelling(self):
+        jid, got = self.queue("101"), {}
+        with self.subtitles_hook(lambda: got.update(self.c.post(f"/api/jobs/{jid}/remove").json())):
+            self.drain()
+        self.assertEqual(got, {"result": "cancelling"})
+        self.assertEqual(self.store.job(jid)["status"], "done")
+        self.assertTrue(os.path.isfile(self.m(HEAT)))
+
+
+class FilesTest(PlexFixture):
+    """Local Files: browsing the media folder and deleting inside library folders."""
+
+    def setUp(self):
+        super().setUp()
+        self.outside = tempfile.mkdtemp(prefix="travelarr-outside-")
+        self.addCleanup(shutil.rmtree, self.outside, True)
+
+    def write(self, rel, data=b"x"):
+        p = self.m(rel)
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        with open(p, "wb") as fh:
+            fh.write(data)
+        return p
+
+    def ls(self, path="", **params):
+        return self.c.get("/api/files", params={"path": path, **params})
+
+    def names(self, path=""):
+        r = self.ls(path)
+        self.assertEqual(r.status_code, 200, r.text)
+        return [e["name"] for e in r.json()["entries"]]
+
+    def rm(self, *rels):
+        return self.c.post("/api/files/delete", json={"paths": list(rels)})
+
+    @contextlib.contextmanager
+    def mode(self, rel, mode):
+        if os.geteuid() == 0:
+            self.skipTest("file modes do not stop root")
+        p = self.m(rel)
+        os.makedirs(p, exist_ok=True)
+        os.chmod(p, mode)
+        try:
+            yield p
+        finally:
+            os.chmod(p, 0o755)
+
+    def test_listing(self):
+        self.write("TV-Shows/Show A/Season 1/e1.mkv", b"x" * 100)
+        self.write("TV-Shows/Show A/Season 2/e1.mkv", b"x" * 50)
+        self.write("TV-Shows/Show A/Season 10/e1.mkv", b"x" * 10)
+        self.write("TV-Shows/Show A/.DS_Store", b"x" * 7)
+        self.write("TV-Shows/Show A/notes.txt", b"x" * 3)
+        self.write("Movies/Heat (1995)/Heat (1995).mkv" + paths.PART_SUFFIX, b"x" * 5)
+        root = self.ls().json()
+        self.assertEqual([(e["name"], e["dir"], e["deletable"]) for e in root["entries"]],
+                         [("Movies", True, False), ("TV-Shows", True, False)])
+        self.assertEqual((root["path"], root["total"], root["offset"]), ("", 2, 0))
+        self.assertIsNotNone(root["disk"])
+        show = self.ls("TV-Shows").json()["entries"][0]
+        self.assertEqual((show["path"], show["size"], show["files"], show["complete"], show["deletable"]),
+                         ("TV-Shows/Show A", 170, 5, True, True))          # the hidden file counts
+        self.assertEqual(self.names("TV-Shows/Show A"), ["Season 1", "Season 2", "Season 10", "notes.txt"])
+        notes = self.ls("TV-Shows/Show A").json()["entries"][-1]
+        self.assertEqual((notes["dir"], notes["size"], notes["files"], notes["partial"]), (False, 3, 1, False))
+        self.assertTrue(self.ls("Movies/Heat (1995)").json()["entries"][0]["partial"])
+        self.assertEqual(self.ls("TV-Shows/./Show A/").json()["path"], "TV-Shows/Show A")
+        os.symlink(self.m("TV-Shows/Show A"), self.m("Movies/Inside"))
+        inside = self.ls("Movies").json()["entries"][-1]
+        self.assertEqual((inside["name"], inside["dir"], inside["link"]), ("Inside", False, True))
+        self.assertEqual(self.names("Movies/Inside"), ["Season 1", "Season 2", "Season 10", "notes.txt"])
+
+    def test_listing_refusals(self):
+        os.makedirs(os.path.join(self.outside, "sub"))
+        os.symlink(self.outside, self.m("Movies/out"))
+        self.write("Movies/a.mkv")
+        for bad in ("../x", "/etc", "Movies/../../x", "Movies/out", "Movies/out/sub", "Movies/a\x00"):
+            self.assertEqual(self.ls(bad).status_code, 400, bad)
+        r = self.ls("Movies/a.mkv")
+        self.assertEqual((r.status_code, r.json()["code"]), (400, "not_folder"))
+        r = self.ls("Movies/nope")
+        self.assertEqual((r.status_code, r.json()["code"]), (404, "missing"))
+        for params in ({"offset": "-1"}, {"limit": "0"}, {"limit": "501"}, {"limit": "x"}, {"offset": "1.5"},
+                       {"offset": "9" * 5000}, {"limit": "0" * 5000 + "1"}):
+            r = self.ls("Movies", **params)
+            self.assertEqual((r.status_code, r.json()["code"]), (400, "bad_request"), params)
+        self.assertEqual(self.ls("Movies", limit="500").status_code, 200)
+        r = self.ls("Movies", offset="99").json()
+        self.assertEqual((r["entries"], r["total"]), ([], 2))
+        os.rename(self.media, self.media + "-gone")
+        try:
+            r = self.ls()
+            self.assertEqual((r.status_code, r.json()["code"]), (409, "no_media"))
+        finally:
+            os.rename(self.media + "-gone", self.media)
+
+    def test_unreadable_folders(self):
+        self.write("Movies/X/ok.mkv", b"x" * 4)
+        with self.mode("Movies/X/locked", 0):
+            d = self.ls("Movies").json()
+            self.assertEqual([(e["name"], e["size"], e["files"], e["complete"]) for e in d["entries"]],
+                             [("X", 4, 1, False)])
+            self.assertFalse(d["complete"])
+            r = self.ls("Movies/X/locked")
+            self.assertEqual((r.status_code, r.json()["code"]), (403, "unreadable"))
+
+    def test_sizing_budget_and_slots(self):
+        self.write("TV-Shows/Show A/e.mkv", b"x" * 10)
+        with mock.patch.object(paths, "SIZE_BUDGET", 0):
+            d = self.ls("TV-Shows").json()
+        self.assertFalse(d["complete"])
+        self.assertEqual([(e["size"], e["complete"]) for e in d["entries"]], [(0, False)])
+        held = [paths._sizing.acquire(blocking=False) for _ in range(2)]
+        try:
+            self.assertEqual(held, [True, True])
+            t0 = time.monotonic()
+            with mock.patch.object(paths, "SIZE_BUDGET", 0.3):
+                d = self.ls("TV-Shows").json()
+            self.assertLess(time.monotonic() - t0, 2)
+            self.assertEqual([(e["size"], e["complete"]) for e in d["entries"]], [(0, False)])
+        finally:
+            for _ in held:
+                paths._sizing.release()
+        self.assertTrue(self.ls("TV-Shows").json()["complete"])
+
+    def test_sizing_stops_inside_a_folder(self):
+        for i in range(100):
+            self.write(f"Movies/Big/f{i}.mkv")
+        clock = iter([0.0] * 5 + [10.0] * 10)    # the budget runs out while the folder is read
+        with mock.patch.object(paths.time, "monotonic", lambda: next(clock)):
+            size, files, complete = paths.tree_size(self.m("Movies/Big"), deadline=5.0)
+        self.assertFalse(complete)
+        self.assertEqual(files, 4)
+
+    def test_links_in_the_path_cannot_be_deleted_through(self):
+        os.symlink(self.media, self.m("Movies/media"))           # an alias of the whole share
+        r = self.rm("Movies/media/TV-Shows")
+        self.assertEqual(r.status_code, 400)
+        self.assertTrue(os.path.isdir(self.m("TV-Shows")))
+        self.assertTrue(all(not e["deletable"] for e in self.ls("Movies/media").json()["entries"]))
+        self.assertTrue(all(not e["deletable"] for e in self.ls("Movies/media/TV-Shows").json()["entries"]))
+
+    def test_job_writing_through_a_linked_library_is_busy(self):
+        self.sign_in_and_connect()
+        os.rmdir(self.m("Movies"))
+        os.makedirs(self.m("Movies-real"))
+        os.symlink(self.m("Movies-real"), self.m("Movies"))      # jobs still write Movies/...
+        self.c.post("/api/queue", json={"keys": ["102", "103"]})
+        jobs = {j["rating_key"]: j["id"] for j in self.store.jobs("all")}
+        self.assertTrue(self.store.claim(jobs["102"]))
+        part = self.write(LOOSE + paths.PART_SUFFIX)
+        r = self.rm("Movies-real/Loose Movie.mkv" + paths.PART_SUFFIX)
+        self.assertEqual((r.status_code, r.json()["code"]), (409, "busy"))
+        self.assertTrue(os.path.isfile(part))
+        self.assertEqual(self.rm("Movies/Loose Movie.mkv" + paths.PART_SUFFIX).status_code, 400)
+        self.write("Movies-real/Heathers (1989)/old.nfo")
+        r = self.rm("Movies-real/Heathers (1989)").json()
+        self.assertEqual((r["deleted"], r["cancelled"]), (1, 1))         # the queued job behind the link
+        self.assertEqual(self.store.job(jobs["103"])["status"], "cancelled")
+
+    def test_link_a_job_writes_through_is_busy(self):
+        self.sign_in_and_connect()
+        os.makedirs(self.m("Movies/H-real"))
+        os.symlink(self.m("Movies/H-real"), self.m("Movies/Heathers (1989)"))
+        self.c.post("/api/queue", json={"keys": ["103"]})
+        jid = self.store.next_queued()["id"]
+        self.assertTrue(self.store.claim(jid))
+        for target in ("Movies/Heathers (1989)", "Movies/H-real"):      # the link, and where it leads
+            r = self.rm(target)
+            self.assertEqual((r.status_code, r.json()["code"]), (409, "busy"), target)
+        self.assertTrue(os.path.islink(self.m("Movies/Heathers (1989)")))
+        self.store.update(jid, status="queued")
+        r = self.rm("Movies/Heathers (1989)").json()                     # queued: cancelled, link removed
+        self.assertEqual((r["deleted"], r["cancelled"]), (1, 1))
+        self.assertFalse(os.path.lexists(self.m("Movies/Heathers (1989)")))
+        self.assertTrue(os.path.isdir(self.m("Movies/H-real")))
+
+    def test_paging(self):
+        for i in range(1000):
+            self.write(f"Movies/Big/f{i}.mkv")
+        got, token = [], None
+        for offset in range(0, 1000, 200):
+            d = self.ls("Movies/Big", offset=str(offset), **({"token": token} if token else {})).json()
+            self.assertEqual((d["total"], d["offset"], len(d["entries"])), (1000, offset, 200))
+            token = token or d["token"]
+            got += [e["name"] for e in d["entries"]]
+        self.assertEqual(got, [f"f{i}.mkv" for i in range(1000)])
+        self.write("Movies/Big/a-new.mkv")
+        r = self.ls("Movies/Big", offset="200", token=token)
+        self.assertEqual((r.status_code, r.json()["code"]), (409, "changed"))
+        self.assertEqual(self.ls("Movies/Big").json()["total"], 1001)
+
+    def test_delete_refusals(self):
+        keep = self.write("Movies/keep.mkv")
+        os.makedirs(os.path.join(self.outside, "dir"))
+        precious = os.path.join(self.outside, "dir", "f")
+        with open(precious, "w") as fh:
+            fh.write("precious")
+        os.symlink(os.path.join(self.outside, "dir"), self.m("Movies/out"))
+        for bad in ("Movies", "Movies/.", "../x", "/etc", "Movies/\x00a", "Movies/out/f", "TV-Shows/../Movies"):
+            r = self.rm("Movies/keep.mkv", bad)
+            self.assertEqual(r.status_code, 400, bad)
+        r = self.rm("Movies/keep.mkv", "Movies/nope")
+        self.assertEqual((r.status_code, r.json()["code"]), (404, "missing"))
+        for body in ({}, {"paths": "Movies/keep.mkv"}, {"paths": [1]}, {"paths": []}, {"paths": [""]},
+                     {"paths": ["Movies/keep.mkv"] * 501}, ["Movies/keep.mkv"]):
+            r = self.c.post("/api/files/delete", json=body)
+            self.assertEqual((r.status_code, r.json()["code"]), (400, "bad_request"), str(body)[:40])
+        self.assertTrue(os.path.isfile(keep))
+        self.assertEqual(open(precious).read(), "precious")
+        self.assertTrue(os.path.isdir(self.m("Movies")))
+
+    def test_links_are_removed_not_followed(self):
+        target = os.path.join(self.outside, "file.txt")
+        with open(target, "w") as fh:
+            fh.write("precious")
+        os.makedirs(os.path.join(self.outside, "dir"))
+        inner = os.path.join(self.outside, "dir", "inner.txt")
+        with open(inner, "w") as fh:
+            fh.write("precious")
+        os.makedirs(self.m("Movies/A"))
+        os.makedirs(self.m("Movies/B"))
+        os.symlink(target, self.m("Movies/A/link-file"))
+        os.symlink(os.path.join(self.outside, "dir"), self.m("Movies/A/link-dir"))
+        os.symlink(os.path.join(self.outside, "dir"), self.m("Movies/B/link-dir"))
+        r = self.rm("Movies/A/link-file", "Movies/A/link-dir").json()
+        self.assertEqual((r["deleted"], r["errors"]), (2, []))
+        self.assertFalse(os.path.lexists(self.m("Movies/A/link-file")))
+        self.assertFalse(os.path.lexists(self.m("Movies/A/link-dir")))
+        self.assertEqual(self.rm("Movies/B").json()["deleted"], 1)       # a folder holding a link
+        self.assertFalse(os.path.lexists(self.m("Movies/B")))
+        self.assertEqual(open(target).read(), "precious")
+        self.assertEqual(open(inner).read(), "precious")
+
+    def test_backslash_is_part_of_a_name(self):
+        self.write("Movies/a\\b.mkv", b"one")
+        self.write("Movies/a/b.mkv", b"two")
+        self.assertIn("Movies/a\\b.mkv", [e["path"] for e in self.ls("Movies").json()["entries"]])
+        r = self.rm("Movies/a\\b.mkv").json()
+        self.assertEqual((r["deleted"], r["bytes"]), (1, 3))
+        self.assertFalse(os.path.lexists(self.m("Movies/a\\b.mkv")))
+        self.assertEqual(open(self.m("Movies/a/b.mkv"), "rb").read(), b"two")
+        self.assertEqual(self.names("Movies/a"), ["b.mkv"])
+
+    def test_deleting_a_copied_season(self):
+        self.sign_in_and_connect()
+        self.c.post("/api/queue", json={"keys": ["200"], "mode": "all"})
+        self.drain()
+        r = self.rm("TV-Shows/Show A/Season 01").json()
+        self.assertEqual((r["deleted"], r["files"], r["removed"], r["cancelled"], r["errors"]), (1, 3, 2, 0, []))
+        self.assertFalse(os.path.exists(self.m("TV-Shows/Show A/Season 01")))
+        self.assertTrue(os.path.isdir(self.m("TV-Shows/Show A")))       # nothing removed above it
+        jobs = {j["rating_key"]: j for j in self.store.jobs("all")}
+        self.assertEqual([jobs[k]["status"] for k in ("201", "202", "203")], ["removed", "removed", "done"])
+        self.assertEqual(jobs["201"]["note"], main_mod.LOCAL_NOTE)
+        show = self.c.get("/api/item/200").json()
+        self.assertEqual({str(e["ratingKey"]): e["copy"] for s in show["seasons"] for e in s["episodes"]},
+                         {"201": None, "202": None, "203": "done"})
+        r = self.c.post("/api/queue", json={"keys": ["200"], "mode": "all"}).json()
+        self.assertEqual((r["added"], r["skipped"]), (2, 1))
+
+    def test_delete_and_the_queue(self):
+        self.sign_in_and_connect()
+        self.write("Movies/Heat (1995)/old.nfo")
+        self.c.post("/api/queue", json={"keys": ["101", "102", "103"]})
+        jobs = {j["rating_key"]: j["id"] for j in self.store.jobs("all")}
+        # a queued download inside the folder is cancelled
+        r = self.rm("Movies/Heat (1995)").json()
+        self.assertEqual((r["deleted"], r["cancelled"]), (1, 1))
+        self.assertEqual(self.store.job(jobs["101"])["status"], "cancelled")
+        self.assertEqual(self.store.job(jobs["101"])["note"], main_mod.LOCAL_NOTE)
+        # an old subtitle of a queued download goes; the download stays queued
+        self.write("Movies/Heathers (1989)/Heathers (1989).en.srt")
+        r = self.rm("Movies/Heathers (1989)/Heathers (1989).en.srt").json()
+        self.assertEqual((r["deleted"], r["cancelled"]), (1, 0))
+        self.assertEqual(self.store.job(jobs["103"])["status"], "queued")
+        # anything a downloading job writes is refused, and then nothing changes
+        self.assertTrue(self.store.claim(jobs["102"]))
+        part = self.write(LOOSE + paths.PART_SUFFIX)
+        sub = self.write("Movies/Loose Movie.en.srt")
+        for target in (LOOSE + paths.PART_SUFFIX, "Movies/Loose Movie.en.srt"):
+            r = self.rm(target, "Movies/Heathers (1989)")
+            self.assertEqual((r.status_code, r.json()["code"]), (409, "busy"), target)
+            self.assertIn("Loose Movie", r.json()["error"])
+        self.assertTrue(os.path.isfile(part) and os.path.isfile(sub))
+        self.assertTrue(os.path.isdir(self.m("Movies/Heathers (1989)")))
+        self.assertEqual(self.store.job(jobs["103"])["status"], "queued")
+        self.assertEqual(self.store.job(jobs["102"])["status"], "downloading")
+
+    def test_nested_selection(self):
+        self.write("TV-Shows/Show B/Season 1/e.mkv", b"x" * 9)
+        r = self.rm("TV-Shows/Show B", "TV-Shows/Show B/Season 1", "TV-Shows/Show B/").json()
+        self.assertEqual((r["deleted"], r["bytes"], r["files"], r["errors"]), (1, 9, 1, []))
+        self.assertFalse(os.path.exists(self.m("TV-Shows/Show B")))
+
+    def test_totals_count_only_what_was_deleted(self):
+        self.write("Movies/A/a.mkv", b"x" * 100)
+        self.write("Movies/B/b.mkv", b"x" * 50)
+        with self.mode("Movies/B", 0o555):
+            r = self.rm("Movies/A", "Movies/B/b.mkv").json()
+        self.assertEqual((r["deleted"], r["bytes"], r["files"]), (1, 100, 1))
+        self.assertEqual([e["path"] for e in r["errors"]], ["Movies/B/b.mkv"])
+        self.assertTrue(os.path.isfile(self.m("Movies/B/b.mkv")))
+
+
+class DeviceNameTest(unittest.TestCase):
+    def test_sources(self):
+        for env, host, want in [({"TRAVELARR_NAME": " Road NAS ", "HOST_HOSTNAME": "N2"}, "x", "Road NAS"),
+                                ({"HOST_HOSTNAME": " N2 "}, "3f2a1b9c4d5e", "N2"),   # Unraid's server name
+                                ({"TRAVELARR_NAME": " ", "HOST_HOSTNAME": ""}, "n2.lan", "n2"),
+                                ({}, "N2", "N2"),
+                                ({}, "3f2a1b9c4d5e", "NAS"),           # Docker's default: the container id
+                                ({}, "", "NAS")]:
+            with mock.patch.dict(os.environ, env), mock.patch("socket.gethostname", return_value=host):
+                for var in ("TRAVELARR_NAME", "HOST_HOSTNAME"):
+                    if var not in env:
+                        os.environ.pop(var, None)
+                self.assertEqual(main_mod.device_name(), want, (env, host))
+
+    def test_state_and_worker_use_it(self):
+        tmp = tempfile.mkdtemp()
+        try:
+            app = create_app(data_dir=tmp, media_root=tmp, password="", start_worker=False, device="Road NAS",
+                             gateway_factory=lambda s: PlexGateway(s, "t"))
+            with TestClient(app) as c:
+                self.assertEqual(c.get("/api/state").json()["device"], "Road NAS")
+            self.assertEqual(app.state.dl.device, "Road NAS")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
+class PasswordTest(unittest.TestCase):
+    def test_basic_auth(self):
+        tmp = tempfile.mkdtemp()
+        try:
+            app = create_app(data_dir=tmp, media_root=tmp, password="s3cret",
+                             gateway_factory=lambda s: PlexGateway(s, "t"), start_worker=False)
+            with TestClient(app) as c:
+                self.assertEqual(c.get("/api/state").status_code, 401)
+                bad = base64.b64encode(b"x:nope").decode()
+                self.assertEqual(c.get("/api/state", headers={"Authorization": f"Basic {bad}"}).status_code, 401)
+                good = base64.b64encode(b"anyone:s3cret").decode()
+                self.assertEqual(c.get("/api/state", headers={"Authorization": f"Basic {good}"}).status_code, 200)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
+class PathsTest(unittest.TestCase):
+    def test_dest_rel(self):
+        f = paths.dest_rel_for
+        self.assertEqual(f("/data/Media/TV-Shows/S/Season 01/e.mkv", ["/data/Media/TV-Shows"], "TV"),
+                         "TV-Shows/S/Season 01/e.mkv")
+        self.assertEqual(f("/data/a/TV/S/e.mkv", ["/data/a", "/data/a/TV"], "TV"), "TV/S/e.mkv")
+        self.assertEqual(f("D:\\Media\\Movies\\M (1)\\m.mkv", ["D:\\Media\\Movies"], "Films"), "Movies/M (1)/m.mkv")
+        self.assertEqual(f("/elsewhere/X/m.mkv", ["/data/Movies"], "Films: HD"), "Films  HD/X/m.mkv")
+        self.assertEqual(f("/data/Movies/m.mkv", ["/data/Movies/"], "Films"), "Movies/m.mkv")
+        with self.assertRaises(paths.PathError):
+            paths.clean_rel("../x/y")
+
+    def test_abs_path_and_remove_guard(self):
+        tmp = tempfile.mkdtemp()
+        try:
+            for bad in ("Movies", "../x/y", "/etc/passwd", "Movies/../../x", ""):
+                with self.assertRaises(paths.PathError):
+                    paths.abs_path(tmp, bad)
+            os.makedirs(os.path.join(tmp, "Movies", "A"))
+            open(os.path.join(tmp, "Movies", "A", "a.mkv"), "w").close()
+            paths.remove_files(tmp, ["Movies/A/a.mkv"])
+            self.assertFalse(os.path.exists(os.path.join(tmp, "Movies", "A")))
+            self.assertTrue(os.path.isdir(os.path.join(tmp, "Movies")))
+            # a symlinked folder pointing outside must not be followed
+            outside = tempfile.mkdtemp()
+            os.symlink(outside, os.path.join(tmp, "Movies", "link"))
+            with self.assertRaises(paths.PathError):
+                paths.abs_path(tmp, "Movies/link/x.mkv")
+            shutil.rmtree(outside)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_sidecar_names(self):
+        used = set()
+        s = lambda lang, forced=False, hi=False: paths.sidecar_rel("TV/S/e.mkv", lang, forced, hi, "srt", used)
+        self.assertEqual(s("es"), "TV/S/e.es.srt")
+        self.assertEqual(s("es"), "TV/S/e.es.2.srt")
+        self.assertEqual(s("en", forced=True), "TV/S/e.en.forced.srt")
+        self.assertEqual(s("en", hi=True), "TV/S/e.en.sdh.srt")
+        self.assertEqual(s(None), "TV/S/e.und.srt")
+        self.assertEqual(s("pt-BR"), "TV/S/e.pt-BR.srt")
+
+
+if __name__ == "__main__":
+    unittest.main()

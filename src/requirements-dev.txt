@@ -1,0 +1,2 @@
+# Test-only dependencies, pinned to the versions the suite passes with.
+httpx==0.28.1

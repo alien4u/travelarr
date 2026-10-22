@@ -1,0 +1,804 @@
+'use strict';
+
+/* ---------------------------------------------------------------- helpers */
+const $ = (s, el = document) => el.querySelector(s);
+const view = $('#view');
+const S = { state: null, tab: 'watchlist', libs: null, lib: {}, q: {}, sort: {}, rid: 0, timer: null, dirty: false, path: '' };
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+const dev = () => (S.state && S.state.device) || 'NAS';
+
+// Builds DOM nodes; every string goes in as text, never as HTML.
+function h(tag, attrs, ...kids) {
+  const el = document.createElement(tag);
+  for (const [k, v] of Object.entries(attrs || {})) {
+    if (v == null || v === false) continue;
+    if (k === 'class') el.className = v;
+    else if (k.startsWith('on')) el.addEventListener(k.slice(2), v);
+    else if (k === 'checked' || k === 'disabled' || k === 'selected' || k === 'value') el[k] = v;
+    else el.setAttribute(k, v === true ? '' : v);
+  }
+  for (const c of kids.flat(Infinity)) if (c != null && c !== false) el.append(c instanceof Node ? c : String(c));
+  return el;
+}
+
+async function api(path, opts = {}) {
+  const o = { headers: {}, ...opts };
+  if (o.body && typeof o.body !== 'string') {
+    o.body = JSON.stringify(o.body);
+    o.headers['Content-Type'] = 'application/json';
+  }
+  const r = await fetch(path, o);
+  let data = null;
+  try { data = await r.json(); } catch { /* not JSON */ }
+  if (!r.ok) {
+    const e = new Error((data && data.error) || `HTTP ${r.status}`);
+    e.code = data && data.code;
+    throw e;
+  }
+  return data;
+}
+const post = (p, body) => api(p, { method: 'POST', body: body || {} });
+
+function fmtBytes(n) {
+  if (n == null) return '';
+  const u = ['B', 'KB', 'MB', 'GB', 'TB'];
+  let i = 0;
+  while (n >= 1024 && i < u.length - 1) { n /= 1024; i++; }
+  return (i >= 3 ? n.toFixed(1) : Math.round(n)) + ' ' + u[i];
+}
+function fmtTime(s) {
+  if (!s) return '';
+  return new Date(s).toLocaleString([], { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' });
+}
+function fmtAdded(sec) {
+  const d = new Date(sec * 1000);
+  const year = d.getFullYear() === new Date().getFullYear() ? undefined : 'numeric';
+  return `Added ${d.toLocaleDateString([], { month: 'short', day: 'numeric', year })}`;
+}
+function fmtEta(sec) {
+  if (!sec || !isFinite(sec)) return '';
+  if (sec < 90) return `${Math.round(sec)} s left`;
+  if (sec < 5400) return `${Math.round(sec / 60)} min left`;
+  return `${(sec / 3600).toFixed(1)} h left`;
+}
+const fmtRate = n => `${fmtBytes(n || 0)}/s`;
+const pad = n => String(n ?? 0).padStart(2, '0');
+function jobTitle(j) {
+  if (j.kind === 'episode') return `${j.show_title} S${pad(j.season)}E${pad(j.episode)} · ${j.title}`;
+  return j.year ? `${j.title} (${j.year})` : j.title;
+}
+
+let toastTimer;
+function toast(msg) {
+  const t = $('#toast');
+  t.textContent = msg;
+  t.classList.add('show');
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => t.classList.remove('show'), 3500);
+}
+
+function errorPanel(e, retry) {
+  const needsSetup = e.code === 'not_ready' || e.code === 'auth';
+  return h('div', { class: 'panel' },
+    h('h2', {}, needsSetup ? 'Plex is not available' : 'Something went wrong'),
+    h('p', { class: 'muted' }, e.message),
+    h('div', { class: 'bar' },
+      retry && h('button', { class: 'btn primary', onclick: retry }, 'Try again'),
+      h('button', { class: 'btn', onclick: () => setTab('settings') }, 'Settings')));
+}
+
+/* ----------------------------------------------------------------- images */
+function thumbUrl(t, w = 240, hh = 360) {
+  if (!t) return null;
+  if (t.startsWith('/library/')) return `/api/thumb?path=${encodeURIComponent(t)}&w=${w}&h=${hh}`;
+  if (t.startsWith('https://')) return t;
+  return null;
+}
+function poster(item, w, hh) {
+  const p = h('div', { class: 'poster' }, h('div', { class: 'ph' }, item.title));
+  const url = thumbUrl(item.thumb, w, hh);
+  if (url) {
+    const img = h('img', { loading: 'lazy', alt: '', src: url });
+    img.onerror = () => img.remove();
+    p.append(img);
+  }
+  return p;
+}
+
+function statusOf(st) {
+  return ({ done: [`On ${dev()}`, ''], queued: ['Queued', 'busy'], downloading: ['Copying', 'busy'],
+    failed: ['Failed', 'bad'] })[st] || [st, 'dim'];
+}
+function badgeFor(item) {
+  const n = item.copy;
+  if (!n) return null;
+  if (typeof n === 'string') {
+    const [txt, cls] = statusOf(n);
+    return h('span', { class: `badge ${cls}` }, txt);
+  }
+  if (n.active) return h('span', { class: 'badge busy' }, `${n.done} + ${n.active} copying`);
+  if (n.done) return h('span', { class: 'badge' }, `${n.done} on ${dev()}`);
+  if (n.failed) return h('span', { class: 'badge bad' }, 'Failed');
+  return null;
+}
+
+function card(item, recent) {
+  const p = poster(item);
+  const b = badgeFor(item);
+  if (b) p.append(b);
+  let sub = item.year || '';
+  if (item.type === 'show' && item.episodes != null) sub = `${item.unwatched} unwatched of ${item.episodes}`;
+  if (item.type === 'movie' && (item.size || recent)) {
+    sub = [recent ? item.addedAt && fmtAdded(item.addedAt) : item.year, item.size && fmtBytes(item.size)]
+      .filter(Boolean).join(' · ');
+  }
+  if (item.inLibrary === false) sub = 'Not in your library';
+  return h('button', {
+    class: 'card', type: 'button',
+    onclick: () => item.ratingKey ? openItem(item.ratingKey) : toast('Not in your Plex library, nothing to copy'),
+  }, p, h('div', { class: 't' }, item.title), h('div', { class: 's' }, sub));
+}
+
+/* ------------------------------------------------------------ state & nav */
+async function refreshState() {
+  try {
+    const prev = S.state;
+    S.state = await api('/api/state');
+    paintPill();
+    if (prev && (prev.signedIn !== S.state.signedIn || prev.serverId !== S.state.serverId)) render();
+  } catch (e) {
+    $('#pill').replaceChildren(h('span', { class: 'dot bad' }), 'travelarr unreachable');
+  }
+}
+
+function paintPill() {
+  const st = S.state;
+  let dot = 'bad', text = 'Not signed in';
+  if (st.signedIn) {
+    if (st.conn) { dot = st.conn.kind === 'relay' ? 'bad' : 'ok'; text = `${st.conn.name} · ${st.conn.kind}`; }
+    else if (st.connError) { text = 'Plex unreachable'; }
+    else { dot = ''; text = st.serverName || 'Plex'; }
+  }
+  if (st.current) dot = 'busy';
+  if (st.disk) text += ` · ${fmtBytes(st.disk.free)} free`;
+  else text += ' · media folder missing';
+  $('#pill').replaceChildren(h('span', { class: `dot ${dot}` }), text);
+  const t = st.totals || {};
+  const q = ((t.queued || {}).count || 0) + ((t.downloading || {}).count || 0);
+  $('#qcount').textContent = q ? String(q) : '';
+}
+
+function setTab(tab) {
+  S.tab = tab;
+  if (location.hash !== '#' + tab) history.replaceState(null, '', '#' + tab);
+  render();
+}
+
+function render() {
+  S.rid++;
+  clearInterval(S.timer);
+  for (const b of document.querySelectorAll('#tabs button')) b.classList.toggle('on', b.dataset.tab === S.tab);
+  const st = S.state;
+  $('#tabs').hidden = !(st && st.signedIn && st.serverId);
+  if (!st) return;
+  if (!st.signedIn) return renderSignIn();
+  if (!st.serverId) return renderServers();
+  ({ watchlist: renderWatchlist, movies: () => renderLibrary('movie'), tv: () => renderLibrary('show'),
+     queue: renderQueue, history: renderHistory, files: renderFiles, settings: renderSettings }[S.tab] || renderWatchlist)();
+}
+
+$('#tabs').addEventListener('click', e => {
+  const b = e.target.closest('button[data-tab]');
+  if (b) setTab(b.dataset.tab);
+});
+$('#pill').addEventListener('click', () => setTab('settings'));
+
+/* ---------------------------------------------------------------- sign-in */
+function renderSignIn() {
+  const msg = h('p', { class: 'small' });
+  const btn = h('button', { class: 'btn primary', onclick: () => signIn(btn, msg) }, 'Sign in with Plex');
+  view.replaceChildren(h('div', { class: 'setup panel' },
+    h('h2', {}, 'Connect travelarr to your Plex'),
+    h('p', {}, 'Sign in with the Plex account that owns your home server. travelarr reads your libraries and watchlist, and downloads only the files you choose.'),
+    btn, msg));
+}
+
+async function signIn(btn, msg) {
+  const win = window.open('about:blank', '_blank');
+  btn.disabled = true;
+  try {
+    const { url } = await post('/api/auth/start');
+    if (win) { win.location = url; msg.textContent = 'Approve travelarr in the Plex tab, then come back here.'; }
+    else msg.replaceChildren('Pop-ups are blocked. ', h('a', { href: url, target: '_blank', rel: 'noopener' }, 'Open the Plex sign-in page'));
+    const t0 = Date.now();
+    while (Date.now() - t0 < 10 * 60 * 1000) {
+      await sleep(2000);
+      const r = await post('/api/auth/check');
+      if (r.signedIn) {
+        try { if (win) win.close(); } catch { /* ignore */ }
+        await refreshState();
+        return render();
+      }
+    }
+    msg.textContent = 'Timed out waiting for Plex. Try again.';
+  } catch (e) {
+    try { if (win) win.close(); } catch { /* ignore */ }
+    msg.textContent = e.message;
+  }
+  btn.disabled = false;
+}
+
+async function renderServers() {
+  const rid = S.rid;
+  view.replaceChildren(h('div', { class: 'spinner' }));
+  let servers;
+  try { ({ servers } = await api('/api/servers')); }
+  catch (e) { return view.replaceChildren(errorPanel(e, renderServers)); }
+  if (rid !== S.rid) return;
+  const st = S.state;
+  let chosen = (servers.find(s => s.id === st.serverId) || servers.find(s => s.owned) || servers[0] || {}).id;
+  const url = h('input', { type: 'url', placeholder: 'https://192-168-1-10.<id>.plex.direct:32400', value: st.preferredUrl || '' });
+  const relay = h('input', { type: 'checkbox', checked: !!st.allowRelay });
+  const msg = h('p', { class: 'small' });
+  const save = h('button', { class: 'btn primary' }, 'Save and connect');
+  save.onclick = async () => {
+    const s = servers.find(x => x.id === chosen);
+    if (!s) return;
+    save.disabled = true;
+    msg.textContent = 'Connecting…';
+    try {
+      const r = await post('/api/server', { id: s.id, name: s.name, preferredUrl: url.value, allowRelay: relay.checked });
+      toast(`Connected to ${r.conn.name} (${r.conn.kind})`);
+      await refreshState();
+      S.libs = null;
+      setTab('watchlist');
+    } catch (e) {
+      msg.textContent = e.message;
+      await refreshState();
+    }
+    save.disabled = false;
+  };
+  view.replaceChildren(h('div', { class: 'setup panel' },
+    h('h2', {}, 'Choose your Plex server'),
+    servers.length ? null : h('p', {}, 'No Plex servers found on this account.'),
+    servers.map(s => {
+      const r = h('input', { type: 'radio', name: 'srv', checked: s.id === chosen });
+      r.onchange = () => { chosen = s.id; };
+      return h('label', { class: 'radio' }, r, h('div', {},
+        h('div', { style: 'font-weight:600' }, s.name),
+        h('div', { class: 'small muted' }, [s.owned ? 'Your server' : 'Shared with you', s.online ? 'online' : 'offline'].join(' · '))));
+    }),
+    h('div', { class: 'field' }, h('label', {}, 'Fixed server address (optional)'), url,
+      h('div', { class: 'small muted' }, 'Leave empty and travelarr uses the LAN address at home and Plex Remote Access when away. Set it to use a VPN address instead.')),
+    h('label', { class: 'check small' }, relay, 'Allow Plex Relay as a last resort (very slow)'),
+    h('div', { class: 'bar', style: 'justify-content:center;margin-top:14px' }, save), msg));
+}
+
+/* --------------------------------------------------------------- browsing */
+async function renderWatchlist() {
+  const rid = S.rid;
+  view.replaceChildren(h('div', { class: 'spinner' }));
+  let items;
+  try { ({ items } = await api('/api/watchlist')); }
+  catch (e) { if (rid === S.rid) view.replaceChildren(errorPanel(e, render)); return; }
+  if (rid !== S.rid) return;
+  const copyable = items.filter(i => i.ratingKey && !(typeof i.copy === 'string' && i.copy !== 'failed'));
+  const copyAll = h('button', { class: 'btn small primary', disabled: !copyable.length }, 'Copy all (unwatched)');
+  copyAll.onclick = async () => {
+    if (!confirm(`Copy ${copyable.length} watchlist title(s)? Shows copy their unwatched episodes.`)) return;
+    await queue(copyable.map(i => i.ratingKey), 'unwatched', 'watchlist');
+    render();
+  };
+  view.replaceChildren(
+    h('div', { class: 'bar' },
+      h('div', { class: 'grow muted small' }, `${items.length} on your Plex watchlist. Add titles from any Plex app, then refresh.`),
+      h('button', { class: 'btn small', onclick: render }, 'Refresh'), copyAll),
+    items.length ? h('div', { class: 'grid' }, items.map(i => card(i)))
+      : h('div', { class: 'empty' }, 'Your watchlist is empty.'));
+}
+
+async function renderLibrary(type) {
+  const rid = S.rid;
+  view.replaceChildren(h('div', { class: 'spinner' }));
+  try { if (!S.libs) S.libs = (await api('/api/libraries')).libraries; }
+  catch (e) { if (rid === S.rid) view.replaceChildren(errorPanel(e, render)); return; }
+  if (rid !== S.rid) return;
+  const libs = S.libs.filter(l => l.type === type);
+  if (!libs.length) return view.replaceChildren(h('div', { class: 'empty' }, `No ${type === 'movie' ? 'movie' : 'TV'} libraries on this server.`));
+  const key = libs.some(l => l.key === S.lib[type]) ? S.lib[type] : libs[0].key;
+  S.lib[type] = key;
+  const sel = libs.length > 1 ? h('select', { onchange: e => { S.lib[type] = e.target.value; render(); } },
+    libs.map(l => h('option', { value: l.key, selected: l.key === key }, l.title))) : null;
+  const search = h('input', { type: 'search', placeholder: `Search ${libs.find(l => l.key === key).title}`, value: S.q[type] || '' });
+  const sort = S.sort[type] || 'title';
+  const order = h('div', { class: 'seg', role: 'group', 'aria-label': 'Order' },
+    [['title', 'A-Z'], ['recent', 'Recently added']].map(([v, label]) => h('button', {
+      type: 'button', class: v === sort ? 'on' : null, 'aria-pressed': String(v === sort),
+      onclick: () => { if (v !== sort) { S.sort[type] = v; render(); } },
+    }, label)));
+  const grid = h('div', { class: 'grid' });
+  const more = h('div', { class: 'more' });
+  let start = 0, debounce;
+  const size = 60;
+  // Everything below belongs to this render (rid): a later render, such as a
+  // new order, makes its timers and responses stale.
+  async function load(reset) {
+    if (rid !== S.rid) return;
+    if (reset) { start = 0; grid.replaceChildren(); }
+    more.replaceChildren(h('div', { class: 'spinner' }));
+    const q = S.q[type] || '';
+    let d;
+    try { d = await api(`/api/library/${key}?start=${start}&size=${size}&sort=${sort}${q ? `&q=${encodeURIComponent(q)}` : ''}`); }
+    catch (e) { if (rid === S.rid) more.replaceChildren(errorPanel(e, () => load(reset))); return; }
+    if (rid !== S.rid || (S.q[type] || '') !== q) return;
+    d.items.forEach(i => grid.append(card(i, sort === 'recent')));
+    start += d.items.length;
+    more.replaceChildren();
+    const hasMore = d.total == null ? d.items.length === size : start < d.total;
+    if (hasMore) more.append(h('button', { class: 'btn', onclick: () => load(false) }, 'Load more'));
+    if (!grid.children.length) more.append(h('div', { class: 'empty' }, q ? 'No matches.' : 'This library is empty.'));
+  }
+  search.oninput = () => {
+    S.q[type] = search.value.trim();  // kept at once, so switching the order keeps what was typed
+    clearTimeout(debounce);
+    debounce = setTimeout(() => load(true), 350);
+  };
+  view.replaceChildren(h('div', { class: 'bar' }, sel, order, h('div', { class: 'grow' }, search)), grid, more);
+  load(true);
+}
+
+async function queue(keys, mode, source, only) {
+  try {
+    const r = await post('/api/queue', { keys, mode, source: source || 'browse', only });
+    const parts = [];
+    if (r.added) parts.push(`Queued ${r.added} file(s), ${fmtBytes(r.bytes)}`);
+    if (r.skipped) parts.push(`${r.skipped} already on ${dev()} or queued`);
+    if (!r.added && !r.skipped) parts.push('Nothing to copy (all watched?)');
+    toast(parts.join(' · '));
+    if (r.warning) setTimeout(() => toast(r.warning), 3600);
+    S.dirty = true;
+    refreshState();
+    return r;
+  } catch (e) { toast(e.message); return null; }
+}
+
+/* ----------------------------------------------------------------- detail */
+function openSheet(...nodes) {
+  $('#sheet-body').replaceChildren(...nodes.filter(n => n != null));
+  $('#sheet').hidden = false;
+  document.body.style.overflow = 'hidden';
+}
+function closeSheet() {
+  $('#sheet').hidden = true;
+  document.body.style.overflow = '';
+  if (S.dirty && ['watchlist', 'movies', 'tv'].includes(S.tab)) { S.dirty = false; render(); }
+}
+$('#sheet').addEventListener('click', e => { if (e.target.closest('[data-close]')) closeSheet(); });
+document.addEventListener('keydown', e => { if (e.key === 'Escape' && !$('#sheet').hidden) closeSheet(); });
+
+function removedToast(results) {
+  const busy = results.cancelling || 0;
+  if (!busy) return toast(`Removed from ${dev()}`);
+  const n = (results.removed || 0) + (results.cancelled || 0);
+  toast(`Removed ${n} file(s). ${busy === 1 ? '1 copying file was' : `${busy} copying files were`} asked to stop; `
+    + `if ${busy === 1 ? 'it' : 'they'} had already finished, ${busy === 1 ? 'it is' : 'they are'} kept, remove again.`);
+}
+
+async function openItem(rk) {
+  openSheet(h('div', { class: 'spinner' }));
+  let d;
+  try { d = await api(`/api/item/${rk}`); }
+  catch (e) { return openSheet(errorPanel(e, () => openItem(rk))); }
+  const meta = [d.year, d.size ? fmtBytes(d.size) : null,
+    d.type === 'show' ? `${d.episodes} episodes, ${d.unwatched} unwatched` : null].filter(Boolean).join(' · ');
+  const head = h('div', { class: 'detail-head' }, poster(d, 220, 330),
+    h('div', {}, h('h1', {}, d.title), h('div', { class: 'muted small' }, meta),
+      h('p', { class: 'summary' }, d.summary || '')));
+  openSheet(head, d.type === 'show' ? showBody(d) : videoBody(d), historyBlock(d.history));
+}
+
+function videoBody(d) {
+  const st = d.copy;
+  const actions = h('div', { class: 'sticky-actions' });
+  const active = (d.history || []).filter(j => j.status === 'queued' || j.status === 'downloading');
+  if (!st || st === 'failed') {
+    actions.append(h('button', {
+      class: 'btn primary', onclick: async () => { await queue([d.ratingKey], 'all'); openItem(d.ratingKey); },
+    }, `Copy to ${dev()} · ${fmtBytes(d.size)}`));
+  } else {
+    actions.append(h('span', { class: `chip ${st}` }, statusOf(st)[0]));
+    if (active.length) actions.append(h('button', {
+      class: 'btn small', onclick: async () => { for (const j of active) await post(`/api/jobs/${j.id}/cancel`); S.dirty = true; openItem(d.ratingKey); },
+    }, 'Cancel'));
+  }
+  if (st === 'done') actions.append(h('button', {
+    class: 'btn small danger', onclick: async () => {
+      if (!confirm(`Delete "${d.title}" from ${dev()}?`)) return;
+      const r = await post('/api/remove', { ratingKeys: [d.ratingKey] });
+      S.dirty = true; removedToast(r.results); openItem(d.ratingKey);
+    },
+  }, `Remove from ${dev()}`));
+  return h('div', {},
+    (d.parts || []).map(p => h('div', { class: 'mono muted' }, `${dev()}: ${p.dest}`)),
+    actions);
+}
+
+function showBody(d) {
+  const eligible = e => !e.copy || e.copy === 'failed';
+  const eps = d.seasons.flatMap(s => s.episodes);
+  const sel = new Set(eps.filter(e => eligible(e) && !e.watched).map(e => e.ratingKey));
+  const boxes = new Map();
+  const copyBtn = h('button', { class: 'btn primary' });
+  const refresh = () => {
+    let bytes = 0;
+    for (const e of eps) if (sel.has(e.ratingKey)) bytes += e.size || 0;
+    for (const [rk, cb] of boxes) cb.checked = sel.has(rk);
+    copyBtn.textContent = sel.size ? `Copy ${sel.size} episode(s) · ${fmtBytes(bytes)}` : 'Select episodes';
+    copyBtn.disabled = !sel.size;
+  };
+  copyBtn.onclick = async () => {
+    copyBtn.disabled = true;
+    await queue([d.ratingKey], 'all', 'browse', [...sel]);
+    openItem(d.ratingKey);
+  };
+  const pick = fn => () => { sel.clear(); eps.filter(e => eligible(e) && fn(e)).forEach(e => sel.add(e.ratingKey)); refresh(); };
+  const onDevice = eps.filter(e => e.copy === 'done').length;
+  const busy = eps.filter(e => e.copy === 'queued' || e.copy === 'downloading').length;
+
+  const seasons = d.seasons.map(s => {
+    const sEl = s.episodes.filter(eligible);
+    const scb = h('input', { type: 'checkbox', disabled: !sEl.length });
+    scb.onchange = () => { sEl.forEach(e => scb.checked ? sel.add(e.ratingKey) : sel.delete(e.ratingKey)); refresh(); };
+    const done = s.episodes.filter(e => e.copy === 'done').length;
+    return h('div', { class: 'season' },
+      h('label', { class: 'season-h' }, scb, s.title || `Season ${s.index}`,
+        h('span', { class: 'muted small' }, `${s.episodes.length} ep${done ? ` · ${done} on ${dev()}` : ''}`)),
+      s.episodes.map(e => {
+        const cb = h('input', { type: 'checkbox', disabled: !eligible(e) });
+        cb.onchange = () => { cb.checked ? sel.add(e.ratingKey) : sel.delete(e.ratingKey); refresh(); };
+        boxes.set(e.ratingKey, cb);
+        return h('label', { class: `ep${e.watched ? ' watched' : ''}` }, cb,
+          h('span', { class: 'n' }, `E${pad(e.index)}`),
+          h('span', { class: 'et' }, e.title),
+          e.copy ? h('span', { class: `chip ${e.copy}` }, statusOf(e.copy)[0])
+            : e.watched ? h('span', { class: 'chip' }, 'Watched') : null,
+          h('span', { class: 'sz' }, fmtBytes(e.size)));
+      }));
+  });
+
+  const removeBtn = onDevice || busy ? h('button', {
+    class: 'btn small danger', onclick: async () => {
+      if (!confirm(`Delete all ${onDevice} episode(s) of "${d.title}" from ${dev()}${busy ? ' and cancel the queued ones' : ''}?`)) return;
+      const r = await post('/api/remove', { showKeys: [d.ratingKey] });
+      S.dirty = true; removedToast(r.results); openItem(d.ratingKey);
+    },
+  }, `Remove show from ${dev()}`) : null;
+
+  refresh();
+  return h('div', {},
+    h('div', { class: 'bar' },
+      h('span', { class: 'muted small grow' }, [onDevice && `${onDevice} on ${dev()}`, busy && `${busy} queued`].filter(Boolean).join(' · ') || `Nothing on ${dev()} yet`),
+      h('button', { class: 'btn small', onclick: pick(e => !e.watched) }, 'Unwatched'),
+      h('button', { class: 'btn small', onclick: pick(() => true) }, 'All'),
+      h('button', { class: 'btn small', onclick: pick(() => false) }, 'None')),
+    seasons,
+    h('div', { class: 'sticky-actions' }, copyBtn, removeBtn));
+}
+
+function historyBlock(jobs) {
+  if (!jobs || !jobs.length) return null;
+  return h('div', { class: 'panel', style: 'margin-top:18px' }, h('h2', {}, 'History'),
+    h('div', { class: 'list' }, jobs.slice().reverse().slice(0, 15).map(j => h('div', { class: 'small' },
+      h('span', { class: `chip ${j.status}` }, j.status), ' ', jobTitle(j), ' ',
+      h('span', { class: 'muted' }, fmtTime(j.removed_at || j.finished_at || j.queued_at))))));
+}
+
+/* ------------------------------------------------------------------ queue */
+function renderQueue() {
+  const rid = S.rid;
+  const box = h('div', {}, h('div', { class: 'spinner' }));
+  view.replaceChildren(box);
+  const tick = async () => {
+    if (rid !== S.rid) return clearInterval(S.timer);
+    let d;
+    try { d = await api('/api/jobs?view=active'); } catch (e) { box.replaceChildren(errorPanel(e, render)); return; }
+    if (rid !== S.rid) return;
+    paintQueue(box, d);
+  };
+  tick();
+  S.timer = setInterval(tick, 1500);
+}
+
+function paintQueue(box, d) {
+  const cur = d.current;
+  const queued = d.jobs.filter(j => j.status === 'queued');
+  const failed = d.jobs.filter(j => j.status === 'failed');
+  const left = queued.reduce((a, j) => a + (j.size - j.bytes_done), 0) + (cur ? cur.size - cur.bytes : 0);
+  const nodes = [h('div', { class: 'bar' },
+    h('div', { class: 'grow muted small' }, (queued.length || cur)
+      ? [`${queued.length + (cur ? 1 : 0)} file(s) to go`, fmtBytes(left), cur ? fmtRate(cur.speed) : null]
+        .filter(Boolean).join(' · ') : 'Nothing queued.'),
+    h('button', {
+      class: 'btn small', onclick: async () => { await post('/api/settings', { paused: !d.paused }); refreshState(); },
+    }, d.paused ? 'Resume' : 'Pause'))];
+  if (d.paused) nodes.push(h('div', { class: 'panel warn' }, 'Downloads are paused.'));
+  if (d.workerError) nodes.push(h('div', { class: 'panel' }, h('b', {}, 'Waiting: '), d.workerError));
+  if (cur) {
+    const pct = cur.size ? Math.min(100, (100 * cur.bytes) / cur.size) : 0;
+    const done = `${fmtBytes(cur.bytes)} of ${fmtBytes(cur.size)}`;
+    const line = {
+      connecting: ['Connecting', fmtRate(cur.speed)],
+      retrying: [`Connection lost, retrying in ${cur.retry_in ?? 0} s (attempt ${cur.attempt} of ${cur.max_attempts})`,
+        fmtRate(cur.speed)],
+      finishing: ['Finishing: subtitles', fmtRate(cur.speed)],
+    }[cur.state] || [done, fmtRate(cur.speed), fmtEta(cur.eta)];
+    nodes.push(h('div', { class: 'panel' },
+      h('div', { style: 'font-weight:600' }, cur.title),
+      h('div', { class: 'progress' }, h('div', { style: `width:${pct.toFixed(1)}%` })),
+      h('div', { class: 'bar small muted', style: 'margin:0' },
+        h('span', { class: 'grow' }, line.filter(Boolean).join(' · ')),
+        h('button', { class: 'btn small', onclick: () => post(`/api/jobs/${cur.id}/cancel`) }, 'Cancel')),
+      cur.state === 'retrying' && cur.error ? h('div', { class: 'small muted' }, cur.error) : null));
+  }
+  if (failed.length) {
+    nodes.push(h('h3', {}, 'Failed'));
+    nodes.push(h('div', { class: 'list' }, failed.map(j => jobRow(j))));
+  }
+  if (queued.length) {
+    nodes.push(h('h3', {}, 'Up next'));
+    nodes.push(h('div', { class: 'list' }, queued.slice(0, 300).map(j => jobRow(j))));
+  }
+  box.replaceChildren(...nodes);
+}
+
+function jobRow(j) {
+  const act = async (what) => {
+    try {
+      const r = await post(`/api/jobs/${j.id}/${what}`);
+      if (what === 'remove') removedToast({ [r.result]: 1 });
+      S.dirty = true; refreshState(); render();
+    } catch (e) { toast(e.message); }
+  };
+  const actions = [];
+  if (j.status === 'queued' || j.status === 'downloading') actions.push(h('button', { class: 'btn small', onclick: () => act('cancel') }, 'Cancel'));
+  if (j.status === 'failed' || j.status === 'cancelled') actions.push(h('button', { class: 'btn small', onclick: () => act('retry') }, 'Retry'));
+  if (j.status === 'done' || j.status === 'failed') actions.push(h('button', {
+    class: 'btn small danger', onclick: () => { if (confirm(`Delete "${jobTitle(j)}" from ${dev()}?`)) act('remove'); },
+  }, 'Remove'));
+  const when = j.status === 'removed' ? `Removed ${fmtTime(j.removed_at)}`
+    : j.finished_at ? `${j.status === 'done' ? 'Copied' : 'Ended'} ${fmtTime(j.finished_at)}` : `Queued ${fmtTime(j.queued_at)}`;
+  const subs = j.subs_total ? `${j.subs_done}/${j.subs_total} subtitles` : null;
+  return h('div', { class: 'row' },
+    h('div', { class: 'main' },
+      h('div', { class: 'title' }, jobTitle(j)),
+      h('div', { class: 'small muted' }, h('span', { class: `chip ${j.status}` }, j.status), ' ',
+        [fmtBytes(j.size), when, subs, j.source === 'watchlist' ? 'from watchlist' : null].filter(Boolean).join(' · ')),
+      j.error ? h('div', { class: 'small warn' }, j.error) : null,
+      j.note && j.status !== 'done' ? h('div', { class: 'small muted' }, j.note) : null,
+      h('div', { class: 'mono muted' }, j.dest_rel)),
+    h('div', { class: 'actions' }, actions));
+}
+
+/* ---------------------------------------------------------------- history */
+async function renderHistory() {
+  await refreshState();
+  const rid = S.rid;
+  const list = h('div', { class: 'list' });
+  const more = h('div', { class: 'more' });
+  const search = h('input', { type: 'search', placeholder: 'Search history', value: S.q.history || '' });
+  const t = (S.state.totals || {}).done || { count: 0, bytes: 0 };
+  let offset = 0, debounce;
+  async function load(reset) {
+    if (reset) { offset = 0; list.replaceChildren(); }
+    const q = S.q.history || '';
+    let d;
+    try { d = await api(`/api/jobs?view=history&limit=100&offset=${offset}${q ? `&q=${encodeURIComponent(q)}` : ''}`); }
+    catch (e) { list.replaceChildren(errorPanel(e, render)); return; }
+    if (rid !== S.rid || (S.q.history || '') !== q) return;
+    d.jobs.forEach(j => list.append(jobRow(j)));
+    offset += d.jobs.length;
+    more.replaceChildren(d.jobs.length === 100 ? h('button', { class: 'btn', onclick: () => load(false) }, 'Load more') : '');
+    if (!list.children.length) list.append(h('div', { class: 'empty' }, q ? 'No matches.' : 'Nothing copied yet.'));
+  }
+  search.oninput = () => { clearTimeout(debounce); debounce = setTimeout(() => { S.q.history = search.value.trim(); load(true); }, 350); };
+  view.replaceChildren(
+    h('div', { class: 'bar' }, h('div', { class: 'grow' }, search)),
+    h('p', { class: 'muted small' }, `${t.count} file(s) currently on ${dev()} · ${fmtBytes(t.bytes)}`),
+    list, more);
+  load(true);
+}
+
+/* ------------------------------------------------------------ local files */
+const MAX_SELECT = 500;  // the delete API's limit per request
+
+function totalOf(entries) {
+  return entries.reduce((a, e) => ({ size: a.size + e.size, files: a.files + e.files, complete: a.complete && e.complete }),
+    { size: 0, files: 0, complete: true });
+}
+// A total that is only a lower bound always says so.
+const amount = t => `${t.complete ? '' : 'at least '}${fmtBytes(t.size)}`;
+const fileCount = t => `${t.files}${t.complete ? '' : '+'} file${t.files === 1 && t.complete ? '' : 's'}`;
+
+function fileRow(e, boxes, toggle) {
+  let cb = null;
+  if (e.deletable) {
+    cb = h('input', { type: 'checkbox', 'aria-label': `Select ${e.name}` });
+    cb.onchange = () => toggle(e, cb.checked);
+    boxes.set(e.path, cb);
+  }
+  const name = e.dir
+    ? h('button', { class: 'linkish', type: 'button', onclick: () => { S.path = e.path; render(); } }, e.name)
+    : e.name;
+  const meta = !e.dir ? fmtBytes(e.size)
+    : !e.complete && !e.size && !e.files ? 'size not counted' : `${amount(e)} · ${fileCount(e)}`;
+  return h('div', { class: 'row' }, cb,
+    h('span', { class: `ico ${e.dir ? 'dir' : 'file'}` }),
+    h('div', { class: 'main' },
+      h('div', { class: 'title' }, name),
+      h('div', { class: 'small muted' }, meta,
+        e.partial ? [' ', h('span', { class: 'chip' }, 'partial download')] : null,
+        e.link ? [' ', h('span', { class: 'chip' }, 'link')] : null)));
+}
+
+async function renderFiles() {
+  const rid = S.rid;
+  const path = S.path;
+  view.replaceChildren(h('div', { class: 'spinner' }));
+  let d;
+  try { d = await api(`/api/files?path=${encodeURIComponent(path)}`); }
+  catch (e) {
+    if (rid !== S.rid) return;
+    if (e.code === 'missing' && path) { S.path = ''; return render(); }
+    return view.replaceChildren(errorPanel(e, render));
+  }
+  if (rid !== S.rid) return;
+  const entries = [...d.entries];
+  const sel = new Map();
+  const boxes = new Map();
+  const summary = h('p', { class: 'muted small' });
+  const list = h('div', { class: 'list' });
+  const more = h('div', { class: 'more' });
+  const delBtn = h('button', { class: 'btn danger' });
+
+  const refresh = () => {
+    for (const [p, cb] of boxes) cb.checked = sel.has(p);
+    const t = totalOf([...sel.values()]);
+    delBtn.textContent = sel.size ? `Delete ${sel.size} selected · ${amount(t)}` : 'Select items to delete';
+    delBtn.disabled = !sel.size;
+    const all = totalOf(entries);
+    const free = d.disk ? ` · ${fmtBytes(d.disk.free)} free of ${fmtBytes(d.disk.total)}` : '';
+    summary.textContent = (entries.length < d.total
+      ? `Showing ${entries.length} of ${d.total} items · ${amount(all)} in those`
+      : `${d.total} item${d.total === 1 ? '' : 's'} · ${amount(all)}`) + free;
+  };
+  const toggle = (e, on) => {
+    if (on && !sel.has(e.path) && sel.size >= MAX_SELECT) toast(`Select at most ${MAX_SELECT} at a time`);
+    else if (on) sel.set(e.path, e);
+    else sel.delete(e.path);
+    refresh();
+  };
+  const pickAll = () => {
+    const all = entries.filter(e => e.deletable);
+    sel.clear();
+    all.slice(0, MAX_SELECT).forEach(e => sel.set(e.path, e));
+    if (all.length > MAX_SELECT) toast(`Selected the first ${MAX_SELECT}; delete them, then select the rest`);
+    refresh();
+  };
+  const paintMore = () => more.replaceChildren(entries.length < d.total
+    ? h('button', { class: 'btn', onclick: loadMore }, 'Load more') : '');
+  async function loadMore() {
+    more.replaceChildren(h('div', { class: 'spinner' }));
+    let p;
+    try { p = await api(`/api/files?path=${encodeURIComponent(path)}&offset=${entries.length}&token=${d.token}`); }
+    catch (e) {
+      if (rid !== S.rid) return;
+      if (e.code === 'changed') { toast('The folder changed, reloaded'); return render(); }
+      if (e.code === 'missing') { S.path = ''; return render(); }
+      return more.replaceChildren(errorPanel(e, loadMore));
+    }
+    if (rid !== S.rid) return;
+    entries.push(...p.entries);
+    d.disk = p.disk;
+    p.entries.forEach(e => list.append(fileRow(e, boxes, toggle)));
+    paintMore();
+    refresh();
+  }
+  delBtn.onclick = async () => {
+    const items = [...sel.values()];
+    const t = totalOf(items);
+    const what = items.length === 1 ? `"${items[0].name}"` : `${items.length} items`;
+    if (!confirm(`Delete ${what} from ${dev()}? ${amount(t)} in ${fileCount(t)}. `
+      + 'Queued downloads inside are cancelled. This cannot be undone.')) return;
+    delBtn.disabled = true;
+    try {
+      const r = await post('/api/files/delete', { paths: items.map(e => e.path) });
+      toast(r.errors.length ? `Deleted ${r.deleted} of ${items.length}. ${r.errors[0].path}: ${r.errors[0].error}`
+        : `Deleted ${r.deleted} item(s) · ${fmtBytes(r.bytes)} of data`);
+    } catch (e) {
+      toast(e.message);
+      if (e.code !== 'missing') { delBtn.disabled = false; return; }
+    }
+    S.dirty = true;
+    refreshState();
+    render();
+  };
+
+  const parts = path ? path.split('/') : [];
+  const crumbs = h('nav', { class: 'crumbs grow', 'aria-label': 'Folder' },
+    parts.length ? h('button', { class: 'linkish', type: 'button', onclick: () => { S.path = ''; render(); } }, 'Media')
+      : h('span', {}, 'Media'),
+    parts.map((p, i) => [h('span', { class: 'muted' }, '›'), i === parts.length - 1 ? h('span', {}, p)
+      : h('button', {
+        class: 'linkish', type: 'button', onclick: () => { S.path = parts.slice(0, i + 1).join('/'); render(); },
+      }, p)]));
+  entries.forEach(e => list.append(fileRow(e, boxes, toggle)));
+  if (!entries.length) list.append(h('div', { class: 'empty' }, 'This folder is empty.'));
+  const deletable = entries.some(e => e.deletable);
+  refresh();
+  paintMore();
+  view.replaceChildren(...[
+    h('div', { class: 'bar' }, crumbs, h('button', { class: 'btn small', onclick: render }, 'Refresh')),
+    summary,
+    parts.length ? null : h('p', { class: 'muted small' }, 'Library folders cannot be deleted here. Open one to delete what is inside.'),
+    list, more,
+    deletable ? h('div', { class: 'files-actions' },
+      h('button', { class: 'btn small', onclick: pickAll }, 'All'),
+      h('button', { class: 'btn small', onclick: () => { sel.clear(); refresh(); } }, 'None'),
+      h('span', { class: 'grow' }), delBtn) : null,
+  ].filter(Boolean));
+}
+
+/* --------------------------------------------------------------- settings */
+function renderSettings() {
+  const st = S.state;
+  const reserve = h('input', { type: 'number', min: '0', step: '1', value: st.reserveGb, style: 'width:110px' });
+  const connLine = st.conn
+    ? `Connected via ${st.conn.kind}: ${st.conn.url}`
+    : st.connError ? `Not connected: ${st.connError}` : 'Not connected yet';
+  view.replaceChildren(
+    h('div', { class: 'panel' }, h('h2', {}, 'Plex account'),
+      h('p', {}, st.user ? `Signed in as ${st.user}` : 'Signed in'),
+      h('button', {
+        class: 'btn danger small', onclick: async () => {
+          if (!confirm('Sign out of Plex? Your copy history stays.')) return;
+          await post('/api/auth/signout'); await refreshState(); render();
+        },
+      }, 'Sign out')),
+    h('div', { class: 'panel' }, h('h2', {}, 'Server'),
+      h('p', {}, st.serverName || ''), h('p', { class: `small ${st.conn ? 'muted' : 'warn'}` }, connLine),
+      st.conn && st.conn.kind === 'relay' ? h('p', { class: 'small warn' }, 'Plex Relay is very slow. Fix Remote Access or set a VPN address.') : null,
+      h('div', { class: 'bar' },
+        h('button', {
+          class: 'btn small', onclick: async () => {
+            try { const r = await post('/api/connect'); toast(`Connected via ${r.conn.kind}`); }
+            catch (e) { toast(e.message); }
+            await refreshState(); render();
+          },
+        }, 'Reconnect'),
+        h('button', { class: 'btn small', onclick: () => { S.libs = null; renderServers(); } }, 'Change server or address'))),
+    h('div', { class: 'panel' }, h('h2', {}, 'Downloads'),
+      h('div', { class: 'bar' },
+        h('button', {
+          class: 'btn small', onclick: async () => { await post('/api/settings', { paused: !st.paused }); await refreshState(); render(); },
+        }, st.paused ? 'Resume downloads' : 'Pause downloads')),
+      h('div', { class: 'field' }, h('label', {}, `Always keep this much free on ${dev()} (GB)`),
+        h('div', { class: 'bar', style: 'margin:0' }, reserve, h('button', {
+          class: 'btn small', onclick: async () => { await post('/api/settings', { reserveGb: reserve.value }); toast('Saved'); refreshState(); },
+        }, 'Save')))),
+    h('div', { class: 'panel' }, h('h2', {}, 'Storage'),
+      h('p', {}, `Device name: ${st.device}`,
+        h('span', { class: 'muted small' }, ' (the Unraid server name or host name; set TRAVELARR_NAME to change it)')),
+      h('p', { class: 'mono' }, st.mediaRoot),
+      st.disk ? h('p', {}, `${fmtBytes(st.disk.free)} free of ${fmtBytes(st.disk.total)}`)
+        : h('p', { class: 'warn' }, 'The media folder is missing. Map the media share to it.')),
+    h('p', { class: 'muted small' }, `travelarr ${st.version}`));
+}
+
+/* ------------------------------------------------------------------- boot */
+(async function init() {
+  const tab = location.hash.slice(1);
+  if (['watchlist', 'movies', 'tv', 'queue', 'history', 'files', 'settings'].includes(tab)) S.tab = tab;
+  await refreshState();
+  render();
+  setInterval(refreshState, 5000);
+})();

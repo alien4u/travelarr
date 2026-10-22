@@ -1,0 +1,621 @@
+"""Everything that talks to Plex: sign-in, server connection, browsing,
+turning a selection into file jobs, and the URLs the downloader fetches."""
+from __future__ import annotations
+
+import http.client
+import json
+import logging
+import socket
+import ssl
+import threading
+import time
+import urllib.parse
+import uuid
+from concurrent.futures import Future
+
+import plexapi
+import plexapi.config
+import requests
+from plexapi.exceptions import Unauthorized
+from plexapi.myplex import MyPlexAccount
+from plexapi.server import PlexServer
+from requests.certs import where as ca_bundle
+
+from .paths import dest_rel_for
+
+log = logging.getLogger("travelarr.plex")
+PLEX_TV = "https://plex.tv"
+
+# Picking a server address: every local/remote candidate is asked for /identity
+# at once, without the token, and the best one that answers as this server wins.
+PROBE_CONNECT = 3
+PROBE_READ = 3
+PROBE_DEADLINE = 5.0
+PROBE_MAX_BYTES = 64 << 10
+PROBE_MAX_CANDIDATES = 8
+# Process-wide cap on probes still running, including any stuck in a DNS lookup.
+_probe_slots = threading.BoundedSemaphore(32)
+_TLS = ssl.create_default_context(cafile=ca_bundle())
+
+RELAY_MAX_CANDIDATES = 3
+RELAY_DEADLINE = 20.0
+
+
+class NotReady(Exception):
+    """Sign-in or server choice missing, or the server is unreachable."""
+
+
+def _is_https(url: str) -> bool:
+    return url.lower().startswith("https://")
+
+
+def _redact(url: str) -> str:
+    """scheme://host[:port] for logs: never userinfo, path or query."""
+    try:
+        u = urllib.parse.urlsplit(url or "")
+        host = u.hostname
+    except ValueError:
+        host = None
+    if not host:
+        return "<unparseable address>"
+    try:
+        port = f":{u.port}" if u.port else ""
+    except ValueError:
+        port = ""
+    return f"{u.scheme.lower()}://{f'[{host}]' if ':' in host else host}{port}"
+
+
+def _origin(url: str) -> tuple[str | None, str | None]:
+    """A fixed address reduced to scheme://host[:port], or (None, why it was rejected)."""
+    try:
+        u = urllib.parse.urlsplit((url or "").strip())
+        u.port  # noqa: B018 - raises ValueError on a bad port
+    except ValueError:
+        return None, "invalid address or port"
+    scheme = u.scheme.lower()
+    if scheme not in ("http", "https"):
+        return None, "it must start with http:// or https://"
+    if not u.hostname:
+        return None, "it has no host"
+    if u.username is not None or u.password is not None:
+        return None, "it must not contain a user name or password"
+    if u.path not in ("", "/") or u.query or u.fragment:
+        return None, "it must be just the address, without a path or query"
+    return f"{scheme}://{u.netloc}", None
+
+
+def _left(deadline: float) -> float:
+    left = deadline - time.monotonic()
+    if left <= 0:
+        raise TimeoutError("probe deadline passed")
+    return left
+
+
+def _abort(sock: socket.socket) -> None:
+    try:
+        sock.shutdown(socket.SHUT_RDWR)  # wakes a blocked read in the probe thread
+    except OSError:
+        pass
+
+
+def _open(host: str, port: int, deadline: float) -> socket.socket:
+    """socket.create_connection, except every address attempt shares the deadline
+    (create_connection gives each resolved address its own full timeout)."""
+    err: OSError = OSError(f"no address for {host}")
+    for family, kind, proto, _, addr in socket.getaddrinfo(host, port, type=socket.SOCK_STREAM):
+        sock = socket.socket(family, kind, proto)
+        try:
+            sock.settimeout(min(PROBE_CONNECT, _left(deadline)))
+            sock.connect(addr)
+            return sock
+        except OSError as e:
+            sock.close()
+            err = e
+    raise err
+
+
+class _Rejected:
+    """Probe outcome: the server answered an authenticated probe with 401."""
+
+
+def _identity(url: str, deadline: float, token: str | None = None) -> str | _Rejected | None:
+    """machineIdentifier answered at url, or None. Without a token it asks /identity;
+    with one (relay, https only) it asks / instead, and a 401 comes back as _Rejected.
+    Follows no redirects, and gives up at the deadline even if the peer keeps trickling
+    bytes: connecting and the TLS handshake share the remaining time, and a watchdog
+    shuts the socket after that."""
+    sock = conn = watchdog = None
+    try:
+        u = urllib.parse.urlsplit(url)
+        https = u.scheme == "https"
+        if token and not https:
+            return None
+        port = u.port or (443 if https else 80)
+        sock = _open(u.hostname, port, deadline)
+        if https:
+            sock.settimeout(_left(deadline))
+            sock = _TLS.wrap_socket(sock, server_hostname=u.hostname)
+        sock.settimeout(min(PROBE_READ, _left(deadline)))
+        watchdog = threading.Timer(_left(deadline), _abort, (sock,))
+        watchdog.daemon = True
+        watchdog.start()
+        conn = (http.client.HTTPSConnection(u.hostname, port, context=_TLS) if https
+                else http.client.HTTPConnection(u.hostname, port))
+        conn.sock = sock
+        headers = {"Accept": "application/json"}
+        if token:
+            headers["X-Plex-Token"] = token
+        conn.request("GET", "/" if token else "/identity", headers=headers)
+        r = conn.getresponse()
+        if r.status == 401 and token:
+            return _Rejected()
+        if r.status != 200:
+            return None
+        body = r.read(PROBE_MAX_BYTES + 1)
+        if len(body) > PROBE_MAX_BYTES or time.monotonic() > deadline:
+            return None
+        return json.loads(body)["MediaContainer"]["machineIdentifier"]
+    except Exception as e:  # noqa: BLE001
+        log.debug("probe %s failed: %s", _redact(url), e)
+        return None
+    finally:
+        if watchdog is not None:
+            watchdog.cancel()
+        if sock is not None:
+            sock.close()
+
+
+def _probe(url: str, deadline: float, token: str | None, fut: Future) -> None:
+    try:
+        fut.set_result(_identity(url, deadline, token))
+    finally:
+        _probe_slots.release()
+
+
+class _PlexSession(requests.Session):
+    """Every request that carries the token goes through this session. It never
+    follows an https -> http redirect, and drops X-Plex-Token wherever requests
+    drops Authorization (another host or port)."""
+
+    def get_redirect_target(self, resp):
+        target = super().get_redirect_target(resp)
+        if target and _is_https(resp.url) and not _is_https(urllib.parse.urljoin(resp.url, target)):
+            log.warning("refused redirect from %s to %s", _redact(resp.url),
+                        _redact(urllib.parse.urljoin(resp.url, target)))
+            return None
+        return target
+
+    def rebuild_auth(self, prepared_request, response):
+        super().rebuild_auth(prepared_request, response)
+        if self.should_strip_auth(response.request.url, prepared_request.url):
+            prepared_request.headers.pop("X-Plex-Token", None)
+
+
+class PlexGateway:
+    def __init__(self, store, version: str):
+        self.store = store
+        self.version = version
+        cid = store.get("client_id")
+        if not cid:
+            cid = f"travelarr-{uuid.uuid4()}"
+            store.set("client_id", cid)
+        self.client_id = cid
+        # Make every plexapi request identify as this device, so it shows up
+        # once (as "travelarr") under Plex > Settings > Authorized Devices.
+        plexapi.X_PLEX_PRODUCT = "travelarr"
+        plexapi.X_PLEX_IDENTIFIER = cid
+        plexapi.X_PLEX_VERSION = version
+        plexapi.X_PLEX_DEVICE_NAME = store.get("device_name", "travelarr")
+        plexapi.BASE_HEADERS = plexapi.config.reset_base_headers()
+
+        self.plex_tv = PLEX_TV
+        self.session = _PlexSession()
+        self._lock = threading.RLock()
+        self._account = None
+        self._server = None
+        self._resource = None
+        self.conn: dict | None = None
+        self._fail: tuple[float, str] | None = None
+        self._pin: dict | None = None
+        self._sections: dict[str, object] = {}
+
+    # ------------------------------------------------------------------ auth
+    def _headers(self) -> dict:
+        return {"Accept": "application/json", "X-Plex-Product": "travelarr",
+                "X-Plex-Client-Identifier": self.client_id, "X-Plex-Version": self.version,
+                "X-Plex-Device-Name": self.store.get("device_name", "travelarr"),
+                "X-Plex-Platform": "Linux"}
+
+    def token(self) -> str | None:
+        return self.store.get("token")
+
+    def start_login(self) -> str:
+        r = self.session.post(f"{self.plex_tv}/api/v2/pins", params={"strong": "true"},
+                              headers=self._headers(), timeout=20)
+        r.raise_for_status()
+        d = r.json()
+        self._pin = {"id": d["id"], "code": d["code"]}
+        q = urllib.parse.urlencode({"clientID": self.client_id, "code": d["code"],
+                                    "context[device][product]": "travelarr"})
+        return f"https://app.plex.tv/auth#?{q}"
+
+    def check_login(self) -> bool:
+        if self.token():
+            return True
+        if not self._pin:
+            return False
+        r = self.session.get(f"{self.plex_tv}/api/v2/pins/{self._pin['id']}",
+                             headers=self._headers(), timeout=20)
+        if r.status_code == 404:  # PIN expired
+            self._pin = None
+            return False
+        r.raise_for_status()
+        tok = r.json().get("authToken")
+        if not tok:
+            return False
+        self.store.set("token", tok)
+        self._pin = None
+        self.reset()
+        try:
+            self.store.set("username", self.account().username)
+        except Exception as e:  # noqa: BLE001
+            log.warning("signed in but could not read the account: %s", e)
+        return True
+
+    def sign_out(self) -> None:
+        for k in ("token", "username", "server_id", "server_name", "preferred_url"):
+            self.store.set(k, None)
+        self.reset()
+
+    def reset(self) -> None:
+        with self._lock:
+            self._account = self._server = self._resource = self.conn = None
+            self._fail = None
+            self._sections.clear()
+
+    def invalidate(self) -> None:
+        """Drop the server connection (e.g. after a network error); the next
+        call reconnects, picking local or remote automatically."""
+        with self._lock:
+            self._server = self.conn = None
+            self._sections.clear()
+
+    def account(self) -> MyPlexAccount:
+        with self._lock:
+            tok = self.token()
+            if not tok:
+                raise NotReady("Not signed in to Plex")
+            if self._account is None:
+                self._account = MyPlexAccount(token=tok, session=self.session, timeout=20)
+            return self._account
+
+    # ---------------------------------------------------------------- server
+    def servers(self) -> list[dict]:
+        out = []
+        for r in self.account().resources():
+            if "server" not in (r.provides or ""):
+                continue
+            out.append({"id": r.clientIdentifier, "name": r.name, "owned": bool(r.owned),
+                        "online": r.presence,
+                        "connections": [{"uri": c.uri, "local": bool(c.local), "relay": bool(c.relay)}
+                                        for c in r.connections]})
+        return out
+
+    def select_server(self, server_id: str, name: str | None, preferred_url: str | None,
+                      allow_relay: bool) -> None:
+        self.store.set("server_id", server_id)
+        self.store.set("server_name", name)
+        self.store.set("preferred_url", (preferred_url or "").strip() or None)
+        self.store.set("allow_relay", bool(allow_relay))
+        self.reset()
+
+    def server(self) -> PlexServer:
+        with self._lock:
+            if self._server is not None:
+                return self._server
+            if self._fail and time.time() - self._fail[0] < 20:
+                raise NotReady(self._fail[1])
+            try:
+                return self._connect()
+            except NotReady as e:
+                self._fail = (time.time(), str(e))
+                raise
+
+    def _connect(self) -> PlexServer:
+        sid = self.store.get("server_id")
+        if not sid:
+            raise NotReady("Choose your Plex server")
+        try:
+            res = next((r for r in self.account().resources() if r.clientIdentifier == sid), None)
+        except requests.RequestException as e:
+            raise NotReady(f"Cannot reach plex.tv: {e}") from None
+        if res is None:
+            raise NotReady("That server is no longer in your Plex account")
+        tok = res.accessToken or self.token()
+        url, skipped = self._manual_url(res, sid)
+        kind = "manual"
+        if url is None:
+            url, more = self._first_reachable(self._auto_candidates(res), sid)
+            skipped += more
+            kind = self._kind(res, url) if url else None
+        if url is None and not skipped and self.store.get("allow_relay"):
+            # Relay addresses are not checked with /identity first; each one gets the
+            # token on an authenticated check instead, over https only.
+            url, skipped = self._first_reachable(self._relay_candidates(res), sid, RELAY_DEADLINE, tok)
+            kind = "relay"
+        if url is None and skipped:
+            log.warning("connection checks for %s are still pending; DNS may not be answering", res.name)
+            raise NotReady("Connection checks are still pending (DNS not answering?); retrying shortly")
+        if url is None:
+            raise NotReady(self._unreachable(res))
+        try:
+            srv = PlexServer(url, tok, session=self.session, timeout=15)
+        except Unauthorized:
+            raise
+        except Exception as e:  # noqa: BLE001
+            raise NotReady(f"{res.name} answered at {url} but the connection failed: {e}") from None
+        self._server, self._resource = srv, res
+        self._fail = None
+        self.conn = {"name": res.name, "url": srv._baseurl, "kind": kind}
+        log.info("connected to %s via %s (%s)", res.name, kind, srv._baseurl)
+        return srv
+
+    @staticmethod
+    def _unreachable(res) -> str:
+        return (f"Cannot reach {res.name}. At home it uses the LAN address; away it needs "
+                f"Plex Remote Access (direct, not relay) or your VPN.")
+
+    @staticmethod
+    def _auto_candidates(res) -> list[str]:
+        """Local then remote addresses. Only https when the server requires it (plexapi's
+        ssl=True is not enough: a connection's uri can itself be http://); otherwise every
+        https address comes before any http one."""
+        urls = list(dict.fromkeys(u for u in res.preferred_connections(locations=["local", "remote"]) if u))
+        if res.httpsRequired:
+            return [u for u in urls if _is_https(u)]
+        return sorted(urls, key=lambda u: not _is_https(u))
+
+    @staticmethod
+    def _relay_candidates(res) -> list[str]:
+        urls = dict.fromkeys(u for u in res.preferred_connections(locations=["relay"]) if u)
+        return [u for u in urls if _is_https(u)][:RELAY_MAX_CANDIDATES]
+
+    @staticmethod
+    def _kind(res, url: str) -> str:
+        for c in res.connections:
+            if url.rstrip("/") in ((c.uri or "").rstrip("/"), (c.httpuri or "").rstrip("/")):
+                return "relay" if c.relay else "local" if c.local else "remote"
+        return "remote"
+
+    def _manual_url(self, res, sid: str) -> tuple[str | None, int]:
+        """The fixed address if it answers as this server, plus the skipped-probe count."""
+        raw = self.store.get("preferred_url")
+        if not raw:
+            return None, 0
+        url, why = _origin(raw)
+        if url is None:
+            log.warning("ignoring fixed address %s: %s", _redact(raw), why)
+            return None, 0
+        if res.httpsRequired and not _is_https(url):
+            log.warning("ignoring fixed address %s: %s requires https", _redact(raw), res.name)
+            return None, 0
+        found, skipped = self._first_reachable([url], sid)
+        if found is None and not skipped:
+            log.warning("fixed address %s did not answer as %s; trying Plex's own addresses",
+                        _redact(raw), res.name)
+        return found, skipped
+
+    def _first_reachable(self, urls: list[str], machine_id: str, window: float | None = None,
+                         token: str | None = None) -> tuple[str | None, int]:
+        """The first URL, in priority order, that answers as this server, plus how many
+        candidates were skipped for lack of a probe slot. All are asked at once; a
+        lower-priority answer only wins once every higher one has failed or run out of time."""
+        urls = list(dict.fromkeys(urls))[:PROBE_MAX_CANDIDATES]
+        deadline = time.monotonic() + (PROBE_DEADLINE if window is None else window)
+        futures: list[Future | None] = []
+        for url in urls:
+            f = None
+            if _probe_slots.acquire(blocking=False):
+                f = Future()
+                try:
+                    threading.Thread(target=_probe, args=(url, deadline, token, f), name="plex-probe",
+                                     daemon=True).start()
+                except RuntimeError:
+                    _probe_slots.release()
+                    f = None
+            futures.append(f)
+        rejected = False
+        for url, f in zip(urls, futures):
+            if f is None:
+                continue
+            try:
+                answer = f.result(timeout=max(0.0, deadline - time.monotonic()))
+            except TimeoutError:
+                continue
+            if answer == machine_id:
+                return url, futures.count(None)
+            rejected = rejected or isinstance(answer, _Rejected)
+        if rejected:
+            raise Unauthorized("Plex rejected the token")
+        return None, futures.count(None)
+
+    # ---------------------------------------------------------------- browse
+    def _section(self, key) -> object:
+        key = str(key)
+        with self._lock:
+            if key not in self._sections:
+                self._sections[key] = self.server().library.sectionByID(int(key))
+            return self._sections[key]
+
+    def libraries(self) -> list[dict]:
+        out = []
+        for s in self.server().library.sections():
+            if s.type in ("movie", "show"):
+                self._sections[str(s.key)] = s
+                out.append({"key": str(s.key), "title": s.title, "type": s.type})
+        return out
+
+    @staticmethod
+    def summary(it) -> dict:
+        it._autoReload = False  # listing data is enough; avoid a request per item
+        d = {"ratingKey": str(it.ratingKey), "type": it.type, "title": it.title,
+             "year": getattr(it, "year", None), "thumb": it.thumb}
+        if it.type == "movie":
+            added = getattr(it, "addedAt", None)
+            d["addedAt"] = int(added.timestamp()) if added else None
+            d["watched"] = bool(getattr(it, "viewCount", 0))
+            try:
+                d["size"] = sum((p.size or 0) for m in it.media for p in m.parts)
+            except Exception:  # noqa: BLE001
+                d["size"] = None
+        elif it.type == "show":
+            leaf = getattr(it, "leafCount", 0) or 0
+            d["episodes"] = leaf
+            d["unwatched"] = leaf - (getattr(it, "viewedLeafCount", 0) or 0)
+        return d
+
+    def list_items(self, section_key: str, q: str | None, start: int, size: int, sort: str = "title") -> dict:
+        """sort 'recent': movies by date added, shows by their newest episode
+        (a show's own addedAt misses new episodes of old shows). titleSort
+        breaks ties so pages never overlap."""
+        sec = self._section(section_key)
+        srv = self.server()
+        order = "titleSort"
+        if sort == "recent":
+            order = "addedAt:desc,titleSort" if sec.type == "movie" else "episode.addedAt:desc,titleSort"
+        params = {"type": 1 if sec.type == "movie" else 2, "sort": order}
+        if q:
+            params["title"] = q
+        key = f"/library/sections/{sec.key}/all?{urllib.parse.urlencode(params)}"
+        items = srv.fetchItems(key, container_start=start, container_size=size, maxresults=size)
+        head = srv.query(key, headers={"X-Plex-Container-Start": "0", "X-Plex-Container-Size": "0"})
+        total = int(head.attrib.get("totalSize") or head.attrib.get("size") or 0)
+        return {"items": [self.summary(i) for i in items], "total": total, "start": start}
+
+    def watchlist(self) -> list[dict]:
+        srv = self.server()
+        out = []
+        for w in self.account().watchlist():
+            lib = None
+            if w.type in ("movie", "show"):
+                try:
+                    found = srv.library.search(guid=w.guid, libtype=w.type)
+                    lib = found[0] if found else None
+                except Exception:  # noqa: BLE001
+                    lib = None
+            if lib is not None:
+                d = self.summary(lib)
+                d["inLibrary"] = True
+            else:
+                w._autoReload = False
+                d = {"ratingKey": None, "type": w.type, "title": w.title,
+                     "year": getattr(w, "year", None), "thumb": w.thumb, "inLibrary": False}
+            out.append(d)
+        return out
+
+    def _part(self, video, part, sec) -> dict:
+        return {"id": part.id, "key": part.key, "size": part.size or 0, "file": part.file,
+                "dest": dest_rel_for(part.file, sec.locations, sec.title)}
+
+    def item(self, rating_key: str) -> dict:
+        it = self.server().fetchItem(int(rating_key))
+        sec = self._section(it.librarySectionID)
+        d = self.summary(it)
+        d["summary"] = getattr(it, "summary", "")
+        if it.type in ("movie", "episode"):
+            d["parts"] = [self._part(it, p, sec) for p in it.iterParts()]
+            d["size"] = sum(p["size"] for p in d["parts"])
+            if it.type == "episode":
+                d["showKey"] = str(it.grandparentRatingKey)
+        if it.type == "show":
+            seasons: dict[int, dict] = {}
+            for ep in it.episodes():
+                ep._autoReload = False
+                s = seasons.setdefault(ep.parentIndex if ep.parentIndex is not None else -1,
+                                       {"index": ep.parentIndex, "title": ep.parentTitle,
+                                        "episodes": []})
+                parts = [self._part(ep, p, sec) for p in ep.iterParts()]
+                s["episodes"].append({"ratingKey": str(ep.ratingKey), "index": ep.index,
+                                      "title": ep.title, "watched": ep.isWatched,
+                                      "size": sum(p["size"] for p in parts),
+                                      "dest": parts[0]["dest"] if parts else None})
+            d["seasons"] = [seasons[k] for k in sorted(seasons)]
+            d["size"] = sum(e["size"] for s in d["seasons"] for e in s["episodes"])
+        return d
+
+    # ------------------------------------------------------------------ plan
+    def plan(self, keys: list[str], mode: str = "unwatched", source: str = "browse",
+             only: set[str] | None = None) -> list[dict]:
+        """Expand movies / episodes / seasons / shows into one job per file.
+        `only` limits a show or season to those episode keys (one request
+        for the whole show instead of one per episode)."""
+        srv = self.server()
+        jobs: list[dict] = []
+        for rk in keys:
+            it = srv.fetchItem(int(rk))
+            sec = self._section(it.librarySectionID)
+            if it.type in ("movie", "episode"):
+                videos = [it]
+            elif it.type in ("show", "season"):
+                videos = it.episodes()
+                for v in videos:
+                    v._autoReload = False  # the episode list already has parts and indices
+                if only:
+                    videos = [v for v in videos if str(v.ratingKey) in only]
+                elif mode == "unwatched":
+                    videos = [v for v in videos if not v.isWatched]
+            else:
+                continue
+            for v in videos:
+                for p in v.iterParts():
+                    jobs.append({
+                        "rating_key": str(v.ratingKey),
+                        "show_key": str(v.grandparentRatingKey) if v.type == "episode" else None,
+                        "kind": v.type,
+                        "title": v.title,
+                        "show_title": getattr(v, "grandparentTitle", None),
+                        "season": getattr(v, "parentIndex", None),
+                        "episode": getattr(v, "index", None) if v.type == "episode" else None,
+                        "year": getattr(v, "year", None),
+                        "part_id": p.id,
+                        "part_key": p.key,
+                        "size": p.size or 0,
+                        "dest_rel": dest_rel_for(p.file, sec.locations, sec.title),
+                        "source": source,
+                    })
+        return jobs
+
+    # -------------------------------------------------------------- download
+    def file_request(self, part_key: str) -> tuple[str, dict]:
+        srv = self.server()
+        return f"{srv._baseurl}{part_key}?download=1", {"X-Plex-Token": srv._token}
+
+    def subtitle_streams(self, rating_key: str, part_id: int) -> list[dict]:
+        """External (sidecar) subtitles only; embedded ones travel inside the file."""
+        it = self.server().fetchItem(int(rating_key))
+        for p in it.iterParts():
+            if p.id == part_id:
+                return [{"key": s.key, "codec": (s.codec or "").lower(),
+                         "lang": s.languageTag or s.languageCode, "forced": bool(s.forced),
+                         "hi": bool(s.hearingImpaired), "title": s.displayTitle}
+                        for s in p.subtitleStreams() if s.key]
+        return []
+
+    def fetch_bytes(self, key: str, max_bytes: int = 20 << 20) -> bytes:
+        srv = self.server()
+        with self.session.get(f"{srv._baseurl}{key}", headers={"X-Plex-Token": srv._token},
+                              stream=True, timeout=(15, 60)) as r:
+            r.raise_for_status()
+            buf = bytearray()
+            for chunk in r.iter_content(65536):
+                buf += chunk
+                if len(buf) > max_bytes:
+                    raise ValueError("subtitle larger than expected")
+            return bytes(buf)
+
+    def thumb(self, path: str, width: int, height: int) -> tuple[bytes, str]:
+        srv = self.server()
+        url = srv.transcodeImage(path, height, width)
+        r = self.session.get(url, timeout=20)
+        r.raise_for_status()
+        return r.content, r.headers.get("Content-Type", "image/jpeg")

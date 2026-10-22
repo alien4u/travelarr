@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="light dark">
+<title>travelarr</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%23e5a00d'/%3E%3Cpath d='M9 17l5 5 9-12' stroke='%23111' stroke-width='3.2' fill='none' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header class="top">
+  <div class="brand"><span class="logo"></span>travelarr</div>
+  <button id="pill" class="pill" type="button" title="Connection and free space"></button>
+</header>
+<nav id="tabs" class="tabs" aria-label="Sections">
+  <button data-tab="watchlist">Watchlist</button>
+  <button data-tab="movies">Movies</button>
+  <button data-tab="tv">TV Shows</button>
+  <button data-tab="queue">Queue <span id="qcount" class="count"></span></button>
+  <button data-tab="history">History</button>
+  <button data-tab="files">Local Files</button>
+  <button data-tab="settings">Settings</button>
+</nav>
+<main id="view" class="view"></main>
+<div id="sheet" class="sheet" hidden>
+  <div class="sheet-backdrop" data-close></div>
+  <section class="sheet-panel" role="dialog" aria-modal="true">
+    <button class="sheet-close" data-close aria-label="Close">&times;</button>
+    <div id="sheet-body"></div>
+  </section>
+</div>
+<div id="toast" class="toast" role="status" aria-live="polite"></div>
+<script src="/static/app.js"></script>
+</body>
+</html>
