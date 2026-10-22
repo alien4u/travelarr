@@ -26,9 +26,10 @@ from .plexgw import NotReady, PlexGateway
 from .store import Store, now
 from .worker import CHANGED, Downloader
 
-VERSION = "2.3.0"
+VERSION = "2.4.0"
 STATIC = os.path.join(os.path.dirname(__file__), "static")
 LOCAL_NOTE = "deleted in Local Files"
+MAX_QUEUE_KEYS = 200  # bounds the Plex requests one queue call makes
 USERNAME_RE = re.compile(r"[A-Za-z0-9._@-]{1,64}")  # no ':' (impossible in Basic auth), safe to log
 log = logging.getLogger("travelarr")
 
@@ -273,6 +274,8 @@ def create_app(data_dir: str | None = None, media_root: str | None = None,
         keys = [str(k) for k in body.get("keys", []) if k]
         if not keys:
             return err(400, "nothing selected")
+        if len(keys) > MAX_QUEUE_KEYS:
+            return err(400, f"Too many titles at once (at most {MAX_QUEUE_KEYS})")
         mode = body.get("mode", "unwatched")
         only = {str(k) for k in body.get("only") or []} or None
         jobs = gw.plan(keys, mode=mode, source=body.get("source", "browse"), only=only)

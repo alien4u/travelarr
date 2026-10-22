@@ -25,6 +25,8 @@ travel NAS.
 - Browse your Watchlist, Movies and TV Shows with posters and search, sorted A-Z or by Recently added.
 - Copy movies, whole shows, seasons or single episodes. Unwatched episodes are preselected and the total size is shown
   before you start.
+- **Select** in Movies, TV Shows and Watchlist to pick many titles at once (shift-click for a range) and copy them in
+  one go; selected shows copy their unwatched or all episodes.
 - Original files only, plus the external subtitles Plex knows about (`Movie.es.srt`, `Movie.en.forced.srt`).
   Subtitles inside the file come along automatically.
 - Same folder layout as your home library (`Movies/...`, `TV-Shows/...`).

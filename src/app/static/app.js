@@ -3,7 +3,8 @@
 /* ---------------------------------------------------------------- helpers */
 const $ = (s, el = document) => el.querySelector(s);
 const view = $('#view');
-const S = { state: null, tab: 'watchlist', libs: null, lib: {}, q: {}, sort: {}, rid: 0, timer: null, dirty: false, path: '' };
+const S = { state: null, tab: 'watchlist', libs: null, lib: {}, q: {}, sort: {}, rid: 0, timer: null, dirty: false, path: '',
+  pick: null };
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 const dev = () => (S.state && S.state.device) || 'NAS';
 
@@ -133,10 +134,154 @@ function card(item, recent) {
       .filter(Boolean).join(' · ');
   }
   if (item.inLibrary === false) sub = 'Not in your library';
+  p.append(h('span', { class: 'tick' }));
+  const el = h('button', { class: 'card', type: 'button', onclick: e => cardClick(item, el, e) },
+    p, h('div', { class: 't' }, item.title), h('div', { class: 's' }, sub));
+  el.dataset.rk = item.ratingKey || '';
+  el.item = item;
+  return el;
+}
+
+/* ----------------------------------------------------------------- select */
+// One selection at a time, for the tab it was started on. S.pick.busy locks it
+// while its copy request runs.
+const MAX_PICK = 100;  // the server takes at most 200 titles per request
+const pickable = i => !!i.ratingKey && (i.type === 'show' || !i.copy || i.copy === 'failed');
+const picking = () => S.pick && S.pick.tab === S.tab ? S.pick : null;
+
+function whyNot(i) {
+  if (!i.ratingKey) return 'Not in your Plex library';
+  return ({ done: `Already on ${dev()}`, queued: 'Already queued', downloading: 'Copying now' })[i.copy] || statusOf(i.copy)[0];
+}
+
+function cardClick(item, el, e) {
+  const p = picking();
+  if (!p) return item.ratingKey ? openItem(item.ratingKey) : toast('Not in your Plex library, nothing to copy');
+  if (p.busy) return;
+  if (!pickable(item)) return toast(whyNot(item));
+  const cards = [...view.querySelectorAll('.card')];
+  const from = e.shiftKey && p.last ? cards.findIndex(c => c.dataset.rk === p.last) : -1;
+  if (from >= 0) {
+    const to = cards.indexOf(el);
+    const range = cards.slice(Math.min(from, to), Math.max(from, to) + 1).map(c => c.item).filter(pickable);
+    if (!addPicks(range)) toast(`Select at most ${MAX_PICK} titles at a time`);
+  } else if (p.items.has(item.ratingKey)) {
+    p.items.delete(item.ratingKey);
+  } else if (!addPicks([item])) {
+    toast(`Select at most ${MAX_PICK} titles at a time`);
+  }
+  p.last = item.ratingKey;
+  paintPick();
+}
+
+// Adds what fits under the cap; false when something did not fit.
+function addPicks(items) {
+  const p = S.pick;
+  for (const i of items) {
+    if (p.items.has(i.ratingKey)) continue;
+    if (p.items.size >= MAX_PICK) return false;
+    p.items.set(i.ratingKey, i);
+  }
+  return true;
+}
+
+// After a load: refresh the selected titles that came back and drop those that
+// can no longer be copied. A complete list (the Watchlist) also drops the ones
+// that are not in it any more.
+function reconcile(items, complete) {
+  const p = picking();
+  if (!p || p.busy) return;
+  const seen = new Map(items.filter(i => i.ratingKey).map(i => [i.ratingKey, i]));
+  let dropped = 0;
+  for (const rk of [...p.items.keys()]) {
+    const now = seen.get(rk);
+    if (now && pickable(now)) p.items.set(rk, now);
+    else if (now || complete) { p.items.delete(rk); dropped++; }
+  }
+  if (dropped) toast(dropped === 1 ? '1 selected title is no longer available and was unselected'
+    : `${dropped} selected titles are no longer available and were unselected`);
+}
+
+function pickToggle() {
   return h('button', {
-    class: 'card', type: 'button',
-    onclick: () => item.ratingKey ? openItem(item.ratingKey) : toast('Not in your Plex library, nothing to copy'),
-  }, p, h('div', { class: 't' }, item.title), h('div', { class: 's' }, sub));
+    class: 'btn small pick-toggle', type: 'button',
+    onclick: () => {
+      const p = picking();
+      if (p && p.busy) return;
+      S.pick = p ? null : { tab: S.tab, items: new Map(), last: null, mode: 'unwatched', busy: false };
+      paintPick();
+    },
+  }, 'Select');
+}
+
+function pickSummary(p) {
+  const all = [...p.items.values()];
+  const movies = all.filter(i => i.type !== 'show');
+  const shows = all.length - movies.length;
+  if (!all.length) return 'No titles selected';
+  const parts = [];
+  if (movies.length) {
+    const bytes = movies.reduce((a, i) => a + (i.size || 0), 0);
+    const some = movies.some(i => i.size == null) ? 'at least ' : '';
+    parts.push(`${movies.length} movie${movies.length === 1 ? '' : 's'} · ${some}${fmtBytes(bytes)}`);
+  }
+  if (shows) parts.push(`${shows} show${shows === 1 ? '' : 's'}`);
+  return parts.join(' + ');
+}
+
+// Repaints the Select button, the cards and the action bar from S.pick.
+function paintPick() {
+  const p = picking();
+  const busy = !!(p && p.busy);
+  for (const t of view.querySelectorAll('.pick-toggle')) {
+    t.classList.toggle('on', !!p);
+    t.setAttribute('aria-pressed', String(!!p));
+    t.disabled = busy;
+  }
+  for (const s of view.querySelectorAll('.lib-select')) s.disabled = busy;
+  for (const c of view.querySelectorAll('.card')) {
+    const on = !!p && p.items.has(c.dataset.rk);
+    c.classList.toggle('picking', !!p);
+    c.classList.toggle('picked', on);
+    c.classList.toggle('off', !!p && !pickable(c.item));
+    if (p) c.setAttribute('aria-pressed', String(on));
+    else c.removeAttribute('aria-pressed');
+  }
+  const slot = $('.pick-slot', view);
+  if (!slot) return;
+  if (!p) return slot.replaceChildren();
+  const shows = [...p.items.values()].some(i => i.type === 'show');
+  const mode = shows ? h('div', { class: 'seg', role: 'group', 'aria-label': 'Episodes of selected shows' },
+    [['unwatched', 'Unwatched episodes'], ['all', 'All episodes']].map(([v, label]) => h('button', {
+      type: 'button', class: v === p.mode ? 'on' : null, 'aria-pressed': String(v === p.mode), disabled: busy,
+      onclick: () => { p.mode = v; paintPick(); },
+    }, label))) : null;
+  const n = p.items.size;
+  slot.replaceChildren(h('div', { class: 'files-actions' },
+    h('div', { class: 'grow small' }, pickSummary(p)), mode,
+    h('button', { class: 'btn small', disabled: busy, onclick: selectShown }, 'Select all shown'),
+    h('button', { class: 'btn small', disabled: busy || !n, onclick: () => { p.items.clear(); p.last = null; paintPick(); } }, 'Clear'),
+    h('button', { class: 'btn small', disabled: busy, onclick: () => { S.pick = null; paintPick(); } }, 'Cancel'),
+    h('button', { class: 'btn primary', disabled: busy || !n, onclick: pickCopy },
+      busy ? 'Queuing...' : n ? `Copy ${n} to ${dev()}` : 'Select titles to copy')));
+}
+
+function selectShown() {
+  const items = [...view.querySelectorAll('.card')].map(c => c.item).filter(pickable);
+  if (!addPicks(items)) toast(`Selected the first ${MAX_PICK}; copy them, then select the rest`);
+  paintPick();
+}
+
+async function pickCopy() {
+  const p = picking();
+  if (!p || p.busy || !p.items.size) return;
+  p.busy = true;
+  paintPick();
+  const r = await queue([...p.items.keys()], p.mode, p.tab === 'watchlist' ? 'watchlist' : 'browse');
+  p.busy = false;
+  if (S.pick !== p) return;  // tab switched or a new selection started: only the toast applies
+  if (r) { S.pick = null; render(); }
+  else paintPick();
 }
 
 /* ------------------------------------------------------------ state & nav */
@@ -169,6 +314,7 @@ function paintPill() {
 }
 
 function setTab(tab) {
+  if (tab !== S.tab) S.pick = null;
   S.tab = tab;
   if (location.hash !== '#' + tab) history.replaceState(null, '', '#' + tab);
   render();
@@ -282,6 +428,7 @@ async function renderWatchlist() {
   try { ({ items } = await api('/api/watchlist')); }
   catch (e) { if (rid === S.rid) view.replaceChildren(errorPanel(e, render)); return; }
   if (rid !== S.rid) return;
+  reconcile(items, true);
   const copyable = items.filter(i => i.ratingKey && !(typeof i.copy === 'string' && i.copy !== 'failed'));
   const copyAll = h('button', { class: 'btn small primary', disabled: !copyable.length }, 'Copy all (unwatched)');
   copyAll.onclick = async () => {
@@ -292,9 +439,11 @@ async function renderWatchlist() {
   view.replaceChildren(
     h('div', { class: 'bar' },
       h('div', { class: 'grow muted small' }, `${items.length} on your Plex watchlist. Add titles from any Plex app, then refresh.`),
-      h('button', { class: 'btn small', onclick: render }, 'Refresh'), copyAll),
+      h('button', { class: 'btn small', onclick: render }, 'Refresh'), items.length ? pickToggle() : null, copyAll),
     items.length ? h('div', { class: 'grid' }, items.map(i => card(i)))
-      : h('div', { class: 'empty' }, 'Your watchlist is empty.'));
+      : h('div', { class: 'empty' }, 'Your watchlist is empty.'),
+    h('div', { class: 'pick-slot' }));
+  paintPick();
 }
 
 async function renderLibrary(type) {
@@ -307,8 +456,15 @@ async function renderLibrary(type) {
   if (!libs.length) return view.replaceChildren(h('div', { class: 'empty' }, `No ${type === 'movie' ? 'movie' : 'TV'} libraries on this server.`));
   const key = libs.some(l => l.key === S.lib[type]) ? S.lib[type] : libs[0].key;
   S.lib[type] = key;
-  const sel = libs.length > 1 ? h('select', { onchange: e => { S.lib[type] = e.target.value; render(); } },
-    libs.map(l => h('option', { value: l.key, selected: l.key === key }, l.title))) : null;
+  const sel = libs.length > 1 ? h('select', {
+    class: 'lib-select',
+    onchange: e => {
+      S.lib[type] = e.target.value;
+      const p = picking();
+      if (p) { p.items.clear(); p.last = null; }  // never keep titles from a library that is not on screen
+      render();
+    },
+  }, libs.map(l => h('option', { value: l.key, selected: l.key === key }, l.title))) : null;
   const search = h('input', { type: 'search', placeholder: `Search ${libs.find(l => l.key === key).title}`, value: S.q[type] || '' });
   const sort = S.sort[type] || 'title';
   const order = h('div', { class: 'seg', role: 'group', 'aria-label': 'Order' },
@@ -331,7 +487,9 @@ async function renderLibrary(type) {
     try { d = await api(`/api/library/${key}?start=${start}&size=${size}&sort=${sort}${q ? `&q=${encodeURIComponent(q)}` : ''}`); }
     catch (e) { if (rid === S.rid) more.replaceChildren(errorPanel(e, () => load(reset))); return; }
     if (rid !== S.rid || (S.q[type] || '') !== q) return;
+    reconcile(d.items, false);
     d.items.forEach(i => grid.append(card(i, sort === 'recent')));
+    paintPick();
     start += d.items.length;
     more.replaceChildren();
     const hasMore = d.total == null ? d.items.length === size : start < d.total;
@@ -343,7 +501,9 @@ async function renderLibrary(type) {
     clearTimeout(debounce);
     debounce = setTimeout(() => load(true), 350);
   };
-  view.replaceChildren(h('div', { class: 'bar' }, sel, order, h('div', { class: 'grow' }, search)), grid, more);
+  view.replaceChildren(h('div', { class: 'bar' }, sel, order, pickToggle(), h('div', { class: 'grow' }, search)),
+    grid, more, h('div', { class: 'pick-slot' }));
+  paintPick();
   load(true);
 }
 

@@ -63,6 +63,17 @@ select { width: auto; }
   font-weight: 700; color: #fff; background: var(--ok); box-shadow: 0 1px 4px rgba(0,0,0,.3); }
 .badge.busy { background: var(--busy); } .badge.bad { background: var(--bad); } .badge.dim { background: #555; }
 .more { display: flex; justify-content: center; margin: 22px 0; }
+.card.picking { user-select: none; }
+.card.picked .poster { outline: 3px solid var(--accent); outline-offset: -3px; }
+.card.off { opacity: .4; }
+.card .tick { display: none; position: absolute; right: 6px; top: 6px; width: 24px; height: 24px; border-radius: 50%;
+  border: 2px solid #fff; background: rgba(0,0,0,.35); box-shadow: 0 1px 4px rgba(0,0,0,.3); place-items: center; }
+.card.picking:not(.off) .tick { display: grid; }
+.card.picked .tick { background: var(--accent); border-color: var(--accent); }
+.card.picked .tick::after { content: ""; width: 6px; height: 11px; margin-top: -3px; border: solid var(--accent-ink);
+  border-width: 0 3px 3px 0; transform: rotate(45deg); }
+.pick-slot { display: contents; }  /* so the bar inside sticks to the view, not to this wrapper */
+.btn.pick-toggle.on { background: var(--accent); border-color: var(--accent); color: var(--accent-ink); }
 
 .panel { background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); padding: 16px; margin-bottom: 14px; }
 .panel h2 { margin: 0 0 10px; font-size: 16px; }

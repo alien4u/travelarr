@@ -325,6 +325,35 @@ class AppTest(PlexFixture):
         meta = [x for x in self.fake.requests[before:] if "/library/metadata/" in x[1]]
         self.assertEqual(len(meta), 2)                  # the show + its episode list, not one per episode
 
+    def test_many_titles_in_one_request(self):
+        self.sign_in_and_connect()
+        keys = {"keys": ["101", "103", "200"], "mode": "all"}
+        r = self.c.post("/api/queue", json=keys).json()
+        self.assertEqual((r["added"], r["skipped"]), (5, 0))   # 2 movies + all 3 episodes
+        self.assertEqual(r["bytes"], 300_000 + 50_000 + 80_000 + 90_000 + 70_000)
+        r = self.c.post("/api/queue", json=keys).json()
+        self.assertEqual((r["added"], r["skipped"]), (0, 5))
+        self.assertEqual(r["warning"], f"Everything selected is already on {self.dl.device} or in the queue.")
+        r = self.c.post("/api/queue", json={"keys": ["101", "102"]}).json()
+        self.assertEqual((r["added"], r["skipped"]), (1, 1))
+
+    def test_many_titles_with_unwatched_shows(self):
+        self.sign_in_and_connect()
+        r = self.c.post("/api/queue", json={"keys": ["102", "200"], "mode": "unwatched"}).json()
+        self.assertEqual(r["added"], 3)
+        self.assertEqual(sorted(j["title"] for j in self.store.jobs("active")), ["Loose Movie", "Second", "Third"])
+
+    def test_queue_size_bound(self):
+        self.sign_in_and_connect()
+        before = len(self.fake.requests)
+        r = self.c.post("/api/queue", json={"keys": [str(i) for i in range(1, main_mod.MAX_QUEUE_KEYS + 2)]})
+        self.assertEqual(r.status_code, 400)
+        self.assertEqual(r.json()["error"], "Too many titles at once (at most 200)")
+        self.assertEqual(len(self.fake.requests), before)   # refused before asking Plex
+        r = self.c.post("/api/queue", json={"keys": ["101"] * main_mod.MAX_QUEUE_KEYS})
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual((r.json()["added"], r.json()["skipped"]), (1, 199))
+
     def test_cancel_removes_partial(self):
         self.sign_in_and_connect()
         self.c.post("/api/queue", json={"keys": ["101"]})
@@ -1584,6 +1613,24 @@ class DeviceNameTest(unittest.TestCase):
             self.assertEqual(app.state.dl.device, "Road NAS")
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
+
+
+class StoreIndexTest(unittest.TestCase):
+    def test_duplicate_check_uses_dest_index_on_old_databases(self):
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, True)
+        path = os.path.join(tmp, "travelarr.db")
+        old = sqlite3.connect(path)
+        old.executescript(store_mod.SCHEMA.replace("CREATE INDEX IF NOT EXISTS jobs_dest   ON jobs(dest_rel);", ""))
+        self.assertNotIn("jobs_dest", {r[0] for r in old.execute("SELECT name FROM sqlite_master WHERE type='index'")})
+        old.close()
+        st = store_mod.Store(path)
+        self.addCleanup(st.close)
+        plan = " ".join(r["detail"] for r in st.rows(
+            "EXPLAIN QUERY PLAN SELECT id FROM jobs WHERE (part_id=? OR dest_rel=?) AND status IN "
+            "('queued','downloading','done')", (1, "x")))
+        self.assertIn("jobs_dest", plan)
+        self.assertIn("jobs_part", plan)
 
 
 class PasswordTest(unittest.TestCase):

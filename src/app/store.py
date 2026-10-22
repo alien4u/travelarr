@@ -42,6 +42,7 @@ CREATE INDEX IF NOT EXISTS jobs_rk     ON jobs(rating_key);
 CREATE INDEX IF NOT EXISTS jobs_show   ON jobs(show_key);
 CREATE INDEX IF NOT EXISTS jobs_status ON jobs(status);
 CREATE INDEX IF NOT EXISTS jobs_part   ON jobs(part_id);
+CREATE INDEX IF NOT EXISTS jobs_dest   ON jobs(dest_rel);
 """
 
 PRESENT = ("queued", "downloading", "done")
