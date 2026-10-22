@@ -469,6 +469,9 @@ class Downloader:
                 self._set(state="verifying")
                 ok = _sha256(temp, self._check_stop) == job["staging_mark"]
             if not ok:
+                # never trusted again: a retry starts from zero instead of resuming this file
+                self._rm(temp)
+                self._reset(job)
                 self._abandon(job, "the downloaded file changed before it was placed; run Re-sync again")
             self._place(job, temp, final)
             return

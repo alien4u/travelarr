@@ -2271,6 +2271,36 @@ class ResyncTest(PlexFixture):
         self.assertEqual(r.status_code, 409)
         self.assertEqual(real(jid)["status"], "removed")
 
+    # review round 6 ----------------------------------------------------------
+    def test_retry_after_a_rejected_staging_file_downloads_from_zero(self):
+        old, up, staging = self.crashed_while_placing()
+        with open(staging, "r+b") as fh:
+            fh.seek(150_000)
+            fh.write(b"tampered")
+        self.drain()
+        self.assertFalse(os.path.lexists(staging))
+        before = len(self.fake.requests)
+        self.c.post(f"/api/jobs/{up['id']}/retry")
+        self.drain()
+        self.assertEqual([r[2].get("Range") for r in self.part_requests(1101, before)], [None])  # from zero
+        self.assertEqual(self.read("Movies/Heat (1995)/Heat (1995) v2.mkv"), self.fake.parts[1101])
+
+    def test_changed_file_retry_is_one_step_with_remove(self):
+        self.c.post("/api/queue", json={"keys": ["102"]})
+        jid = self.store.next_queued()["id"]
+        self.store.update(jid, status="failed", error=worker.CHANGED + ": test")
+        self.store.remove(jid)
+        self.assertIsNone(self.store.requeue_changed(jid, self.gw.plan(["102"])))   # Remove came first
+        self.assertIsNone(self.store.next_queued())
+        self.c.post("/api/queue", json={"keys": ["103"]})
+        jid2 = self.store.next_queued()["id"]
+        self.store.update(jid2, status="failed", error=worker.CHANGED + ": test")
+        self.assertEqual(self.c.post(f"/api/jobs/{jid2}/retry").json()["requeued"], 1)
+        new = self.store.next_queued()["id"]
+        self.assertEqual(json.loads(self.store.job(jid2)["requeued_as"]), [new])
+        self.c.post(f"/api/jobs/{jid2}/remove")                                     # Remove after Retry
+        self.assertEqual(self.store.job(new)["status"], "cancelled")
+
     # servers -----------------------------------------------------------------
     def test_jobs_of_another_server_wait(self):
         self.c.post("/api/queue", json={"keys": ["102"]})

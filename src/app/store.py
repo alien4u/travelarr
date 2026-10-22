@@ -63,7 +63,7 @@ JOB_FIELDS = ("rating_key", "show_key", "kind", "title", "show_title", "season",
 #   cleanup: paths this row gave up and that are still to be deleted
 NEW_COLUMNS = {"validator": "TEXT", "server_id": "TEXT", "guid": "TEXT", "mode": "TEXT",
                "replaces": "TEXT NOT NULL DEFAULT '[]'", "phase": "TEXT", "staging_mark": "TEXT",
-               "cleanup": "TEXT NOT NULL DEFAULT '[]'"}
+               "cleanup": "TEXT NOT NULL DEFAULT '[]'", "requeued_as": "TEXT NOT NULL DEFAULT '[]'"}
 
 
 def staging_rel(row: dict) -> str:
@@ -155,30 +155,59 @@ class Store:
 
     # -- jobs ------------------------------------------------------------------
     def add_jobs(self, jobs: list[dict]) -> tuple[list[dict], list[dict]]:
-        added, skipped = [], []
         with self.lock:
             self.db.execute("BEGIN")
             try:
-                for j in jobs:
-                    replaces = json.loads(j.get("replaces") or "[]")
-                    ignore = ",".join(str(int(i)) for i in replaces) or "0"
-                    dup = self.db.execute(
-                        f"SELECT id FROM jobs WHERE status IN ('queued','downloading','done') AND id NOT IN ({ignore}) "
-                        "AND (dest_rel=? OR (part_id=? AND (server_id IS NULL OR ? IS NULL OR server_id=?)))",
-                        (j["dest_rel"], j["part_id"], j.get("server_id"), j.get("server_id"))).fetchone()
-                    if dup or (replaces and self._replaced_by_other(replaces)):
-                        skipped.append(j)
-                        continue
-                    cols = [f for f in JOB_FIELDS if f in j]
-                    self.db.execute(
-                        f"INSERT INTO jobs({','.join(cols)},status,queued_at) "
-                        f"VALUES({','.join('?' * len(cols))},'queued',?)",
-                        [j[c] for c in cols] + [now()])
-                    added.append(j)
+                out = self._add_jobs(jobs)
                 self.db.execute("COMMIT")
             except Exception:
                 self.db.execute("ROLLBACK")
                 raise
+        return out
+
+    def requeue_changed(self, job_id: int, jobs: list[dict]) -> list[int] | None:
+        """Retry of a job whose file changed on Plex: in one transaction, the failed
+        row is cancelled, the item's current files are queued, and the row records
+        them (so removing it later also cancels them). None if the row is no longer
+        failed (a Remove came first)."""
+        with self.lock:
+            self.db.execute("BEGIN")
+            try:
+                cur = self.db.execute("SELECT status FROM jobs WHERE id=?", (job_id,)).fetchone()
+                if cur is None or cur[0] != "failed":
+                    self.db.execute("ROLLBACK")
+                    return None
+                before = self.db.execute("SELECT COALESCE(MAX(id), 0) FROM jobs").fetchone()[0]
+                self._add_jobs(jobs)
+                ids = [r[0] for r in self.db.execute("SELECT id FROM jobs WHERE id > ?", (before,))]
+                self._transition(job_id, lambda r: r["status"] == "failed", {
+                    "status": "cancelled", "note": "queued again", "finished_at": now(),
+                    "requeued_as": json.dumps(ids)})
+                self.db.execute("COMMIT")
+            except Exception:
+                self.db.execute("ROLLBACK")
+                raise
+        return ids
+
+    def _add_jobs(self, jobs: list[dict]) -> tuple[list[dict], list[dict]]:
+        """Inside a transaction."""
+        added, skipped = [], []
+        for j in jobs:
+            replaces = json.loads(j.get("replaces") or "[]")
+            ignore = ",".join(str(int(i)) for i in replaces) or "0"
+            dup = self.db.execute(
+                f"SELECT id FROM jobs WHERE status IN ('queued','downloading','done') AND id NOT IN ({ignore}) "
+                "AND (dest_rel=? OR (part_id=? AND (server_id IS NULL OR ? IS NULL OR server_id=?)))",
+                (j["dest_rel"], j["part_id"], j.get("server_id"), j.get("server_id"))).fetchone()
+            if dup or (replaces and self._replaced_by_other(replaces)):
+                skipped.append(j)
+                continue
+            cols = [f for f in JOB_FIELDS if f in j]
+            self.db.execute(
+                f"INSERT INTO jobs({','.join(cols)},status,queued_at) "
+                f"VALUES({','.join('?' * len(cols))},'queued',?)",
+                [j[c] for c in cols] + [now()])
+            added.append(j)
         return added, skipped
 
     def job(self, job_id: int) -> dict | None:
