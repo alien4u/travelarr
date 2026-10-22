@@ -193,12 +193,6 @@ def create_app(data_dir: str | None = None, media_root: str | None = None,
             return "cancelling"
         if st == "removed":
             return "removed"
-        for rid in json.loads(job["requeued_as"] or "[]"):  # what a Retry queued in its place
-            again = store.job(int(rid))
-            if again and again["status"] == "queued" and store.cancel_queued(again["id"]):
-                dl.cleanup(again["id"])
-            elif again and again["status"] == "downloading" and not again["phase"]:
-                dl.cancel(again["id"])
         for u in upgrades:  # the removal wins over an upgrade that has not started placing
             if u["status"] == "queued" and store.cancel_queued(u["id"]):
                 dl.cleanup(u["id"])
@@ -408,12 +402,13 @@ def create_app(data_dir: str | None = None, media_root: str | None = None,
                                   server_id=j["server_id"] or store.get("server_id"))
             except OtherServer:
                 return err(409, "This job belongs to another Plex server; select it first.", "other_server")
-            ids = store.requeue_changed(job_id, planned)  # one transaction; a Remove first wins
-            if ids is None:
-                return err(409, "This job changed meanwhile; reload", "changed")
+            if len(planned) != 1:
+                return err(409, "Plex now has this title in several files; remove it and copy it again", "changed")
+            if not store.requeue_changed(job_id, planned[0]):  # a Remove first, or a clash: nothing changes
+                return err(409, "This job changed meanwhile, or the new file is already copied; reload", "changed")
             dl.cleanup(job_id)
             dl.wake()
-            return {"ok": True, "requeued": len(ids)}
+            return {"ok": True, "requeued": 1}
         if j["status"] in ("failed", "cancelled"):
             if not store.transition(job_id, lambda r: r["status"] in ("failed", "cancelled"), status="queued",
                                     error=None, note=None, finished_at=None):

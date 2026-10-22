@@ -63,7 +63,7 @@ JOB_FIELDS = ("rating_key", "show_key", "kind", "title", "show_title", "season",
 #   cleanup: paths this row gave up and that are still to be deleted
 NEW_COLUMNS = {"validator": "TEXT", "server_id": "TEXT", "guid": "TEXT", "mode": "TEXT",
                "replaces": "TEXT NOT NULL DEFAULT '[]'", "phase": "TEXT", "staging_mark": "TEXT",
-               "cleanup": "TEXT NOT NULL DEFAULT '[]'", "requeued_as": "TEXT NOT NULL DEFAULT '[]'"}
+               "cleanup": "TEXT NOT NULL DEFAULT '[]'"}
 
 
 def staging_rel(row: dict) -> str:
@@ -165,29 +165,28 @@ class Store:
                 raise
         return out
 
-    def requeue_changed(self, job_id: int, jobs: list[dict]) -> list[int] | None:
-        """Retry of a job whose file changed on Plex: in one transaction, the failed
-        row is cancelled, the item's current files are queued, and the row records
-        them (so removing it later also cancels them). None if the row is no longer
-        failed (a Remove came first)."""
+    def requeue_changed(self, job_id: int, job: dict) -> bool:
+        """Retry of a job whose file changed on Plex: the same row takes the item's
+        current file and goes back to the queue, in one conditional transaction
+        (False if the row is no longer failed, or the new file collides with another
+        copy). One row, so Retry, Remove and the worker's claim stay mutually exclusive."""
         with self.lock:
             self.db.execute("BEGIN")
             try:
-                cur = self.db.execute("SELECT status FROM jobs WHERE id=?", (job_id,)).fetchone()
-                if cur is None or cur[0] != "failed":
-                    self.db.execute("ROLLBACK")
-                    return None
-                before = self.db.execute("SELECT COALESCE(MAX(id), 0) FROM jobs").fetchone()[0]
-                self._add_jobs(jobs)
-                ids = [r[0] for r in self.db.execute("SELECT id FROM jobs WHERE id > ?", (before,))]
-                self._transition(job_id, lambda r: r["status"] == "failed", {
-                    "status": "cancelled", "note": "queued again", "finished_at": now(),
-                    "requeued_as": json.dumps(ids)})
+                dup = self.db.execute(
+                    "SELECT id FROM jobs WHERE status IN ('queued','downloading','done') AND id != ? "
+                    "AND (dest_rel=? OR (part_id=? AND (server_id IS NULL OR ? IS NULL OR server_id=?)))",
+                    (job_id, job["dest_rel"], job["part_id"], job.get("server_id"), job.get("server_id"))).fetchone()
+                ok = dup is None and self._transition(job_id, lambda r: r["status"] == "failed", {
+                    "status": "queued", "part_id": job["part_id"], "part_key": job["part_key"], "size": job["size"],
+                    "dest_rel": job["dest_rel"], "title": job["title"], "server_id": job.get("server_id"),
+                    "guid": job.get("guid"), "bytes_done": 0, "validator": None, "error": None,
+                    "finished_at": None, "note": "queued again: the file changed on Plex"}) is not None
                 self.db.execute("COMMIT")
             except Exception:
                 self.db.execute("ROLLBACK")
                 raise
-        return ids
+        return ok
 
     def _add_jobs(self, jobs: list[dict]) -> tuple[list[dict], list[dict]]:
         """Inside a transaction."""

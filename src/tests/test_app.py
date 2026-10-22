@@ -838,10 +838,12 @@ class DownloadTest(PlexFixture):
         self.assertEqual((j["bytes_done"], j["validator"]), (0, None))
         self.fake.movies[1]["size"] = len(new)            # what Plex now reports
         self.assertEqual(self.c.post(f"/api/jobs/{jid}/retry").json()["requeued"], 1)
-        j = self.store.job(jid)
-        self.assertEqual((j["status"], j["note"]), ("cancelled", "queued again"))
+        j = self.store.job(jid)  # the same row, now for the file Plex has
+        self.assertEqual((j["status"], j["note"], j["size"]), ("queued", "queued again: the file changed on Plex",
+                                                                len(new)))
         self.drain()
         self.assertEqual(self.read(LOOSE), new)
+        self.assertEqual(self.store.job(jid)["status"], "done")
 
     def test_416_on_resume_means_changed(self):
         self.fake.drop_after[1002] = 100_000
@@ -2285,21 +2287,23 @@ class ResyncTest(PlexFixture):
         self.assertEqual([r[2].get("Range") for r in self.part_requests(1101, before)], [None])  # from zero
         self.assertEqual(self.read("Movies/Heat (1995)/Heat (1995) v2.mkv"), self.fake.parts[1101])
 
-    def test_changed_file_retry_is_one_step_with_remove(self):
+    def test_changed_file_retry_updates_the_same_row(self):
         self.c.post("/api/queue", json={"keys": ["102"]})
         jid = self.store.next_queued()["id"]
         self.store.update(jid, status="failed", error=worker.CHANGED + ": test")
         self.store.remove(jid)
-        self.assertIsNone(self.store.requeue_changed(jid, self.gw.plan(["102"])))   # Remove came first
-        self.assertIsNone(self.store.next_queued())
+        self.assertFalse(self.store.requeue_changed(jid, self.gw.plan(["102"])[0]))   # Remove came first
+        self.assertEqual(self.store.job(jid)["status"], "removed")
         self.c.post("/api/queue", json={"keys": ["103"]})
         jid2 = self.store.next_queued()["id"]
         self.store.update(jid2, status="failed", error=worker.CHANGED + ": test")
-        self.assertEqual(self.c.post(f"/api/jobs/{jid2}/retry").json()["requeued"], 1)
-        new = self.store.next_queued()["id"]
-        self.assertEqual(json.loads(self.store.job(jid2)["requeued_as"]), [new])
-        self.c.post(f"/api/jobs/{jid2}/remove")                                     # Remove after Retry
-        self.assertEqual(self.store.job(new)["status"], "cancelled")
+        self.new_part(self.movie(103), 1203, file="/data/Media/Movies/Heathers (1989)/Heathers v2.mkv", size=60_000)
+        self.assertEqual(self.c.post(f"/api/jobs/{jid2}/retry").json(), {"ok": True, "requeued": 1})
+        job = self.store.job(jid2)
+        self.assertEqual((job["status"], job["part_id"], job["size"]), ("queued", 1203, 60_000))
+        self.assertEqual(len([j for j in self.store.jobs("active") if j["rating_key"] == "103"]), 1)  # one live row
+        self.drain()
+        self.assertEqual(self.read("Movies/Heathers (1989)/Heathers v2.mkv"), self.fake.parts[1203])
 
     # servers -----------------------------------------------------------------
     def test_jobs_of_another_server_wait(self):
