@@ -45,6 +45,10 @@ class NotReady(Exception):
     """Sign-in or server choice missing, or the server is unreachable."""
 
 
+class OtherServer(Exception):
+    """The job's data came from a Plex server that is not the selected one."""
+
+
 def _is_https(url: str) -> bool:
     return url.lower().startswith("https://")
 
@@ -217,7 +221,7 @@ class PlexGateway:
         self.conn: dict | None = None
         self._fail: tuple[float, str] | None = None
         self._pin: dict | None = None
-        self._sections: dict[str, object] = {}
+        self._sections: dict[tuple, object] = {}  # (server id, section key) -> section
 
     # ------------------------------------------------------------------ auth
     def _headers(self) -> dict:
@@ -308,6 +312,20 @@ class PlexGateway:
         self.store.set("preferred_url", (preferred_url or "").strip() or None)
         self.store.set("allow_relay", bool(allow_relay))
         self.reset()
+
+    def snapshot(self) -> tuple[PlexServer, str]:
+        """The selected server's connection and id, read together."""
+        with self._lock:
+            return self.server(), self.store.get("server_id")
+
+    def server_for(self, server_id: str | None) -> PlexServer:
+        """The connection to use for one request of a job from server_id: raises
+        OtherServer when another server is selected. The caller uses the returned
+        object for that request, so a later selection change cannot redirect it."""
+        with self._lock:
+            if server_id and self.store.get("server_id") != server_id:
+                raise OtherServer("this job belongs to another Plex server")
+            return self.server()
 
     def server(self) -> PlexServer:
         with self._lock:
@@ -440,18 +458,20 @@ class PlexGateway:
         return None, futures.count(None)
 
     # ---------------------------------------------------------------- browse
-    def _section(self, key) -> object:
-        key = str(key)
+    def _section(self, key, srv: PlexServer | None = None) -> object:
+        srv = srv or self.server()
+        ck = (getattr(srv, "machineIdentifier", None), str(key))
         with self._lock:
-            if key not in self._sections:
-                self._sections[key] = self.server().library.sectionByID(int(key))
-            return self._sections[key]
+            if ck not in self._sections:
+                self._sections[ck] = srv.library.sectionByID(int(key))
+            return self._sections[ck]
 
     def libraries(self) -> list[dict]:
         out = []
-        for s in self.server().library.sections():
+        srv = self.server()
+        for s in srv.library.sections():
             if s.type in ("movie", "show"):
-                self._sections[str(s.key)] = s
+                self._sections[(getattr(srv, "machineIdentifier", None), str(s.key))] = s
                 out.append({"key": str(s.key), "title": s.title, "type": s.type})
         return out
 
@@ -533,7 +553,7 @@ class PlexGateway:
                 ep._autoReload = False
                 s = seasons.setdefault(ep.parentIndex if ep.parentIndex is not None else -1,
                                        {"index": ep.parentIndex, "title": ep.parentTitle,
-                                        "episodes": []})
+                                        "ratingKey": str(ep.parentRatingKey), "episodes": []})
                 parts = [self._part(ep, p, sec) for p in ep.iterParts()]
                 s["episodes"].append({"ratingKey": str(ep.ratingKey), "index": ep.index,
                                       "title": ep.title, "watched": ep.isWatched,
@@ -548,12 +568,13 @@ class PlexGateway:
              only: set[str] | None = None) -> list[dict]:
         """Expand movies / episodes / seasons / shows into one job per file.
         `only` limits a show or season to those episode keys (one request
-        for the whole show instead of one per episode)."""
-        srv = self.server()
+        for the whole show instead of one per episode). One server snapshot
+        serves the whole plan, and every job records that server."""
+        srv, sid = self.snapshot()
         jobs: list[dict] = []
         for rk in keys:
             it = srv.fetchItem(int(rk))
-            sec = self._section(it.librarySectionID)
+            sec = self._section(it.librarySectionID, srv)
             if it.type in ("movie", "episode"):
                 videos = [it]
             elif it.type in ("show", "season"):
@@ -582,27 +603,53 @@ class PlexGateway:
                         "size": p.size or 0,
                         "dest_rel": dest_rel_for(p.file, sec.locations, sec.title),
                         "source": source,
+                        "server_id": sid,
+                        "guid": getattr(v, "guid", None),
                     })
         return jobs
 
+    def batch(self, srv: PlexServer, keys: list[str]) -> dict[str, object]:
+        """Full metadata (parts and streams) for many items, 100 per request."""
+        out: dict[str, object] = {}
+        for i in range(0, len(keys), 100):
+            chunk = keys[i:i + 100]
+            for it in srv.fetchItems("/library/metadata/" + ",".join(chunk)):
+                it._autoReload = False
+                out[str(it.ratingKey)] = it
+        return out
+
+    def head_length(self, srv: PlexServer, key: str) -> int | None:
+        r = self.session.head(f"{srv._baseurl}{key}", headers={"X-Plex-Token": srv._token},
+                              timeout=(5, 10), allow_redirects=False)
+        if r.status_code != 200:
+            return None
+        v = (r.headers.get("Content-Length") or "").strip()
+        return int(v) if v.isdigit() else None
+
     # -------------------------------------------------------------- download
-    def file_request(self, part_key: str) -> tuple[str, dict]:
-        srv = self.server()
+    def file_request(self, part_key: str, srv: PlexServer | None = None) -> tuple[str, dict]:
+        srv = srv or self.server()
         return f"{srv._baseurl}{part_key}?download=1", {"X-Plex-Token": srv._token}
 
-    def subtitle_streams(self, rating_key: str, part_id: int) -> list[dict]:
+    @staticmethod
+    def text_streams(part) -> list[dict]:
         """External (sidecar) subtitles only; embedded ones travel inside the file."""
-        it = self.server().fetchItem(int(rating_key))
+        return [{"key": s.key, "codec": (s.codec or "").lower(),
+                 "lang": s.languageTag or s.languageCode, "forced": bool(s.forced),
+                 "hi": bool(s.hearingImpaired), "title": s.displayTitle}
+                for s in part.subtitleStreams() if s.key]
+
+    def subtitle_streams(self, rating_key: str, part_id: int,
+                         srv: PlexServer | None = None) -> tuple[list[dict], str | None]:
+        """The part's external subtitles and the item's guid."""
+        it = (srv or self.server()).fetchItem(int(rating_key))
         for p in it.iterParts():
             if p.id == part_id:
-                return [{"key": s.key, "codec": (s.codec or "").lower(),
-                         "lang": s.languageTag or s.languageCode, "forced": bool(s.forced),
-                         "hi": bool(s.hearingImpaired), "title": s.displayTitle}
-                        for s in p.subtitleStreams() if s.key]
-        return []
+                return self.text_streams(p), getattr(it, "guid", None)
+        return [], getattr(it, "guid", None)
 
-    def fetch_bytes(self, key: str, max_bytes: int = 20 << 20) -> bytes:
-        srv = self.server()
+    def fetch_bytes(self, key: str, max_bytes: int = 20 << 20, srv: PlexServer | None = None) -> bytes:
+        srv = srv or self.server()
         with self.session.get(f"{srv._baseurl}{key}", headers={"X-Plex-Token": srv._token},
                               stream=True, timeout=(15, 60)) as r:
             r.raise_for_status()

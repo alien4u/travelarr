@@ -2,11 +2,13 @@
 from __future__ import annotations
 
 import json
+import os
+import posixpath
 import sqlite3
 import threading
 import time
 
-from .paths import touches
+from .paths import PART_SUFFIX, PathError, abs_path, touches
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT);
@@ -49,7 +51,61 @@ PRESENT = ("queued", "downloading", "done")
 RANK = {"downloading": 5, "queued": 4, "done": 3, "failed": 2, "cancelled": 1, "removed": 0}
 
 JOB_FIELDS = ("rating_key", "show_key", "kind", "title", "show_title", "season", "episode",
-              "year", "part_id", "part_key", "size", "dest_rel", "source")
+              "year", "part_id", "part_key", "size", "dest_rel", "source", "server_id", "guid", "mode",
+              "replaces")
+
+# Columns added after the first release, created on start when missing.
+#   server_id / guid: the Plex server and item a job's data came from
+#   mode: NULL (a copy), 'redownload' / 'refresh' (an existing copy re-queued by a
+#     re-sync), 'upgrade' (a new version replacing the rows in `replaces`)
+#   phase: NULL, 'placing' (the final rename may have happened), 'placed'
+#   staging_mark: sha256 of an upgrade's staging file, proof of its placement
+#   cleanup: paths this row gave up and that are still to be deleted
+NEW_COLUMNS = {"validator": "TEXT", "server_id": "TEXT", "guid": "TEXT", "mode": "TEXT",
+               "replaces": "TEXT NOT NULL DEFAULT '[]'", "phase": "TEXT", "staging_mark": "TEXT",
+               "cleanup": "TEXT NOT NULL DEFAULT '[]'"}
+
+
+def staging_rel(row: dict) -> str:
+    """Where an upgrade downloads before it replaces the old copy: hidden, one per job."""
+    return posixpath.join(posixpath.dirname(row["dest_rel"]), f".travelarr-resync-{row['id']}.part")
+
+
+def _sidecars(row: dict) -> set[str]:
+    out: set[str] = set()
+    for rel in json.loads(row.get("sidecars") or "[]"):
+        out |= {rel, rel + PART_SUFFIX}
+    return out
+
+
+def owned(row: dict) -> set[str]:
+    """Paths a row may delete once it gives them up (see `Store.transition`)."""
+    st, mode, phase, dest = row["status"], row.get("mode"), row.get("phase"), row["dest_rel"]
+    temp = staging_rel(row) if mode == "upgrade" else dest + PART_SUFFIX
+    if st == "removed":
+        return set()
+    if st == "done":
+        return {dest} | _sidecars(row)
+    if phase == "placed":
+        return {dest, temp} | _sidecars(row)
+    if phase == "placing":
+        # the destination is proven only once placed; a redownload owned it already
+        return {temp} | _sidecars(row) | ({dest} if mode == "redownload" else set())
+    if mode in ("refresh", "redownload"):  # an existing copy, re-queued
+        if st == "cancelled":
+            return {dest} | _sidecars(row)
+        return {dest, temp} | _sidecars(row)
+    if st == "cancelled":
+        return set()
+    return {temp}
+
+
+def protected(row: dict) -> set[str]:
+    """owned() plus paths no cleanup may delete while this row exists."""
+    out = owned(row)
+    if row.get("phase") == "placing":
+        out.add(row["dest_rel"])
+    return out
 
 
 def now() -> str:
@@ -58,6 +114,7 @@ def now() -> str:
 
 class Store:
     def __init__(self, path: str):
+        self.media_root: str | None = None  # set by the app; hand-offs skip paths not on disk
         self.lock = threading.RLock()
         self.db = sqlite3.connect(path, check_same_thread=False, isolation_level=None)
         self.db.row_factory = sqlite3.Row
@@ -65,8 +122,9 @@ class Store:
             self.db.execute("PRAGMA journal_mode=WAL")
             self.db.executescript(SCHEMA)
             cols = {r[1] for r in self.db.execute("PRAGMA table_info(jobs)")}
-            if "validator" not in cols:  # databases from before resume validation
-                self.db.execute("ALTER TABLE jobs ADD COLUMN validator TEXT")
+            for col, decl in NEW_COLUMNS.items():
+                if col not in cols:
+                    self.db.execute(f"ALTER TABLE jobs ADD COLUMN {col} {decl}")
             # A restart mid-download resumes from the partial file.
             self.db.execute("UPDATE jobs SET status='queued' WHERE status='downloading'")
 
@@ -102,10 +160,13 @@ class Store:
             self.db.execute("BEGIN")
             try:
                 for j in jobs:
+                    replaces = json.loads(j.get("replaces") or "[]")
+                    ignore = ",".join(str(int(i)) for i in replaces) or "0"
                     dup = self.db.execute(
-                        "SELECT id FROM jobs WHERE (part_id=? OR dest_rel=?) AND status IN "
-                        "('queued','downloading','done')", (j["part_id"], j["dest_rel"])).fetchone()
-                    if dup:
+                        f"SELECT id FROM jobs WHERE status IN ('queued','downloading','done') AND id NOT IN ({ignore}) "
+                        "AND (dest_rel=? OR (part_id=? AND (server_id IS NULL OR ? IS NULL OR server_id=?)))",
+                        (j["dest_rel"], j["part_id"], j.get("server_id"), j.get("server_id"))).fetchone()
+                    if dup or (replaces and self._replaced_by_other(replaces)):
                         skipped.append(j)
                         continue
                     cols = [f for f in JOB_FIELDS if f in j]
@@ -124,24 +185,157 @@ class Store:
         r = self.rows("SELECT * FROM jobs WHERE id=?", (job_id,))
         return r[0] if r else None
 
-    def next_queued(self) -> dict | None:
-        r = self.rows("SELECT * FROM jobs WHERE status='queued' ORDER BY id LIMIT 1")
-        return r[0] if r else None
+    def _replaced_by_other(self, replaces: list) -> bool:
+        """Another unfinished upgrade already replaces one of these rows."""
+        want = {int(i) for i in replaces}
+        for r in self.db.execute("SELECT replaces FROM jobs WHERE mode='upgrade' "
+                                 "AND status IN ('queued','downloading','failed')"):
+            if want & {int(i) for i in json.loads(r[0] or "[]")}:
+                return True
+        return False
+
+    def upgrades_of(self, job_id: int) -> list[dict]:
+        """Unfinished upgrades that replace this row."""
+        return [r for r in self.rows("SELECT * FROM jobs WHERE mode='upgrade' "
+                                     "AND status IN ('queued','downloading','failed')")
+                if job_id in {int(i) for i in json.loads(r["replaces"] or "[]")}]
+
+    def next_queued(self, server_id: str | None = None, skip: frozenset = frozenset()) -> dict | None:
+        """The oldest queued job; with server_id, only jobs of that server or of
+        none (rows from before 2.5.0). Jobs of another server wait."""
+        sql, args = "SELECT * FROM jobs WHERE status='queued'", []
+        if server_id is not None:
+            sql += " AND (server_id IS NULL OR server_id=?)"
+            args.append(server_id)
+        for r in self.rows(sql + " ORDER BY id LIMIT 200", args):
+            if r["id"] not in skip:
+                return r
+        return None
 
     # Every way out of 'queued' is one conditional UPDATE, so the worker's claim
-    # and a cancel can never both win.
-    def claim(self, job_id: int) -> bool:
-        """queued -> downloading; False when the job left the queue first."""
-        return self.exec("UPDATE jobs SET status='downloading', started_at=?, error=NULL, note=NULL "
-                         "WHERE id=? AND status='queued'", (now(), job_id)).rowcount == 1
+    # and a cancel or removal can never both win.
+    def claim(self, job_id: int, server_id: str | None = None) -> bool:
+        """queued -> downloading; False when the job left the queue first. A row
+        without a server is bound to the one it is about to use."""
+        return self.exec("UPDATE jobs SET status='downloading', started_at=?, error=NULL, note=NULL, "
+                         "server_id=COALESCE(server_id, ?) WHERE id=? AND status='queued'",
+                         (now(), server_id, job_id)).rowcount == 1
+
+    # -- transitions that give up files ------------------------------------------
+    def _exists(self, rel: str) -> bool:
+        if self.media_root is None:
+            return True
+        try:
+            return os.path.lexists(abs_path(self.media_root, rel))
+        except PathError:
+            return False
+
+    def _transition(self, job_id: int, when, fields: dict) -> dict | None:
+        """Inside a transaction: apply fields if when(row) holds. Whatever the row
+        owned before and no longer owns goes to its cleanup list in the same write
+        (skipping paths not on disk), so a crash never leaves a file nobody owns."""
+        cur = self.db.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
+        if cur is None:
+            return None
+        row = dict(cur)
+        if not when(row):
+            return None
+        after = {**row, **fields}
+        gone = owned(row) - owned(after)
+        if gone:
+            pending = json.loads(row.get("cleanup") or "[]")
+            pending += sorted(p for p in gone if p not in pending and self._exists(p))
+            after["cleanup"] = fields["cleanup"] = json.dumps(pending)
+        keys = list(fields)
+        self.db.execute(f"UPDATE jobs SET {', '.join(k + '=?' for k in keys)} WHERE id=?",
+                        [fields[k] for k in keys] + [job_id])
+        return after
+
+    def transition(self, job_id: int, when, **fields) -> dict | None:
+        with self.lock:
+            self.db.execute("BEGIN")
+            try:
+                out = self._transition(job_id, when, fields)
+                self.db.execute("COMMIT")
+            except Exception:
+                self.db.execute("ROLLBACK")
+                raise
+        return out
+
+    @staticmethod
+    def _cancel_fields(row: dict) -> dict:
+        if row.get("mode") == "refresh":  # the copy itself is fine: back to done
+            return {"status": "done", "mode": None, "note": "re-sync cancelled"}
+        return {"status": "cancelled", "finished_at": now()}
 
     def cancel_queued(self, job_id: int) -> bool:
-        return self.exec("UPDATE jobs SET status='cancelled', finished_at=? WHERE id=? AND status='queued'",
-                         (now(), job_id)).rowcount == 1
+        """queued -> cancelled (a refresh goes back to done). Never a row whose
+        file is being placed or is in place."""
+        with self.lock:
+            row = self.job(job_id)
+            if row is None:
+                return False
+            return self.transition(job_id, lambda r: r["status"] == "queued" and not r["phase"],
+                                   **self._cancel_fields(row)) is not None
+
+    def remove(self, job_id: int, statuses=("done", "failed", "cancelled"), note: str | None = None) -> dict | None:
+        """-> removed; everything the row owned goes to its cleanup list."""
+        fields = {"status": "removed", "removed_at": now(), "phase": None}
+        if note is not None:
+            fields["note"] = note
+        return self.transition(job_id, lambda r: r["status"] in statuses, **fields)
 
     def mark_removed(self, job_id: int, note: str) -> bool:
-        return self.exec("UPDATE jobs SET status='removed', removed_at=?, note=? "
-                         "WHERE id=? AND status IN ('done','failed')", (now(), note, job_id)).rowcount == 1
+        return self.remove(job_id, ("done", "failed"), note) is not None
+
+    def begin_upgrade(self, job_id: int, old_ids: list, mark: str | None) -> bool:
+        """T1: the old copy must still be done; then the upgrade is placing (it can
+        no longer be cancelled and its old copy is locked). Otherwise the upgrade is
+        cancelled, giving up its staging file."""
+        with self.lock:
+            self.db.execute("BEGIN")
+            try:
+                olds = [self.db.execute("SELECT status FROM jobs WHERE id=?", (int(o),)).fetchone() for o in old_ids]
+                if all(o is not None and o[0] == "done" for o in olds):
+                    self._transition(job_id, lambda r: True, {"phase": "placing", "staging_mark": mark})
+                    ok = True
+                else:
+                    self._transition(job_id, lambda r: True, {
+                        "status": "cancelled", "finished_at": now(),
+                        "note": "the copy it would replace was removed"})
+                    ok = False
+                self.db.execute("COMMIT")
+            except Exception:
+                self.db.execute("ROLLBACK")
+                raise
+        return ok
+
+    def finish_upgrade(self, job_id: int, old_ids: list, fields: dict) -> list[int]:
+        """T3: the upgrade is done and the copies it replaces are removed, giving
+        up their files (what the new copy owns stays protected)."""
+        retired = []
+        with self.lock:
+            self.db.execute("BEGIN")
+            try:
+                self._transition(job_id, lambda r: True, dict(fields))
+                for o in old_ids:
+                    if self._transition(int(o), lambda r: r["status"] == "done", {
+                            "status": "removed", "removed_at": now(), "phase": None,
+                            "note": "replaced by a re-sync"}) is not None:
+                        retired.append(int(o))
+                self.db.execute("COMMIT")
+            except Exception:
+                self.db.execute("ROLLBACK")
+                raise
+        return retired
+
+    def add_sidecar(self, job_id: int, rel: str) -> None:
+        """Recorded before the file is written, so a written file is never unowned."""
+        with self.lock:
+            row = self.job(job_id)
+            names = json.loads(row["sidecars"] or "[]")
+            if rel not in names:
+                self.update(job_id, sidecars=json.dumps(names + [rel]))
 
     def release_paths(self, targets: list[str], note: str, where=lambda rel: rel) -> tuple[dict | None, int]:
         """Before deleting targets: the downloading job they would hit (then
@@ -154,16 +348,21 @@ class Store:
             try:
                 rows = [dict(r) for r in self.db.execute(
                     "SELECT * FROM jobs WHERE status IN ('queued','downloading') ORDER BY id")]
-                hit = {j["id"]: {touches(t, p) for t in targets for p in (j["dest_rel"], where(j["dest_rel"]))}
-                       for j in rows}
-                busy = next((j for j in rows if j["status"] == "downloading" and hit[j["id"]] - {None}), None)
+
+                def paths(j):
+                    out = [j["dest_rel"], where(j["dest_rel"])]
+                    if j["mode"] == "upgrade":
+                        out.append(staging_rel(j))
+                    return out
+                hit = {j["id"]: {touches(t, p) for t in targets for p in paths(j)} for j in rows}
+                busy = next((j for j in rows if (j["status"] == "downloading" or j["phase"])
+                             and hit[j["id"]] - {None}), None)
                 n = 0
                 if busy is None:
                     for j in rows:
                         if j["status"] == "queued" and "video" in hit[j["id"]]:
-                            n += self.db.execute(
-                                "UPDATE jobs SET status='cancelled', finished_at=?, note=? "
-                                "WHERE id=? AND status='queued'", (now(), note, j["id"])).rowcount
+                            n += self._transition(j["id"], lambda r: r["status"] == "queued" and not r["phase"],
+                                                  {**self._cancel_fields(j), "note": note}) is not None
                 self.db.execute("COMMIT")
             except Exception:
                 self.db.execute("ROLLBACK")
@@ -199,20 +398,22 @@ class Store:
             return self.rows("SELECT * FROM jobs WHERE show_key=? ORDER BY id", (show_key,))
         return self.rows("SELECT * FROM jobs WHERE rating_key=? ORDER BY id", (rating_key,))
 
-    def status_map(self, rating_keys: list[str]) -> dict[str, str]:
-        """Best current status per item (downloading > queued > done > failed...)."""
+    def status_map(self, rating_keys: list[str], server_id: str | None = None) -> dict[str, str]:
+        """Best current status per item (downloading > queued > done > failed...),
+        counting rows of server_id and rows from before 2.5.0 (no server)."""
         if not rating_keys:
             return {}
         marks = ",".join("?" * len(rating_keys))
         out: dict[str, str] = {}
-        for r in self.rows(f"SELECT rating_key, status FROM jobs WHERE rating_key IN ({marks})",
-                           list(rating_keys)):
+        for r in self.rows(f"SELECT rating_key, status FROM jobs WHERE rating_key IN ({marks}) "
+                           "AND (server_id IS NULL OR ? IS NULL OR server_id=?)",
+                           list(rating_keys) + [server_id, server_id]):
             cur = out.get(r["rating_key"])
             if cur is None or RANK[r["status"]] > RANK[cur]:
                 out[r["rating_key"]] = r["status"]
         return {k: v for k, v in out.items() if v not in ("removed", "cancelled")}
 
-    def show_counts(self, show_keys: list[str]) -> dict[str, dict]:
+    def show_counts(self, show_keys: list[str], server_id: str | None = None) -> dict[str, dict]:
         if not show_keys:
             return {}
         marks = ",".join("?" * len(show_keys))
@@ -220,7 +421,8 @@ class Store:
         for r in self.rows(
                 f"SELECT show_key, status, COUNT(DISTINCT rating_key) n FROM jobs "
                 f"WHERE show_key IN ({marks}) AND status IN ('queued','downloading','done','failed') "
-                f"GROUP BY show_key, status", list(show_keys)):
+                f"AND (server_id IS NULL OR ? IS NULL OR server_id=?) "
+                f"GROUP BY show_key, status", list(show_keys) + [server_id, server_id]):
             d = out.setdefault(r["show_key"], {"done": 0, "active": 0, "failed": 0})
             key = {"done": "done", "failed": "failed"}.get(r["status"], "active")
             d[key] += r["n"]
@@ -232,5 +434,5 @@ class Store:
 
     def pending_bytes(self) -> int:
         r = self.rows("SELECT COALESCE(SUM(size - bytes_done),0) b FROM jobs "
-                      "WHERE status IN ('queued','downloading')")
+                      "WHERE status IN ('queued','downloading') AND COALESCE(mode,'') != 'refresh'")
         return int(r[0]["b"])

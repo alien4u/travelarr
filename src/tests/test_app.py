@@ -6,6 +6,7 @@ Run:  python -m unittest discover -s tests -v
 """
 import base64
 import contextlib
+import hashlib
 import json
 import os
 import re
@@ -34,6 +35,7 @@ from app.plexgw import PlexGateway  # noqa: E402
 
 HEAT = "Movies/Heat (1995)/Heat (1995).mkv"            # part 1001, 300,000 bytes, with subtitles
 LOOSE = "Movies/Loose Movie.mkv"                        # part 1002, 120,000 bytes
+from tests.fakeplex import SRT as SRT_BODY  # noqa: E402
 from tests.fakeplex import TOKEN, FakeAccount, FakeConn, FakePlex  # noqa: E402
 
 
@@ -1222,8 +1224,8 @@ class DownloadTest(PlexFixture):
         """Run the queue, sending a request right after the worker claims each job."""
         real, seen = self.store.claim, {}
 
-        def claim(job_id):
-            ok = real(job_id)
+        def claim(job_id, *a):
+            ok = real(job_id, *a)
             seen["result"] = self.c.post(f"/api/jobs/{job_id}/{action}").json()
             seen["status"] = self.store.job(job_id)["status"]
             return ok
@@ -1284,13 +1286,14 @@ class DownloadTest(PlexFixture):
         self.assertNotIn(jid, self.dl._cancel)
         self.assertEqual(self.read(HEAT), self.fake.parts[1001])
 
-    def test_remove_after_the_last_check_reports_cancelling(self):
+    def test_remove_while_finishing_reports_busy(self):
+        # the video is in place: removal waits for the job to finish instead of racing it
         jid, got = self.queue("101"), {}
         with self.subtitles_hook(lambda: got.update(self.c.post(f"/api/jobs/{jid}/remove").json())):
             self.drain()
-        self.assertEqual(got, {"result": "cancelling"})
+        self.assertEqual(got, {"result": "busy"})
         self.assertEqual(self.store.job(jid)["status"], "done")
-        self.assertTrue(os.path.isfile(self.m(HEAT)))
+        self.assertEqual(self.read(HEAT), self.fake.parts[1001])
 
 
 class FilesTest(PlexFixture):
@@ -1615,6 +1618,420 @@ class DeviceNameTest(unittest.TestCase):
             shutil.rmtree(tmp, ignore_errors=True)
 
 
+class ResyncTest(PlexFixture):
+    """Re-sync: compare copies with Plex and bring them up to date."""
+    HEAT_ES = "Movies/Heat (1995)/Heat (1995).es.srt"
+    HEAT_EN = "Movies/Heat (1995)/Heat (1995).en.forced.srt"
+
+    def setUp(self):
+        super().setUp()
+        self.sign_in_and_connect()
+        heat = self.movie(101)
+        heat["subs"] = [x for x in heat["subs"] if x["id"] != 9005]   # the always-invalid one
+
+    # helpers ---------------------------------------------------------------
+    def read(self, rel):
+        with open(self.m(rel), "rb") as fh:
+            return fh.read()
+
+    def copy(self, *keys, mode="all"):
+        self.c.post("/api/queue", json={"keys": list(keys), "mode": mode})
+        self.drain()
+
+    def check(self, key):
+        r = self.c.post("/api/resync/check", json={"key": key})
+        self.assertEqual(r.status_code, 200, r.text)
+        return r.json()
+
+    def kinds(self, key):
+        return {i["ratingKey"]: i["kind"] for i in self.check(key)["items"]}
+
+    def apply(self, key, *rks, server=None):
+        sid = server or self.check(key)["serverId"]
+        return self.c.post("/api/resync/apply", json={"key": key, "serverId": sid, "ratingKeys": list(rks)})
+
+    def row(self, rk, status="done"):
+        rows = [j for j in self.store.jobs_for(rating_key=rk) if j["status"] == status]
+        return rows[-1] if rows else None
+
+    def new_part(self, m, pid, file=None, size=None, content=None):
+        """Plex now has another version of a movie/episode dict m."""
+        m["part"] = pid
+        m["file"] = file or m["file"]
+        m["size"] = size or m["size"]
+        self.fake.parts[pid] = content or bytes((i * 11 + pid) % 251 for i in range(m["size"]))
+        self.fake.versions[pid] = 1
+
+    def movie(self, rk):
+        return next(x for x in self.fake.movies if x["rk"] == rk)
+
+    def part_requests(self, pid, since=0):
+        return [r for r in self.fake.requests[since:] if f"/library/parts/{pid}/" in r[1]]
+
+    # check -----------------------------------------------------------------
+    def test_unchanged_copy_reports_nothing(self):
+        self.copy("101")
+        d = self.check("101")
+        self.assertEqual((d["checked"], d["items"]), (1, []))
+        self.assertEqual(d["serverId"], "srv1")
+
+    def test_upgrade_with_a_new_file_name(self):
+        self.copy("101")
+        old = self.row("101")
+        new = "/data/Media/Movies/Heat (1995)/Heat (1995) Bluray-2160p.mkv"
+        self.new_part(self.movie(101), 1101, file=new, size=310_000)
+        item = self.check("101")["items"][0]
+        self.assertEqual(item["kind"], "upgraded")
+        self.assertEqual(item["video"], {"from": {"file": "Heat (1995).mkv", "size": 300_000},
+                                         "to": {"file": "Heat (1995) Bluray-2160p.mkv", "size": 310_000}})
+        r = self.apply("101", "101").json()
+        self.assertEqual((r["upgrades"], r["videoBytes"]), (1, 310_000))
+        self.drain()
+        self.assertEqual(self.store.job(old["id"])["status"], "removed")
+        self.assertEqual(self.store.job(old["id"])["note"], "replaced by a re-sync")
+        done = self.row("101")
+        self.assertEqual((done["mode"], done["note"]), ("upgrade", "re-synced: new version"))
+        self.assertEqual(self.read("Movies/Heat (1995)/Heat (1995) Bluray-2160p.mkv"), self.fake.parts[1101])
+        self.assertFalse(os.path.lexists(self.m(HEAT)))
+        self.assertFalse(os.path.lexists(self.m(self.HEAT_ES)))      # old name retired
+        self.assertTrue(os.path.isfile(self.m("Movies/Heat (1995)/Heat (1995) Bluray-2160p.es.srt")))
+        self.assertEqual(json.loads(done["cleanup"]), [])
+        self.assertEqual(json.loads(self.store.job(old["id"])["cleanup"]), [])
+        leftovers = [n for n in os.listdir(self.m("Movies/Heat (1995)")) if "travelarr" in n]
+        self.assertEqual(leftovers, [])
+        self.assertEqual(self.check("101")["items"], [])
+
+    def test_upgrade_in_place_same_name_new_size(self):
+        self.copy("101")
+        old = self.row("101")
+        self.new_part(self.movie(101), 1101, size=320_000)
+        self.assertEqual(self.kinds("101"), {"101": "upgraded"})
+        self.apply("101", "101")
+        self.drain()
+        self.assertEqual(self.read(HEAT), self.fake.parts[1101])
+        self.assertTrue(os.path.isfile(self.m(self.HEAT_ES)))       # same name: re-fetched, kept
+        self.assertEqual(self.store.job(old["id"])["status"], "removed")
+        self.assertIn(self.HEAT_ES, json.loads(self.row("101")["sidecars"]))
+
+    def test_upgrade_same_size_new_part_downloads(self):
+        self.copy("101")
+        self.new_part(self.movie(101), 1101)  # same name, same size, different bytes
+        self.assertEqual(self.kinds("101"), {"101": "upgraded"})
+        self.apply("101", "101")
+        before = len(self.fake.requests)
+        self.drain()
+        self.assertTrue(self.part_requests(1101, before))          # never adopted by size
+        self.assertEqual(self.read(HEAT), self.fake.parts[1101])
+        up = self.row("101")
+        self.assertEqual(up["staging_mark"], hashlib.sha256(self.fake.parts[1101]).hexdigest())
+
+    def test_upgrade_hash_survives_a_dropped_connection(self):
+        self.copy("101")
+        self.new_part(self.movie(101), 1101, size=320_000)
+        self.fake.drop_after[1101] = 100_000
+        self.dl.backoff = 0.01
+        self.apply("101", "101")
+        self.drain()
+        self.assertEqual(self.row("101")["staging_mark"], hashlib.sha256(self.fake.parts[1101]).hexdigest())
+        self.assertEqual(self.read(HEAT), self.fake.parts[1101])
+
+    def test_missing_copy_is_copied_again(self):
+        self.copy("102")
+        os.remove(self.m(LOOSE))
+        self.assertEqual(self.check("102")["items"][0]["reason"], "missing on the NAS")
+        r = self.apply("102", "102").json()
+        self.assertEqual((r["redownloads"], r["videoBytes"]), (1, 120_000))
+        rid = self.row("102", "queued")["id"]
+        self.drain()
+        done = self.store.job(rid)
+        self.assertEqual((done["status"], done["note"], done["mode"]), ("done", "re-synced: was missing", None))
+        self.assertEqual(self.read(LOOSE), self.fake.parts[1002])
+
+    def test_wrong_size_on_the_nas(self):
+        self.copy("102")
+        with open(self.m(LOOSE), "r+b") as fh:
+            fh.truncate(10)
+        self.assertEqual(self.check("102")["items"][0]["reason"], "the file on the NAS has the wrong size")
+        self.apply("102", "102")
+        self.drain()
+        self.assertEqual(self.read(LOOSE), self.fake.parts[1002])
+
+    def test_subtitles_added_changed_removed(self):
+        self.copy("101")
+        m = self.movie(101)
+        es = next(x for x in m["subs"] if x["id"] == 9001)
+        es["body"] = SRT_BODY("Hola de nuevo")                              # changed size
+        m["subs"] = [x for x in m["subs"] if x["id"] != 9002]               # en forced removed
+        m["subs"].append(dict(id=9006, codec="srt", lang="fr", ext=True, body=SRT_BODY("Salut")))
+        item = self.check("101")["items"][0]
+        self.assertEqual(item["kind"], "subtitles")
+        self.assertEqual(item["subtitles"], {"added": ["Heat (1995).fr.srt"], "changed": ["Heat (1995).es.srt"],
+                                             "removed": ["Heat (1995).en.forced.srt"]})
+        rid = self.row("101")["id"]
+        r = self.apply("101", "101").json()
+        self.assertEqual((r["refreshes"], r["videoBytes"]), (1, 0))
+        self.assertEqual(self.store.pending_bytes(), 0)
+        before = len(self.fake.requests)
+        self.drain()
+        self.assertEqual(self.part_requests(1001, before), [])               # the video is not touched
+        row = self.store.job(rid)
+        self.assertEqual((row["status"], row["note"], row["mode"]), ("done", "re-synced: subtitles", None))
+        self.assertEqual(self.read(self.HEAT_ES), es["body"].encode())
+        self.assertTrue(os.path.isfile(self.m("Movies/Heat (1995)/Heat (1995).fr.srt")))
+        self.assertFalse(os.path.lexists(self.m(self.HEAT_EN)))
+        self.assertNotIn(self.HEAT_EN, json.loads(row["sidecars"]))
+        self.assertEqual(self.check("101")["items"], [])
+
+    def test_failed_subtitle_fetch_keeps_old_ones(self):
+        self.copy("101")
+        m = self.movie(101)
+        next(x for x in m["subs"] if x["id"] == 9001)["body"] = "<html>oops</html>"   # not a subtitle
+        m["subs"] = [x for x in m["subs"] if x["id"] != 9002]
+        self.apply("101", "101")
+        self.drain()
+        row = self.row("101")
+        self.assertTrue(os.path.isfile(self.m(self.HEAT_EN)))               # not retired
+        self.assertIn(self.HEAT_EN, json.loads(row["sidecars"]))
+        self.assertEqual(row["note"], "old subtitles kept: some subtitles could not be fetched")
+        self.assertEqual(self.read(self.HEAT_ES), SRT_BODY("Hola").encode())  # old file of that name kept
+
+    def test_season_scope_reports_an_episode_gone_from_plex(self):
+        self.copy("200")
+        self.fake.episodes = [e for e in self.fake.episodes if e["rk"] != 202]
+        self.assertEqual(self.kinds("210"), {"202": "gone"})
+        self.assertEqual(self.check("220")["checked"], 1)
+        self.assertEqual(self.kinds("200"), {"202": "gone"})
+
+    def test_busy_and_double_apply(self):
+        self.copy("102")
+        os.remove(self.m(LOOSE))
+        self.apply("102", "102")
+        self.assertEqual(self.kinds("102"), {"102": "busy"})
+        r = self.apply("102", "102").json()
+        self.assertEqual((r["redownloads"], r["skipped"]), (0, 1))
+
+    def test_identity(self):
+        self.copy("101")
+        rid = self.row("101")["id"]
+        self.store.update(rid, server_id="other")
+        self.assertEqual(self.kinds("101"), {"101": "mismatch"})
+        # a copy from before 2.5.0: same title and folder -> compared, and bound on apply
+        self.store.update(rid, server_id=None, guid=None)
+        os.remove(self.m(HEAT))
+        self.assertEqual(self.kinds("101"), {"101": "missing"})
+        self.apply("101", "101")
+        self.assertEqual((self.store.job(rid)["server_id"], self.store.job(rid)["guid"]), ("srv1", "plex://movie/heat"))
+        self.store.update(rid, server_id=None, guid=None, status="done", mode=None)
+        self.movie(101)["title"] = "Something Else"
+        self.assertEqual(self.kinds("101"), {"101": "mismatch"})
+
+    def test_multipart_and_unavailable(self):
+        self.copy("103")
+        h = self.movie(103)
+        h["extra_parts"] = [dict(part=1203, file=f"{h['file']}.cd2", size=10)]
+        self.assertEqual(self.kinds("103"), {"103": "multipart"})
+        h["extra_parts"], h["no_parts"] = [], True
+        self.assertEqual(self.kinds("103"), {"103": "unavailable"})
+
+    def test_unreadable_subtitle_size_is_unchecked(self):
+        self.copy("101")
+        self.fake.head_fail.add(9001)
+        self.assertEqual(self.kinds("101"), {"101": "unchecked"})
+
+    def test_requests_are_validated(self):
+        self.copy("101")
+        self.assertEqual(self.c.post("/api/resync/check", json={"key": "x"}).status_code, 400)
+        self.assertEqual(self.c.post("/api/resync/check", json={"key": "999"}).status_code, 400)
+        self.assertEqual(self.apply("101", "101", server="other").status_code, 409)
+        for bad in ([], ["101", "101"], [101], ["102"]):
+            r = self.c.post("/api/resync/apply", json={"key": "101", "serverId": "srv1", "ratingKeys": bad})
+            self.assertEqual(r.status_code, 400, bad)
+        from app import resync
+        with resync.LOCK:
+            r = self.c.post("/api/resync/check", json={"key": "101"})
+        self.assertEqual((r.status_code, r.json()["error"]), (409, "A re-sync check is already running"))
+
+    # upgrade lifecycle -------------------------------------------------------
+    def upgrade_queued(self):
+        self.copy("101")
+        old = self.row("101")
+        self.new_part(self.movie(101), 1101, file="/data/Media/Movies/Heat (1995)/Heat (1995) v2.mkv",
+                      size=310_000)
+        self.apply("101", "101")
+        return old, self.row("101", "queued")
+
+    def test_cancel_before_placement_keeps_the_old_copy(self):
+        old, up = self.upgrade_queued()
+        self.c.post(f"/api/jobs/{up['id']}/cancel")
+        self.assertEqual(self.store.job(up["id"])["status"], "cancelled")
+        self.drain()
+        self.assertEqual(self.store.job(old["id"])["status"], "done")
+        self.assertEqual(self.read(HEAT), self.fake.parts[1001])
+
+    def test_removing_the_old_copy_wins_over_a_queued_upgrade(self):
+        old, up = self.upgrade_queued()
+        self.assertEqual(self.c.post(f"/api/jobs/{old['id']}/remove").json(), {"result": "removed"})
+        self.drain()
+        self.assertEqual(self.store.job(up["id"])["status"], "cancelled")
+        self.assertFalse(os.path.lexists(self.m("Movies/Heat (1995)/Heat (1995) v2.mkv")))
+        self.assertFalse(os.path.lexists(self.m(HEAT)))
+
+    def test_old_copy_removed_while_the_upgrade_downloads(self):
+        old, up = self.upgrade_queued()
+        real = self.store.begin_upgrade
+
+        def begin(*a):
+            self.store.remove(old["id"])          # removed between the download and placement
+            return real(*a)
+        with mock.patch.object(self.store, "begin_upgrade", begin):
+            self.drain()
+        job = self.store.job(up["id"])
+        self.assertEqual((job["status"], job["note"]), ("cancelled", "the copy it would replace was removed"))
+        self.assertFalse(os.path.lexists(self.m("Movies/Heat (1995)/Heat (1995) v2.mkv")))
+        self.assertEqual([n for n in os.listdir(self.m("Movies/Heat (1995)")) if "resync" in n], [])
+
+    def test_removal_while_placing_is_busy(self):
+        old, up = self.upgrade_queued()
+        self.store.update(up["id"], phase="placing")
+        self.assertEqual(self.c.post(f"/api/jobs/{old['id']}/remove").json(), {"result": "busy"})
+        self.assertEqual(self.c.post(f"/api/jobs/{up['id']}/remove").json(), {"result": "busy"})
+        self.assertFalse(self.store.cancel_queued(up["id"]))
+        self.assertEqual(self.kinds("101"), {"101": "busy"})
+
+    def test_crash_after_the_rename_is_recovered_by_hash(self):
+        old, up = self.upgrade_queued()
+        real = self.store.update
+        state = {"n": 0}
+
+        def update(job_id, **f):
+            if f == {"phase": "placed"} and not state["n"]:
+                state["n"] += 1
+                raise sqlite3.OperationalError("disk I/O error")   # after the rename, before `placed`
+            return real(job_id, **f)
+        with mock.patch.object(self.store, "update", update):
+            self.dl._process(self.store.next_queued())
+        job = self.store.job(up["id"])
+        self.assertEqual((job["status"], job["phase"]), ("queued", "placing"))   # never failed
+        self.assertIn(up["id"], self.dl._later)                                   # backs off
+        self.dl._later.clear()
+        before = len(self.fake.requests)
+        self.drain()
+        self.assertEqual(self.part_requests(1101, before), [])               # no second download
+        self.assertEqual(self.store.job(up["id"])["status"], "done")
+        self.assertEqual(self.store.job(old["id"])["status"], "removed")
+        self.assertFalse(os.path.lexists(self.m(HEAT)))
+
+    def test_staging_lost_before_the_rename_is_not_certified(self):
+        old, up = self.upgrade_queued()
+        self.store.update(up["id"], phase="placing", staging_mark="0" * 64)   # crashed after T1, staging gone
+        self.drain()
+        job = self.store.job(up["id"])
+        self.assertEqual((job["status"], job["phase"], job["error"]), ("failed", None, worker.UNCONFIRMED))
+        o = self.store.job(old["id"])
+        self.assertEqual((o["status"], o["note"]), ("done", "unverified after an interrupted re-sync"))
+        self.assertEqual(self.read(HEAT), self.fake.parts[1001])
+        self.assertEqual(self.kinds("101"), {"101": "busy"})                  # the failed upgrade comes first
+        self.c.post(f"/api/jobs/{up['id']}/remove")
+        self.assertEqual(self.kinds("101"), {"101": "upgraded"})              # unlocked, can be re-synced
+
+    def test_rename_error_fails_and_retry_does_not_download(self):
+        old, up = self.upgrade_queued()
+        real = worker.os.replace
+
+        def replace(src, dst):
+            if ".travelarr-resync-" in src:
+                raise OSError(13, "Permission denied")
+            return real(src, dst)
+        with mock.patch.object(worker.os, "replace", replace):
+            self.drain()
+        job = self.store.job(up["id"])
+        self.assertEqual((job["status"], job["phase"]), ("failed", None))
+        self.assertEqual(self.store.job(old["id"])["status"], "done")
+        before = len(self.fake.requests)
+        self.c.post(f"/api/jobs/{up['id']}/retry")
+        self.drain()
+        # the complete staging file is only re-checked against Plex (its last 64 KB), not downloaded again
+        tail = f"bytes={310_000 - worker.OVERLAP}-"
+        self.assertEqual([r[2].get("Range") for r in self.part_requests(1101, before)], [tail])
+        self.assertEqual(self.store.job(up["id"])["status"], "done")
+        self.assertEqual(self.read("Movies/Heat (1995)/Heat (1995) v2.mkv"), self.fake.parts[1101])
+
+    # ownership and cleanup ---------------------------------------------------
+    def test_cleanup_never_deletes_a_file_a_copy_owns(self):
+        self.copy("101", "102")
+        heat = self.row("101")
+        loose = self.row("102")
+        self.store.update(loose["id"], status="removed", cleanup=json.dumps([HEAT, LOOSE]))
+        self.assertEqual(self.dl.cleanup(loose["id"]), [])
+        self.assertTrue(os.path.isfile(self.m(HEAT)))                         # owned by a done copy
+        self.assertFalse(os.path.lexists(self.m(LOOSE)))
+        self.store.update(heat["id"], status="queued", mode="redownload")
+        self.store.update(loose["id"], cleanup=json.dumps([HEAT]))
+        self.assertEqual(self.dl.cleanup(loose["id"]), [HEAT])                # deferred for an unfinished job
+
+    def test_cancel_hands_off_the_partial_only(self):
+        self.copy("102")
+        rid = self.row("102")["id"]
+        self.store.transition(rid, lambda r: True, status="queued", mode="redownload")
+        with open(self.m(LOOSE) + paths.PART_SUFFIX, "wb") as fh:
+            fh.write(b"x" * 10)
+        self.c.post(f"/api/jobs/{rid}/cancel")
+        self.assertEqual(self.store.job(rid)["status"], "cancelled")
+        self.assertFalse(os.path.lexists(self.m(LOOSE) + paths.PART_SUFFIX))
+        self.assertTrue(os.path.isfile(self.m(LOOSE)))                        # still the cancelled copy's
+
+    def test_placed_job_waiting_after_a_crash_can_be_removed(self):
+        self.copy("102")
+        rid = self.row("102")["id"]
+        self.store.update(rid, status="queued", phase="placed")
+        self.assertFalse(self.store.cancel_queued(rid))
+        self.assertEqual(self.c.post(f"/api/jobs/{rid}/remove").json(), {"result": "removed"})
+        self.assertFalse(os.path.lexists(self.m(LOOSE)))
+        self.drain()
+        self.assertEqual(self.store.job(rid)["status"], "removed")
+
+    # servers -----------------------------------------------------------------
+    def test_jobs_of_another_server_wait(self):
+        self.c.post("/api/queue", json={"keys": ["102"]})
+        jid = self.store.next_queued()["id"]
+        self.store.update(jid, server_id="other")
+        self.assertIsNone(self.store.next_queued("srv1"))
+        self.assertTrue(next(j for j in self.c.get("/api/jobs").json()["jobs"] if j["id"] == jid)["waiting"])
+        self.store.update(jid, status="failed")
+        self.assertEqual(self.c.post(f"/api/jobs/{jid}/retry").status_code, 409)
+
+    def test_server_change_before_placement_waits(self):
+        self.c.post("/api/queue", json={"keys": ["102"]})
+        jid = self.store.next_queued()["id"]
+        real = self.gw.server_for
+
+        def server_for(sid):
+            if self.store.job(jid)["bytes_done"] == 120_000:    # downloaded, about to place
+                raise plexgw.OtherServer("changed")
+            return real(sid)
+        with mock.patch.object(self.gw, "server_for", server_for):
+            self.dl._process(self.store.next_queued())
+        job = self.store.job(jid)
+        self.assertEqual((job["status"], job["note"], job["phase"]), ("queued", worker.WAITING, None))
+        self.assertTrue(os.path.isfile(self.m(LOOSE) + paths.PART_SUFFIX))   # kept for later
+        self.drain()
+        self.assertEqual(self.store.job(jid)["status"], "done")
+
+    def test_legacy_job_is_bound_at_claim(self):
+        self.c.post("/api/queue", json={"keys": ["102"]})
+        jid = self.store.next_queued()["id"]
+        self.store.update(jid, server_id=None)
+        self.drain()
+        self.assertEqual(self.store.job(jid)["server_id"], "srv1")
+
+    def test_badges_count_only_the_selected_server(self):
+        self.copy("102")
+        rid = self.row("102")["id"]
+        self.assertEqual(self.store.status_map(["102"], "srv1"), {"102": "done"})
+        self.store.update(rid, server_id="other")
+        self.assertEqual(self.store.status_map(["102"], "srv1"), {})
+
+
 class StoreIndexTest(unittest.TestCase):
     def test_duplicate_check_uses_dest_index_on_old_databases(self):
         tmp = tempfile.mkdtemp()
@@ -1631,6 +2048,25 @@ class StoreIndexTest(unittest.TestCase):
             "('queued','downloading','done')", (1, "x")))
         self.assertIn("jobs_dest", plan)
         self.assertIn("jobs_part", plan)
+
+
+class MigrationTest(unittest.TestCase):
+    def test_old_database_gains_the_resync_columns(self):
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, True)
+        path = os.path.join(tmp, "travelarr.db")
+        old = sqlite3.connect(path)
+        old.executescript(store_mod.SCHEMA)
+        old.execute("INSERT INTO jobs(rating_key, kind, title, part_id, part_key, size, dest_rel, status) "
+                    "VALUES('1','movie','A',1,'/k',5,'Movies/A/a.mkv','done')")
+        old.commit()
+        old.close()
+        st = store_mod.Store(path)
+        self.addCleanup(st.close)
+        row = st.job(1)
+        for col in store_mod.NEW_COLUMNS:
+            self.assertIn(col, row)
+        self.assertEqual((row["replaces"], row["cleanup"], row["server_id"]), ("[]", "[]", None))
 
 
 class PasswordTest(unittest.TestCase):

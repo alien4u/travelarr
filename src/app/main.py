@@ -20,13 +20,15 @@ from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from plexapi.exceptions import NotFound, Unauthorized
 
-from .paths import (PART_SUFFIX, ListingChanged, PathError, abs_path, delete_entry, list_dir, local_entry,
-                    real_rel, remove_files, touches)
+from . import resync
+from .paths import (ListingChanged, PathError, abs_path, delete_entry, list_dir, local_entry, real_rel,
+                    touches)
 from .plexgw import NotReady, PlexGateway
+from .resync import ResyncError
 from .store import Store, now
 from .worker import CHANGED, Downloader
 
-VERSION = "2.4.0"
+VERSION = "2.5.0"
 STATIC = os.path.join(os.path.dirname(__file__), "static")
 LOCAL_NOTE = "deleted in Local Files"
 MAX_QUEUE_KEYS = 200  # bounds the Plex requests one queue call makes
@@ -72,6 +74,7 @@ def create_app(data_dir: str | None = None, media_root: str | None = None,
     os.makedirs(thumbs, exist_ok=True)
 
     store = Store(os.path.join(data_dir, "travelarr.db"))
+    store.media_root = media_root
     gw = (gateway_factory or (lambda s: PlexGateway(s, VERSION)))(store)
     dl = Downloader(store, gw, media_root, device)
 
@@ -132,6 +135,10 @@ def create_app(data_dir: str | None = None, media_root: str | None = None,
     async def _pe(_r, e):
         return err(400, str(e))
 
+    @app.exception_handler(ResyncError)
+    async def _re(_r, e):
+        return err(e.status, str(e), "resync")
+
     @app.exception_handler(requests.RequestException)
     async def _rq(_r, e):
         gw.invalidate()
@@ -147,7 +154,8 @@ def create_app(data_dir: str | None = None, media_root: str | None = None,
     def annotate(items: list[dict]) -> list[dict]:
         movies = [i["ratingKey"] for i in items if i.get("ratingKey") and i["type"] in ("movie", "episode")]
         shows = [i["ratingKey"] for i in items if i.get("ratingKey") and i["type"] == "show"]
-        sm, sc = store.status_map(movies), store.show_counts(shows)
+        sid = store.get("server_id")
+        sm, sc = store.status_map(movies, sid), store.show_counts(shows, sid)
         for i in items:
             if i.get("type") in ("movie", "episode"):
                 i["copy"] = sm.get(i.get("ratingKey"))
@@ -156,20 +164,41 @@ def create_app(data_dir: str | None = None, media_root: str | None = None,
         return items
 
     def remove_job(job: dict) -> str:
+        """Removal gives up everything the row owns (deleted through its cleanup
+        list). A row whose file is being placed, or a copy an upgrade is replacing
+        right now, is busy."""
+        jid = job["id"]
+        upgrades = store.upgrades_of(jid)
+        if any(u["phase"] for u in upgrades):
+            return "busy"
+        job = store.job(jid)
+        if job["phase"]:
+            if job["phase"] == "placed" and job["mode"] != "upgrade" and store.remove(jid, ("queued",)):
+                return "removed" if not dl.cleanup(jid) else "deferred"
+            return "busy"
         if job["status"] == "queued":
-            if store.cancel_queued(job["id"]):
+            if job["mode"] == "refresh":
+                store.cancel_queued(jid)  # back to done, then removed below
+            elif store.cancel_queued(jid):
+                dl.cleanup(jid)
                 return "cancelled"
-            job = store.job(job["id"])  # the worker claimed it meanwhile
+            job = store.job(jid)  # the worker claimed it meanwhile
         st = job["status"]
         if st == "downloading":
-            dl.cancel(job["id"])  # best-effort: a file past its last check finishes
+            dl.cancel(jid)  # best-effort: a file past its last check finishes
             return "cancelling"
         if st == "removed":
             return "removed"
-        rels = [job["dest_rel"], job["dest_rel"] + PART_SUFFIX] + json.loads(job["sidecars"] or "[]")
-        remove_files(media_root, rels)
-        store.update(job["id"], status="removed", removed_at=now())
-        return "removed"
+        for u in upgrades:  # the removal wins over an upgrade that has not started placing
+            if u["status"] == "queued" and store.cancel_queued(u["id"]):
+                dl.cleanup(u["id"])
+            elif u["status"] == "failed" and store.remove(u["id"], ("failed",)):
+                dl.cleanup(u["id"])
+            elif u["status"] == "downloading":
+                dl.cancel(u["id"])
+        if store.remove(jid) is None:
+            return "busy"
+        return "removed" if not dl.cleanup(jid) else "deferred"
 
     # ---------------------------------------------------------------- state
     @app.get("/api/state")
@@ -216,8 +245,10 @@ def create_app(data_dir: str | None = None, media_root: str | None = None,
 
     @app.post("/api/server")
     def choose_server(body: dict = Body(...)):
-        gw.select_server(body["id"], body.get("name"), body.get("preferredUrl"),
-                         bool(body.get("allowRelay")))
+        with resync.LOCK:  # never in the middle of a re-sync check
+            gw.select_server(body["id"], body.get("name"), body.get("preferredUrl"),
+                             bool(body.get("allowRelay")))
+        dl.wake()  # jobs waiting for this server can run again
         gw.server()
         return {"conn": gw.conn}
 
@@ -258,12 +289,13 @@ def create_app(data_dir: str | None = None, media_root: str | None = None,
         d = gw.item(rk)
         if d["type"] == "show":
             eps = [e for s in d["seasons"] for e in s["episodes"]]
-            sm = store.status_map([e["ratingKey"] for e in eps])
+            sid = store.get("server_id")
+            sm = store.status_map([e["ratingKey"] for e in eps], sid)
             for e in eps:
                 e["copy"] = sm.get(e["ratingKey"])
-            d["copy"] = store.show_counts([rk]).get(rk)
+            d["copy"] = store.show_counts([rk], sid).get(rk)
         else:
-            d["copy"] = store.status_map([rk]).get(rk)
+            d["copy"] = store.status_map([rk], store.get("server_id")).get(rk)
         jobs = store.jobs_for(show_key=rk) if d["type"] == "show" else store.jobs_for(rating_key=rk)
         d["history"] = jobs[-50:]
         return d
@@ -294,8 +326,32 @@ def create_app(data_dir: str | None = None, media_root: str | None = None,
 
     @app.get("/api/jobs")
     def jobs(view: str = "active", q: str | None = None, limit: int = 200, offset: int = 0):
-        return {"jobs": store.jobs(view, q, min(limit, 1000), offset), "current": dl.snapshot(),
+        sid = store.get("server_id")
+        rows = store.jobs(view, q, min(limit, 1000), offset)
+        for j in rows:
+            j["waiting"] = j["status"] == "queued" and bool(j["server_id"]) and j["server_id"] != sid
+        return {"jobs": rows, "current": dl.snapshot(),
                 "paused": bool(store.get("paused", False)), "workerError": dl.last_error}
+
+    # --------------------------------------------------------------- resync
+    @app.post("/api/resync/check")
+    def resync_check(body: dict = Body(...)):
+        key = str(body.get("key") or "")
+        if not re.fullmatch(r"[0-9]{1,12}", key):
+            return err(400, "key must be a rating key", "bad_request")
+        return resync.check(store, gw, media_root, key)
+
+    @app.post("/api/resync/apply")
+    def resync_apply(body: dict = Body(...)):
+        key = str(body.get("key") or "")
+        if not re.fullmatch(r"[0-9]{1,12}", key):
+            return err(400, "key must be a rating key", "bad_request")
+        out = resync.apply(store, gw, media_root, key, body.get("serverId"), body.get("ratingKeys"))
+        dl.wake()
+        d = disk()
+        if d and store.pending_bytes() > d["free"] - dl.reserve_bytes():
+            out["warning"] = f"The queue is larger than the free space on {device}; some downloads will fail."
+        return out
 
     def _job(job_id: int) -> dict:
         j = store.job(job_id)
@@ -306,13 +362,29 @@ def create_app(data_dir: str | None = None, media_root: str | None = None,
     @app.post("/api/jobs/{job_id}/cancel")
     def cancel(job_id: int):
         _job(job_id)
-        if not store.cancel_queued(job_id) and store.job(job_id)["status"] == "downloading":
-            dl.cancel(job_id)
+        if store.cancel_queued(job_id):
+            dl.cleanup(job_id)
+        else:
+            j = store.job(job_id)
+            if j["status"] == "downloading" and not j["phase"]:
+                dl.cancel(job_id)
         return {"ok": True}
 
     @app.post("/api/jobs/{job_id}/retry")
     def retry(job_id: int):
         j = _job(job_id)
+        if j["server_id"] and j["server_id"] != store.get("server_id"):
+            return err(409, "This job belongs to another Plex server; select it first.", "other_server")
+        if j["mode"] == "upgrade" and j["status"] in ("failed", "cancelled"):
+            if (j["error"] or "").startswith(CHANGED):
+                store.transition(job_id, lambda r: r["status"] == "failed", status="cancelled",
+                                 note="Plex changed the file again; run Re-sync")
+                dl.cleanup(job_id)
+                return err(409, "Plex changed the file again; run Re-sync", "changed")
+            olds = json.loads(j["replaces"] or "[]")
+            if not all((store.job(int(o)) or {}).get("status") == "done" for o in olds) or \
+                    any(u["id"] != job_id for o in olds for u in store.upgrades_of(int(o))):
+                return err(409, "The copy this re-sync would replace changed; run Re-sync again", "changed")
         if j["status"] == "failed" and (j["error"] or "").startswith(CHANGED):
             # the old file is gone from Plex: queue the item again as it is now
             added, _ = store.add_jobs(gw.plan([j["rating_key"]], mode="all", source=j["source"] or "browse"))
@@ -401,6 +473,7 @@ def create_app(data_dir: str | None = None, media_root: str | None = None,
                 continue
             if gone and store.mark_removed(j["id"], LOCAL_NOTE):
                 out["removed"] += 1
+                dl.cleanup(j["id"])
         return out
 
     # --------------------------------------------------------------- images

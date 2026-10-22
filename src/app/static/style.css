@@ -121,6 +121,10 @@ select { width: auto; }
 .ep .sz { color: var(--muted); font-size: 12px; white-space: nowrap; }
 .ep.watched .et { color: var(--muted); }
 .ep input { width: 18px; height: 18px; }
+.ep .resync, .season-h .resync { padding: 2px 8px; font-size: 12px; }
+.season-h .grow { flex: 1; }
+.ep.rs .et { white-space: normal; }
+.ep.rs.muted .et { color: var(--muted); }
 
 .seg { display: inline-flex; border: 1px solid var(--line); border-radius: 10px; overflow: hidden; background: var(--panel); }
 .seg button { border: 0; background: none; padding: 8px 12px; font-weight: 600; color: var(--muted); white-space: nowrap; }

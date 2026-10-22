@@ -27,6 +27,9 @@ travel NAS.
   before you start.
 - **Select** in Movies, TV Shows and Watchlist to pick many titles at once (shift-click for a range) and copy them in
   one go; selected shows copy their unwatched or all episodes.
+- **Re-sync** a copied movie, show, season or episode with Plex: picks up videos upgraded by Radarr/Sonarr, copies
+  missing files again, and updates subtitles that were added, changed or removed (Lingarr). It shows what changed
+  before anything is downloaded, and an old copy is only replaced once the new file is in place.
 - Original files only, plus the external subtitles Plex knows about (`Movie.es.srt`, `Movie.en.forced.srt`).
   Subtitles inside the file come along automatically.
 - Same folder layout as your home library (`Movies/...`, `TV-Shows/...`).
@@ -137,6 +140,8 @@ Fill the NAS at home if you can: copying over your own network is much faster th
 - A file that is already on the NAS with the same name and size is added to the History instead of being copied
   again.
 - Image-based subtitles stored as separate files (PGS, VobSub) are skipped and noted in the History.
+- Re-sync compares file names and sizes (Plex offers no checksums): videos split into several files are not
+  re-synced, and a subtitle edit that keeps the exact same size is not detected.
 
 ## Support
 

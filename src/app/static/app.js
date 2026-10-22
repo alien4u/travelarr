@@ -524,7 +524,7 @@ async function queue(keys, mode, source, only) {
 
 /* ----------------------------------------------------------------- detail */
 function openSheet(...nodes) {
-  $('#sheet-body').replaceChildren(...nodes.filter(n => n != null));
+  $('#sheet-body').replaceChildren(...nodes.flat(Infinity).filter(n => n != null && n !== false));
   $('#sheet').hidden = false;
   document.body.style.overflow = 'hidden';
 }
@@ -537,6 +537,8 @@ $('#sheet').addEventListener('click', e => { if (e.target.closest('[data-close]'
 document.addEventListener('keydown', e => { if (e.key === 'Escape' && !$('#sheet').hidden) closeSheet(); });
 
 function removedToast(results) {
+  if (results.busy) return toast(`${results.busy === 1 ? 'It is' : `${results.busy} files are`} being finished (a copy or a re-sync); try again in a moment`);
+  if (results.deferred) return toast(`Removed from ${dev()}. Some old files could not be deleted yet; they will be retried`);
   const busy = results.cancelling || 0;
   if (!busy) return toast(`Removed from ${dev()}`);
   const n = (results.removed || 0) + (results.cancelled || 0);
@@ -571,6 +573,9 @@ function videoBody(d) {
       class: 'btn small', onclick: async () => { for (const j of active) await post(`/api/jobs/${j.id}/cancel`); S.dirty = true; openItem(d.ratingKey); },
     }, 'Cancel'));
   }
+  if (st === 'done') actions.append(h('button', {
+    class: 'btn small', onclick: () => openResync(d.ratingKey, d.ratingKey, d.title),
+  }, 'Re-sync from Plex'));
   if (st === 'done') actions.append(h('button', {
     class: 'btn small danger', onclick: async () => {
       if (!confirm(`Delete "${d.title}" from ${dev()}?`)) return;
@@ -610,9 +615,11 @@ function showBody(d) {
     const scb = h('input', { type: 'checkbox', disabled: !sEl.length });
     scb.onchange = () => { sEl.forEach(e => scb.checked ? sel.add(e.ratingKey) : sel.delete(e.ratingKey)); refresh(); };
     const done = s.episodes.filter(e => e.copy === 'done').length;
+    const sTitle = s.title || `Season ${s.index}`;
     return h('div', { class: 'season' },
-      h('label', { class: 'season-h' }, scb, s.title || `Season ${s.index}`,
-        h('span', { class: 'muted small' }, `${s.episodes.length} ep${done ? ` · ${done} on ${dev()}` : ''}`)),
+      h('label', { class: 'season-h' }, scb, sTitle,
+        h('span', { class: 'muted small grow' }, `${s.episodes.length} ep${done ? ` · ${done} on ${dev()}` : ''}`),
+        done && s.ratingKey ? resyncButton(s.ratingKey, d.ratingKey, `${d.title} ${sTitle}`) : null),
       s.episodes.map(e => {
         const cb = h('input', { type: 'checkbox', disabled: !eligible(e) });
         cb.onchange = () => { cb.checked ? sel.add(e.ratingKey) : sel.delete(e.ratingKey); refresh(); };
@@ -622,7 +629,8 @@ function showBody(d) {
           h('span', { class: 'et' }, e.title),
           e.copy ? h('span', { class: `chip ${e.copy}` }, statusOf(e.copy)[0])
             : e.watched ? h('span', { class: 'chip' }, 'Watched') : null,
-          h('span', { class: 'sz' }, fmtBytes(e.size)));
+          h('span', { class: 'sz' }, fmtBytes(e.size)),
+          e.copy === 'done' ? resyncButton(e.ratingKey, d.ratingKey, `${d.title} E${pad(e.index)}`) : null);
       }));
   });
 
@@ -642,7 +650,83 @@ function showBody(d) {
       h('button', { class: 'btn small', onclick: pick(() => true) }, 'All'),
       h('button', { class: 'btn small', onclick: pick(() => false) }, 'None')),
     seasons,
-    h('div', { class: 'sticky-actions' }, copyBtn, removeBtn));
+    h('div', { class: 'sticky-actions' }, copyBtn,
+      onDevice ? h('button', { class: 'btn small', onclick: () => openResync(d.ratingKey, d.ratingKey, d.title) },
+        'Re-sync show') : null,
+      removeBtn));
+}
+
+/* ----------------------------------------------------------------- resync */
+function resyncButton(key, back, title) {
+  return h('button', {
+    class: 'btn small resync', type: 'button', title: 'Compare with Plex and update',
+    onclick: e => { e.preventDefault(); e.stopPropagation(); openResync(key, back, title); },
+  }, 'Re-sync');
+}
+
+const RESYNC_ACT = ['upgraded', 'missing', 'subtitles'];
+
+function resyncLine(i) {
+  if (i.kind === 'upgraded') {
+    return `new version: ${fmtBytes(i.video.from.size)} -> ${fmtBytes(i.video.to.size)} (${i.video.to.file})`;
+  }
+  if (i.kind === 'subtitles') {
+    const s = i.subtitles;
+    return ['subtitles:', s.added.length && `${s.added.length} added (${s.added.join(', ')})`,
+      s.changed.length && `${s.changed.length} changed (${s.changed.join(', ')})`,
+      s.removed.length && `${s.removed.length} removed (${s.removed.join(', ')})`].filter(Boolean).join(' ');
+  }
+  return (i.reason || i.kind).replace('the NAS', dev());
+}
+
+async function openResync(key, back, title) {
+  const head = h('div', { class: 'detail-head' }, h('div', {},
+    h('h1', {}, `Re-sync ${title}`),
+    h('div', { class: 'muted small' }, `Compares what is on ${dev()} with Plex: new versions, missing files, subtitles.`)));
+  const backBtn = h('button', { class: 'btn small', onclick: () => openItem(back) }, 'Back');
+  openSheet(head, h('div', { class: 'spinner' }), h('p', { class: 'muted small' }, 'Checking...'));
+  let d;
+  try { d = await post('/api/resync/check', { key }); }
+  catch (e) { return openSheet(head, errorPanel(e, () => openResync(key, back, title)), backBtn); }
+  if (!d.items.length) {
+    return openSheet(head, h('div', { class: 'empty' }, `Everything is up to date (${d.checked} checked).`), backBtn);
+  }
+  const act = d.items.filter(i => RESYNC_ACT.includes(i.kind));
+  const rest = d.items.filter(i => !RESYNC_ACT.includes(i.kind));
+  const sel = new Set(act.map(i => i.ratingKey));
+  const btn = h('button', { class: 'btn primary' });
+  const paint = () => {
+    const bytes = act.filter(i => sel.has(i.ratingKey)).reduce((a, i) => a + (i.videoBytes || 0), 0);
+    btn.textContent = sel.size ? `Sync ${sel.size}${bytes ? ` · ${fmtBytes(bytes)} of video` : ''}` : 'Select items to sync';
+    btn.disabled = !sel.size;
+  };
+  btn.onclick = async () => {
+    btn.disabled = true;
+    btn.textContent = 'Queuing...';
+    try {
+      const r = await post('/api/resync/apply', { key, serverId: d.serverId, ratingKeys: [...sel] });
+      const parts = [r.upgrades && `${r.upgrades} new version(s)`, r.redownloads && `${r.redownloads} to copy again`,
+        r.refreshes && `${r.refreshes} subtitle update(s)`].filter(Boolean);
+      toast(parts.length ? `Queued ${parts.join(', ')}${r.videoBytes ? ` · ${fmtBytes(r.videoBytes)}` : ''}`
+        : 'Nothing to sync any more');
+      if (r.warning) setTimeout(() => toast(r.warning), 3600);
+      S.dirty = true;
+      refreshState();
+      openItem(back);
+    } catch (e) { toast(e.message); paint(); }
+  };
+  const rows = act.map(i => {
+    const cb = h('input', { type: 'checkbox', checked: true });
+    cb.onchange = () => { cb.checked ? sel.add(i.ratingKey) : sel.delete(i.ratingKey); paint(); };
+    return h('label', { class: 'ep rs' }, cb, h('span', { class: 'et' }, h('b', {}, i.label), ` · ${resyncLine(i)}`));
+  });
+  const others = rest.map(i => h('div', { class: 'ep rs muted' }, h('span', { class: 'n' }),
+    h('span', { class: 'et' }, h('b', {}, i.label), ` · ${resyncLine(i)}`)));
+  paint();
+  openSheet(head,
+    h('p', { class: 'muted small' }, `${d.checked} checked · ${act.length} to sync${rest.length ? ` · ${rest.length} not synced` : ''}`),
+    rows, others.length ? [h('h3', {}, 'Not synced'), others] : null,
+    h('div', { class: 'sticky-actions' }, btn, backBtn));
 }
 
 function historyBlock(jobs) {
@@ -691,6 +775,7 @@ function paintQueue(box, d) {
       retrying: [`Connection lost, retrying in ${cur.retry_in ?? 0} s (attempt ${cur.attempt} of ${cur.max_attempts})`,
         fmtRate(cur.speed)],
       finishing: ['Finishing: subtitles', fmtRate(cur.speed)],
+      verifying: ['Verifying the file already downloaded', null],
     }[cur.state] || [done, fmtRate(cur.speed), fmtEta(cur.eta)];
     nodes.push(h('div', { class: 'panel' },
       h('div', { style: 'font-weight:600' }, cur.title),
@@ -720,7 +805,7 @@ function jobRow(j) {
     } catch (e) { toast(e.message); }
   };
   const actions = [];
-  if (j.status === 'queued' || j.status === 'downloading') actions.push(h('button', { class: 'btn small', onclick: () => act('cancel') }, 'Cancel'));
+  if ((j.status === 'queued' || j.status === 'downloading') && !j.phase) actions.push(h('button', { class: 'btn small', onclick: () => act('cancel') }, 'Cancel'));
   if (j.status === 'failed' || j.status === 'cancelled') actions.push(h('button', { class: 'btn small', onclick: () => act('retry') }, 'Retry'));
   if (j.status === 'done' || j.status === 'failed') actions.push(h('button', {
     class: 'btn small danger', onclick: () => { if (confirm(`Delete "${jobTitle(j)}" from ${dev()}?`)) act('remove'); },
@@ -731,8 +816,10 @@ function jobRow(j) {
   return h('div', { class: 'row' },
     h('div', { class: 'main' },
       h('div', { class: 'title' }, jobTitle(j)),
-      h('div', { class: 'small muted' }, h('span', { class: `chip ${j.status}` }, j.status), ' ',
-        [fmtBytes(j.size), when, subs, j.source === 'watchlist' ? 'from watchlist' : null].filter(Boolean).join(' · ')),
+      h('div', { class: 'small muted' }, h('span', { class: `chip ${j.status}` }, j.phase && j.status !== 'done' ? 'finishing' : j.status), ' ',
+        [{ upgrade: 'new version', redownload: 'copy again', refresh: 'subtitles only' }[j.mode],
+          fmtBytes(j.size), when, subs, j.source === 'watchlist' ? 'from watchlist' : null].filter(Boolean).join(' · ')),
+      j.waiting ? h('div', { class: 'small warn' }, 'Waiting: this job belongs to another Plex server; select it again in Settings or remove the job') : null,
       j.error ? h('div', { class: 'small warn' }, j.error) : null,
       j.note && j.status !== 'done' ? h('div', { class: 'small muted' }, j.note) : null,
       h('div', { class: 'mono muted' }, j.dest_rel)),

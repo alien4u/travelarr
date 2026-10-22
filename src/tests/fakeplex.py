@@ -46,6 +46,7 @@ class FakePlex:
         self.redirect_to: str | None = None       # target for /redir
         self.https_required = False
         self.conns: list | None = None            # overrides the advertised connections
+        self.head_fail: set[int] = set()          # subtitle stream ids whose HEAD answers 500
         self.pin_polls = 0
         self.parts: dict[int, bytes] = {}
         self.movies = [
@@ -93,6 +94,9 @@ class FakePlex:
             def do_POST(self):
                 outer.handle(self, "POST")
 
+            def do_HEAD(self):
+                outer.handle(self, "HEAD")
+
         self.httpd = ThreadingHTTPServer(("127.0.0.1", 0), H)
         self.url = f"http://127.0.0.1:{self.httpd.server_port}"
         threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
@@ -112,9 +116,15 @@ class FakePlex:
                     "languageCode": s["lang"], "forced": 1 if s.get("forced") else None,
                     "key": f"/library/streams/{s['id']}" if s["ext"] else None,
                     "index": None if s["ext"] else 2, "displayTitle": f"{s['lang']} {s['codec']}"}) + "/>"
+        if v.get("no_parts"):
+            return ""
+        extra = ""
+        for x in v.get("extra_parts", []):   # a video split into several files
+            extra += "<Part " + attrs({"id": x["part"], "key": f"/library/parts/{x['part']}/1700000000/file.mkv",
+                                       "file": x["file"], "size": x["size"], "container": "mkv"}) + "/>"
         return (f'<Media id="{v["part"]}0" container="mkv"><Part ' + attrs({
             "id": v["part"], "key": f"/library/parts/{v['part']}/1700000000/file.mkv",
-            "file": v["file"], "size": v["size"], "container": "mkv"}) + f">{streams}</Part></Media>")
+            "file": v["file"], "size": v["size"], "container": "mkv"}) + f">{streams}</Part>{extra}</Media>")
 
     def movie_xml(self, m, full=False):
         return "<Video " + attrs({
@@ -136,6 +146,7 @@ class FakePlex:
     def ep_xml(self, e, full=False):
         return "<Video " + attrs({
             "ratingKey": e["rk"], "key": f"/library/metadata/{e['rk']}", "type": "episode",
+            "guid": f"plex://episode/{e['rk']}",
             "title": e["title"], "grandparentRatingKey": 200, "grandparentTitle": "Show A",
             "grandparentKey": "/library/metadata/200", "parentRatingKey": 200 + e["season"] * 10,
             "parentTitle": f"Season {e['season']}", "parentIndex": e["season"], "index": e["index"],
@@ -222,9 +233,22 @@ class FakePlex:
             if q["guid"] == self.show["guid"]:
                 hits.append(self.show_xml())
             return self.mc(h, "".join(hits), size=len(hits))
+        m = re.fullmatch(r"/library/metadata/(\d+(?:,\d+)+)", path)
+        if m:   # several items in one request, each with its parts and streams
+            out = []
+            for rk in map(int, m.group(1).split(",")):
+                out += [self.movie_xml(x, full=True) for x in self.movies if x["rk"] == rk]
+                out += [self.ep_xml(e, full=True) for e in self.episodes if e["rk"] == rk]
+            return self.mc(h, "".join(out), size=len(out))
         m = re.fullmatch(r"/library/metadata/(\d+)(/allLeaves)?", path)
         if m:
             rk, leaves = int(m.group(1)), m.group(2)
+            if rk in (210, 220):
+                season = (rk - 200) // 10
+                return self.mc(h, "<Directory " + attrs({
+                    "ratingKey": rk, "key": f"/library/metadata/{rk}/children", "type": "season",
+                    "title": f"Season {season}", "index": season, "parentRatingKey": 200,
+                    "parentTitle": "Show A", "librarySectionID": 2}) + "/>", size=1, librarySectionID=2)
             if rk == 200 and leaves:
                 return self.mc(h, "".join(self.ep_xml(e) for e in self.episodes),
                                size=len(self.episodes), librarySectionID=2)
@@ -246,6 +270,15 @@ class FakePlex:
             for v in self.movies + self.episodes:
                 for s in v["subs"]:
                     if s["id"] == sid and s.get("body"):
+                        if method == "HEAD":   # what Plex sends: the length, no body
+                            if sid in self.head_fail:
+                                h.send_response(500)
+                                h.send_header("Content-Length", "0")
+                                return h.end_headers()
+                            h.send_response(200)
+                            h.send_header("Content-Type", "text/html")
+                            h.send_header("Content-Length", str(len(s["body"].encode())))
+                            return h.end_headers()
                         return self.send(h, 200, s["body"].encode(), "text/plain")
             return self.send(h, 404, b"<html>404</html>", "text/html")
         if path == "/photo/:/transcode":

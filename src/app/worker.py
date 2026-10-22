@@ -12,10 +12,12 @@ from __future__ import annotations
 
 import collections
 import errno
+import hashlib
 import itertools
 import json
 import logging
 import os
+import posixpath
 import re
 import shutil
 import stat
@@ -25,9 +27,9 @@ import time
 import requests
 import urllib3
 
-from .paths import PART_SUFFIX, SUB_EXT, PathError, abs_path, sidecar_rel
-from .plexgw import NotReady
-from .store import now
+from .paths import PART_SUFFIX, SUB_EXT, PathError, abs_path, real_rel, remove_files, sidecar_rel
+from .plexgw import NotReady, OtherServer
+from .store import now, protected, staging_rel
 
 log = logging.getLogger("travelarr.worker")
 
@@ -40,6 +42,11 @@ RATE_WINDOW = 5.0  # seconds of history behind the displayed speed
 MAX_RESTARTS = 2
 CHANGED = "The file changed on Plex since it was queued"
 ADOPTED = "already on {}; adopted"
+WAITING = "waiting for its Plex server to be selected again"
+UNCONFIRMED = "could not confirm the file was placed; run Re-sync again"
+CLEANUP_EVERY = 1800  # seconds between retries of a row's leftover cleanup
+NOTES = {"upgrade": "re-synced: new version", "redownload": "re-synced: was missing",
+         "refresh": "re-synced: subtitles"}
 _CONTENT_RANGE = re.compile(r"bytes (\d+)-(\d+)/(\d+)")
 _dir_sync_warned = False
 
@@ -66,6 +73,14 @@ class Retry(Exception):
 
 class Restart(Exception):
     """The partial cannot be trusted; start again from byte 0."""
+
+
+class PlaceFailed(JobError):
+    """The final rename raised: nothing moved."""
+
+
+class Superseded(Exception):
+    """An upgrade whose old copy was removed before it could replace it."""
 
 
 RETRYABLE = (requests.ConnectionError, requests.Timeout, requests.exceptions.ChunkedEncodingError,
@@ -188,6 +203,8 @@ class Downloader:
         self.chunk = CHUNK
         self.max_attempts = MAX_ATTEMPTS
         self.backoff = 2.0  # seconds, doubled per attempt, capped at 60
+        self._later: dict[int, tuple[float, float]] = {}  # job id -> (not before, last delay)
+        self._cleaned: dict[int, float] = {}  # row id -> last cleanup attempt
 
     # ------------------------------------------------------------ control
     def start(self) -> None:
@@ -277,6 +294,7 @@ class Downloader:
     def _loop(self) -> None:
         try:
             self._reconcile_done()
+            self.cleanup_pass(force=True)
         except Exception:  # noqa: BLE001
             log.exception("startup check of copied files failed")
         while not self._stop.is_set():
@@ -284,8 +302,11 @@ class Downloader:
                 if self.store.get("paused", False):
                     self._sleep(2)
                     continue
-                job = self.store.next_queued()
+                t = time.monotonic()
+                skip = frozenset(j for j, (at, _) in self._later.items() if at > t)
+                job = self.store.next_queued(self.store.get("server_id") or "", skip)
                 if job is None:
+                    self.cleanup_pass()
                     self._sleep(5)
                     continue
                 try:
@@ -322,49 +343,156 @@ class Downloader:
 
     # ------------------------------------------------------------ one job
     def _process(self, job: dict) -> None:
-        """Cancel is best-effort: the flag is read right after the claim, while
-        the file streams or waits to retry, and just before the final rename.
-        After the last of those the job finishes as done."""
+        """Cancel is best-effort until the file is being placed: the flag is read
+        right after the claim, while the file streams or waits to retry, and just
+        before placement. From then on the job finishes."""
         jid = job["id"]
-        if not self.store.claim(jid):
+        if not self.store.claim(jid, self.store.get("server_id")):
             return  # cancelled after it was picked
-        final = abs_path(self.media_root, job["dest_rel"])
-        partial = final + PART_SUFFIX
+        job = self.store.job(jid)
         self._begin(job)
         try:
-            if jid in self._cancel:
-                raise Cancelled()
-            os.makedirs(os.path.dirname(final), exist_ok=True)
-            note = None
-            size = int(job["size"] or 0)
-            if size and not os.path.lexists(partial) and _regular_size(final) == size:
-                note = ADOPTED.format(self.device)
-                self._set(bytes=size)
-            else:
-                self._download(job, final, partial)
-            self._set(state="finishing")
-            subs = self._subtitles(job)
-            self.store.update(jid, status="done", finished_at=now(), bytes_done=int(job["size"]),
-                              sidecars=json.dumps(subs["written"]), subs_total=subs["total"],
-                              subs_done=len(subs["written"]), note=note, error=subs["error"])
-            log.info("done: %s", self._label(job))
+            self._run(job)
+            self._later.pop(jid, None)
+        except OtherServer:
+            # before anything was placed: wait, keeping the partial (never a failure)
+            self.store.update(jid, status="queued", note=WAITING)
+            log.info("waiting for its server: %s", self._label(job))
+        except Superseded:
+            log.info("cancelled, the copy it would replace was removed: %s", self._label(job))
+            self.cleanup(jid)
+        except (_Handled, PlaceFailed):
+            pass  # outcome already recorded
         except Cancelled:
-            self._rm(partial)
-            self._reset(job)
-            self.store.update(jid, status="cancelled", finished_at=now())
+            self.store.transition(jid, lambda r: True, **self.store._cancel_fields(job))
+            if job["mode"] != "refresh":
+                self._reset(job)
+            self.cleanup(jid)
             log.info("cancelled: %s", self._label(job))
         except Changed as e:
-            self._rm(partial)
+            self._rm(self._temp(job))
             self._reset(job)
             self.store.update(jid, status="failed", finished_at=now(), error=f"{CHANGED}: {e}"[:500])
             log.warning("changed on Plex: %s: %s", self._label(job), e)
         except Exception as e:  # noqa: BLE001
-            self.store.update(jid, status="failed", finished_at=now(), error=str(e)[:500])
-            log.warning("failed: %s: %s", self._label(job), e)
+            cur = self.store.job(jid)
+            if cur and cur["phase"]:
+                # never failed while placing or placed: try again later, then recover
+                at, delay = self._later.get(jid, (0.0, 15.0))
+                delay = min(900.0, delay * 2)
+                self._later[jid] = (time.monotonic() + delay, delay)
+                try:
+                    self.store.update(jid, status="queued", note=f"finishing, retrying after: {e}"[:300])
+                except Exception:  # noqa: BLE001
+                    log.exception("could not record the retry of %s", self._label(job))
+                log.warning("finishing %s failed, retrying in %.0fs: %s", self._label(job), delay, e)
+            else:
+                self.store.update(jid, status="failed", finished_at=now(), error=str(e)[:500])
+                log.warning("failed: %s: %s", self._label(job), e)
         finally:
             self._cancel.discard(jid)
             with self._lock:
                 self.current = None
+
+    def _temp(self, job: dict) -> str:
+        """The partial (a copy) or the staging file (an upgrade)."""
+        if job["mode"] == "upgrade":
+            return abs_path(self.media_root, staging_rel(job))
+        return abs_path(self.media_root, job["dest_rel"]) + PART_SUFFIX
+
+    def _run(self, job: dict) -> None:
+        jid, mode, phase = job["id"], job["mode"], job["phase"]
+        final = abs_path(self.media_root, job["dest_rel"])
+        temp = self._temp(job)
+        size = int(job["size"] or 0)
+        if jid in self._cancel and not phase:
+            raise Cancelled()
+        os.makedirs(os.path.dirname(final), exist_ok=True)
+        note = NOTES.get(mode)
+        if mode == "refresh" or phase == "placed":
+            if _regular_size(final) != size:
+                raise JobError("the copied file changed on the NAS; run Re-sync again")
+            self._set(bytes=size)
+        elif phase == "placing":
+            self._recover(job, final, temp)
+        elif mode is None and size and not os.path.lexists(temp) and _regular_size(final) == size:
+            note = ADOPTED.format(self.device)
+            self._set(bytes=size)
+            self._place(job, None, final)
+        else:
+            mark = self._download(job, temp)
+            self._place(job, temp, final, mark)
+        self._set(state="finishing")
+        self._finish(job, self._subtitles(job), note)
+
+    def _place(self, job: dict, src: str | None, final: str, mark: str | None = None) -> None:
+        """Serialized with server selection (gateway lock, then store lock): the
+        server check, `placing`, the rename and `placed` happen as one step."""
+        jid = job["id"]
+        with self.gw._lock:
+            self.gw.server_for(job["server_id"])
+            if job["phase"] != "placing":
+                if jid in self._cancel:
+                    raise Cancelled()
+                if job["mode"] == "upgrade":
+                    old = json.loads(job["replaces"] or "[]")
+                    ok = self.store.begin_upgrade(jid, old, mark)
+                    if not ok:
+                        raise Superseded()
+                else:
+                    self.store.update(jid, phase="placing")
+                job["phase"] = "placing"
+            if src is not None:
+                try:
+                    os.replace(src, final)
+                except OSError as e:
+                    self.store.update(jid, status="failed", phase=None, finished_at=now(),
+                                      error=f"could not move the file into place: {e}"[:500])
+                    job["phase"] = None
+                    raise PlaceFailed(str(e)) from None
+                _sync_dir(os.path.dirname(final))
+            self.store.update(jid, phase="placed")
+            job["phase"] = "placed"
+
+    def _recover(self, job: dict, final: str, temp: str) -> None:
+        """A run interrupted while placing: finish the rename, or prove it happened."""
+        if os.path.lexists(temp):
+            self._place(job, temp, final)
+            return
+        if job["mode"] == "upgrade":
+            self._set(state="verifying")
+            placed = os.path.isfile(final) and _sha256(final, self._check_stop) == job["staging_mark"]
+        else:
+            placed = _regular_size(final) == int(job["size"] or 0)
+        if placed:
+            self._place(job, None, final)
+            return
+        self.store.update(job["id"], status="failed", phase=None, finished_at=now(), error=UNCONFIRMED)
+        for old in json.loads(job["replaces"] or "[]"):
+            self.store.update(int(old), note="unverified after an interrupted re-sync")
+        raise _Handled()
+
+    def _check_stop(self) -> None:
+        if self._stop.is_set():
+            raise JobError("shutting down")
+
+    def _finish(self, job: dict, subs: dict, note: str | None) -> None:
+        jid = job["id"]
+        fields = {"status": "done", "phase": None, "finished_at": now(), "bytes_done": int(job["size"]),
+                  "sidecars": json.dumps(subs["sidecars"]), "subs_total": subs["total"],
+                  "subs_done": len(subs["written"]), "note": subs["note"] or note, "error": subs["error"]}
+        if subs["guid"] and not job["guid"]:
+            fields["guid"] = subs["guid"]
+        if job["mode"] in ("refresh", "redownload"):
+            fields["mode"] = None
+        if job["mode"] == "upgrade":
+            old = self.store.finish_upgrade(jid, json.loads(job["replaces"] or "[]"), fields)
+            for o in old:
+                self.cleanup(o)
+        else:
+            self.store.transition(jid, lambda r: True, **fields)
+        self.cleanup(jid)
+        log.info("done: %s", self._label(job))
 
     @staticmethod
     def _label(job: dict) -> str:
@@ -405,14 +533,18 @@ class Downloader:
             raise DiskError(f"could not record progress: {e}") from None
         job["bytes_done"] = pos
 
-    def _download(self, job: dict, final: str, partial: str) -> None:
+    def _download(self, job: dict, partial: str) -> str | None:
+        """Download into partial (a copy's partial or an upgrade's staging file).
+        For an upgrade, returns the sha256 of the whole file, kept up to date while
+        writing; a resume first rebuilds it from the bytes already there."""
         fd = _open_partial(partial)
+        hashing = {"h": hashlib.sha256(), "n": 0} if job["mode"] == "upgrade" else None
         try:
             have = self._start_offset(job, fd)
             high, attempts, restarts = have, 0, 0
             while True:
                 try:
-                    self._attempt(job, fd, have)
+                    self._attempt(job, fd, have, hashing)
                     break
                 except Restart as e:
                     restarts += 1
@@ -445,10 +577,28 @@ class Downloader:
             self._fsync(fd)
             if job["id"] in self._cancel:
                 raise Cancelled()
-            os.replace(partial, final)
-            _sync_dir(os.path.dirname(final))
+            if hashing is None:
+                return None
+            self._hash_upto(fd, hashing, size, job["id"])
+            return hashing["h"].hexdigest()
         finally:
             os.close(fd)
+
+    def _hash_upto(self, fd: int, hashing: dict, pos: int, jid: int) -> None:
+        """Make the running hash cover exactly bytes [0, pos) of the file."""
+        if hashing["n"] == pos:
+            return
+        if hashing["n"] > pos:
+            hashing["h"], hashing["n"] = hashlib.sha256(), 0
+        self._set(state="verifying")
+        while hashing["n"] < pos:
+            if jid in self._cancel:
+                raise Cancelled()
+            b = os.pread(fd, min(CHUNK, pos - hashing["n"]), hashing["n"])
+            if not b:
+                raise JobError("the staging file is shorter than expected")
+            hashing["h"].update(b)
+            hashing["n"] += len(b)
 
     def _start_offset(self, job: dict, fd: int) -> int:
         """Where a resume may start: only fsynced bytes from a validated response."""
@@ -469,7 +619,7 @@ class Downloader:
         self._set(bytes=have)
         return have
 
-    def _attempt(self, job: dict, fd: int, have: int) -> None:
+    def _attempt(self, job: dict, fd: int, have: int, hashing: dict | None = None) -> None:
         """One request; returns only when the file is complete and the response
         ended cleanly at exactly its size."""
         jid = job["id"]
@@ -480,7 +630,7 @@ class Downloader:
         size = int(job["size"] or 0)
         self._check_space(size, have)
         start = max(0, have - OVERLAP)
-        url, headers = self.gw.file_request(job["part_key"])
+        url, headers = self.gw.file_request(job["part_key"], self.gw.server_for(job["server_id"]))
         headers["Accept-Encoding"] = "identity"
         if have:
             headers["Range"] = f"bytes={start}-"
@@ -493,11 +643,17 @@ class Downloader:
                 first = [rest] if rest else []
             pos, failed = have, False
             synced, synced_t = have, time.monotonic()
+            if hashing is not None:
+                self._hash_upto(fd, hashing, have, jid)
+                self._set(state="connecting")
             try:
                 for chunk in itertools.chain(first, chunks):
                     room = size - pos
                     take = chunk if len(chunk) <= room else chunk[:room]
                     _write_all(fd, take, pos)
+                    if hashing is not None:
+                        hashing["h"].update(take)
+                        hashing["n"] += len(take)
                     pos += len(take)
                     self._set(bytes=pos)
                     if len(chunk) > room:
@@ -600,19 +756,37 @@ class Downloader:
         return bytes(got[need:])
 
     def _subtitles(self, job: dict) -> dict:
+        """The subtitle step, the same for every kind of job. `recorded` is every
+        name the copy owns (for an upgrade, the old copy's too). Names are recorded
+        before their file is written; old names are retired only when every
+        expected subtitle was written; otherwise everything recorded is kept."""
+        jid = job["id"]
+        recorded = list(json.loads(self.store.job(jid)["sidecars"] or "[]"))
+        for o in json.loads(job["replaces"] or "[]"):
+            old = self.store.job(int(o))
+            if old:
+                recorded += [n for n in json.loads(old["sidecars"] or "[]") if n not in recorded]
+        out = {"sidecars": recorded, "written": [], "total": 0, "guid": None, "note": None, "error": None}
         try:
-            streams = self.gw.subtitle_streams(job["rating_key"], job["part_id"])
+            streams, out["guid"] = self.gw.subtitle_streams(job["rating_key"], job["part_id"],
+                                                            self.gw.server_for(job["server_id"]))
+        except OtherServer:
+            out["note"] = "subtitles not refreshed: the Plex server changed"
+            return out
         except Exception as e:  # noqa: BLE001
-            return {"total": 0, "written": [], "error": f"subtitles not checked: {e}"[:300]}
-        written, problems, used = [], [], set()
+            out["error"] = f"subtitles not checked: {e}"[:300]
+            return out
+        out["total"] = len(streams)
+        written, failures, skipped, used = [], [], [], set()
         for s in streams:
             ext = SUB_EXT.get(s["codec"])
             if not ext:
-                problems.append(f"{s['title'] or s['codec']}: image-based, skipped")
+                skipped.append(f"{s['title'] or s['codec']}: image-based, skipped")
                 continue
             rel = sidecar_rel(job["dest_rel"], s["lang"], s["forced"], s["hi"], ext, used)
+            self.store.add_sidecar(jid, rel)
             try:
-                data = self.gw.fetch_bytes(s["key"])
+                data = self.gw.fetch_bytes(s["key"], srv=self.gw.server_for(job["server_id"]))
                 if not looks_like_subtitle(data, ext):
                     raise ValueError("response is not a subtitle file")
                 path = abs_path(self.media_root, rel)
@@ -626,7 +800,87 @@ class Downloader:
                     os.close(fd)
                 os.replace(tmp, path)
                 written.append(rel)
+            except OtherServer:
+                failures.append(f"{s['title'] or rel}: the Plex server changed")
             except Exception as e:  # noqa: BLE001
-                problems.append(f"{s['title'] or rel}: {e}")
-        return {"total": len(streams), "written": written,
-                "error": ("subtitles: " + "; ".join(problems))[:500] if problems else None}
+                failures.append(f"{s['title'] or rel}: {e}")
+        mine = list(json.loads(self.store.job(jid)["sidecars"] or "[]"))
+        recorded += [n for n in mine if n not in recorded]
+        if failures:
+            # keep everything recorded: old names stay owned by the copy
+            out["sidecars"] = recorded
+            if any(n not in written for n in recorded):
+                out["note"] = "old subtitles kept: some subtitles could not be fetched"
+        else:
+            out["sidecars"] = written  # the rest of `recorded` is retired by the finishing write
+        out["written"] = written
+        problems = failures + skipped
+        out["error"] = ("subtitles: " + "; ".join(problems))[:500] if problems else None
+        return out
+
+    # ------------------------------------------------------------- cleanup
+    def cleanup(self, row_id: int) -> list[str]:
+        """Delete what a row gave up (its cleanup list). A path still owned by a
+        copy on the NAS is left alone and cleared; one still needed by an unfinished
+        job is kept for later; a failed delete is kept and noted. Returns what is left."""
+        with self.store.lock:
+            row = self.store.job(row_id)
+            paths = json.loads((row or {}).get("cleanup") or "[]")
+            if not paths:
+                return []
+            self._cleaned[row_id] = time.monotonic()
+            names = {posixpath.basename(p) for p in paths}
+            owners: dict[str, bool] = {}  # real path -> owned by a done row
+            for r in self.store.rows("SELECT * FROM jobs WHERE id != ? AND status != 'removed'", (row_id,)):
+                for p in protected(r):
+                    if posixpath.basename(p) in names:
+                        rp = self._real(p)
+                        owners[rp] = owners.get(rp, False) or r["status"] == "done"
+            left, errors = [], []
+            for p in paths:
+                rp = self._real(p)
+                if rp in owners:
+                    if not owners[rp]:
+                        left.append(p)
+                    continue
+                try:
+                    remove_files(self.media_root, [p])
+                except (OSError, PathError) as e:
+                    if getattr(e, "errno", None) != errno.ENOENT:
+                        left.append(p)
+                        errors.append(f"{p}: {getattr(e, 'strerror', None) or e}")
+            fields = {"cleanup": json.dumps(left)}
+            if errors:
+                fields["note"] = ("could not delete old file: " + "; ".join(errors))[:300]
+            self.store.update(row_id, **fields)
+            return left
+
+    def _real(self, rel: str) -> str:
+        try:
+            return real_rel(self.media_root, rel)
+        except Exception:  # noqa: BLE001
+            return rel
+
+    def cleanup_pass(self, force: bool = False) -> None:
+        t = time.monotonic()
+        for r in self.store.rows("SELECT id FROM jobs WHERE cleanup != '[]'"):
+            if force or t - self._cleaned.get(r["id"], -CLEANUP_EVERY) >= CLEANUP_EVERY:
+                try:
+                    self.cleanup(r["id"])
+                except Exception:  # noqa: BLE001
+                    log.exception("cleanup of row %s failed", r["id"])
+
+
+class _Handled(Exception):
+    """The job's outcome is already recorded."""
+
+
+def _sha256(path: str, check) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as fh:
+        while True:
+            check()
+            b = fh.read(CHUNK)
+            if not b:
+                return h.hexdigest()
+            h.update(b)
