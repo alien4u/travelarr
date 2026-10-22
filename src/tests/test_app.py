@@ -2209,6 +2209,68 @@ class ResyncTest(PlexFixture):
         self.assertEqual(self.store.job(rid)["status"], "removed")
         self.assertFalse(os.path.lexists(self.m(LOOSE)))
 
+    # review round 5 ----------------------------------------------------------
+    def crashed_while_placing(self):
+        """An upgrade that committed T1 and crashed before its rename."""
+        old, up = self.upgrade_queued()
+        real = worker.os.replace
+
+        def crash(src, dst):
+            if ".travelarr-resync-" in src:
+                raise KeyboardInterrupt  # stands in for the process dying
+            return real(src, dst)
+        with mock.patch.object(worker.os, "replace", crash):
+            with self.assertRaises(KeyboardInterrupt):
+                self.dl._process(self.store.next_queued())
+        self.store.update(up["id"], status="queued")  # what the startup reset does
+        job = self.store.job(up["id"])
+        self.assertEqual(job["phase"], "placing")
+        return old, job, self.m(store_mod.staging_rel(job))
+
+    def test_recovery_refuses_a_truncated_staging_file(self):
+        old, up, staging = self.crashed_while_placing()
+        with open(staging, "r+b") as fh:
+            fh.truncate(1000)
+        self.drain()
+        self.assertEqual(self.store.job(up["id"])["status"], "failed")
+        self.assertEqual(self.store.job(old["id"])["status"], "done")
+        self.assertEqual(self.read(HEAT), self.fake.parts[1001])
+        self.assertFalse(os.path.lexists(self.m("Movies/Heat (1995)/Heat (1995) v2.mkv")))
+
+    def test_recovery_refuses_a_substituted_staging_file(self):
+        old, up, staging = self.crashed_while_placing()
+        with open(staging, "r+b") as fh:
+            fh.seek(150_000)
+            fh.write(b"tampered")                 # same size, different content
+        self.drain()
+        self.assertEqual(self.store.job(up["id"])["status"], "failed")
+        self.assertEqual(self.store.job(old["id"])["status"], "done")
+        self.assertFalse(os.path.lexists(self.m("Movies/Heat (1995)/Heat (1995) v2.mkv")))
+
+    def test_recovery_places_an_intact_staging_file(self):
+        old, up, staging = self.crashed_while_placing()
+        before = len(self.fake.requests)
+        self.drain()
+        self.assertEqual(self.part_requests(1101, before), [])
+        self.assertEqual(self.store.job(up["id"])["status"], "done")
+        self.assertEqual(self.read("Movies/Heat (1995)/Heat (1995) v2.mkv"), self.fake.parts[1101])
+
+    def test_retry_cannot_bring_back_a_removed_job(self):
+        self.c.post("/api/queue", json={"keys": ["102"]})
+        jid = self.store.next_queued()["id"]
+        self.store.update(jid, status="failed")
+        real = self.store.job
+
+        def job(job_id):
+            row = real(job_id)
+            if row and row["status"] == "failed":
+                self.store.remove(job_id)          # Remove commits right after Retry read the row
+            return row
+        with mock.patch.object(self.store, "job", job):
+            r = self.c.post(f"/api/jobs/{jid}/retry")
+        self.assertEqual(r.status_code, 409)
+        self.assertEqual(real(jid)["status"], "removed")
+
     # servers -----------------------------------------------------------------
     def test_jobs_of_another_server_wait(self):
         self.c.post("/api/queue", json={"keys": ["102"]})

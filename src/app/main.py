@@ -402,12 +402,18 @@ def create_app(data_dir: str | None = None, media_root: str | None = None,
                                   server_id=j["server_id"] or store.get("server_id"))
             except OtherServer:
                 return err(409, "This job belongs to another Plex server; select it first.", "other_server")
+            # only while it is still the failed job (a concurrent Remove wins)
+            if not store.transition(job_id, lambda r: r["status"] == "failed", status="cancelled",
+                                    note="queued again", finished_at=now()):
+                return err(409, "This job changed meanwhile; reload", "changed")
+            dl.cleanup(job_id)
             added, _ = store.add_jobs(planned)
-            store.update(job_id, status="cancelled", note="queued again", finished_at=now())
             dl.wake()
             return {"ok": True, "requeued": len(added)}
         if j["status"] in ("failed", "cancelled"):
-            store.update(job_id, status="queued", error=None, note=None, finished_at=None)
+            if not store.transition(job_id, lambda r: r["status"] in ("failed", "cancelled"), status="queued",
+                                    error=None, note=None, finished_at=None):
+                return err(409, "This job changed meanwhile; reload", "changed")
             dl.wake()
         return {"ok": True}
 

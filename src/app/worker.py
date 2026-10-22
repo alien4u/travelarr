@@ -459,8 +459,17 @@ class Downloader:
             job["phase"] = "placed"
 
     def _recover(self, job: dict, final: str, temp: str) -> None:
-        """A run interrupted while placing: finish the rename, or prove it happened."""
+        """A run interrupted while placing: finish the rename, or prove it happened.
+        A surviving temporary file is only moved into place if it is still the file
+        that was committed: a regular file of the job's size and, for an upgrade, the
+        recorded sha256."""
         if os.path.lexists(temp):
+            ok = _regular_size(temp) == int(job["size"] or 0)
+            if ok and job["mode"] == "upgrade":
+                self._set(state="verifying")
+                ok = _sha256(temp, self._check_stop) == job["staging_mark"]
+            if not ok:
+                self._abandon(job, "the downloaded file changed before it was placed; run Re-sync again")
             self._place(job, temp, final)
             return
         if job["mode"] == "upgrade":
