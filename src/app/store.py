@@ -254,9 +254,12 @@ class Store:
         if not when(row):
             return None
         after = {**row, **fields}
-        gone = owned(row) - owned(after)
-        if gone:
-            pending = json.loads(row.get("cleanup") or "[]")
+        mine = owned(after)
+        pending = json.loads(row.get("cleanup") or "[]")
+        gone = owned(row) - mine
+        if gone or any(p in mine for p in pending):
+            # a path the row owns again (a retry placed it anew) is no longer to be deleted
+            pending = [p for p in pending if p not in mine]
             pending += sorted(p for p in gone if p not in pending and self._exists(p))
             after["cleanup"] = fields["cleanup"] = json.dumps(pending)
         keys = list(fields)
@@ -350,6 +353,12 @@ class Store:
                 self.db.execute("ROLLBACK")
                 raise
         return retired
+
+    def bind_server(self, job_id: int, server_id: str, guid: str | None) -> bool:
+        """Bind a row from before 2.5.0 to a server, only if it still has none."""
+        n = self.exec("UPDATE jobs SET server_id=?, guid=COALESCE(guid, ?) WHERE id=? AND server_id IS NULL "
+                      "AND status IN ('done','failed','cancelled','queued')", (server_id, guid, job_id)).rowcount
+        return n == 1 or (self.job(job_id) or {}).get("server_id") == server_id
 
     def add_sidecar(self, job_id: int, rel: str) -> None:
         """Recorded before the file is written, so a written file is never unowned."""

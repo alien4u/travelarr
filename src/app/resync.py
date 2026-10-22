@@ -213,8 +213,7 @@ def bind_legacy(store, gw, rows: list[dict], expected_sid: str) -> set[int]:
         parts = list(it.iterParts())
         sec = gw._section(it.librarySectionID, srv)
         dest = dest_rel_for(parts[0].file, sec.locations, sec.title) if parts else None
-        if _same_item(r, it, sid, dest):
-            store.update(r["id"], server_id=sid, guid=r["guid"] or getattr(it, "guid", None))
+        if _same_item(r, it, sid, dest) and store.bind_server(r["id"], sid, getattr(it, "guid", None)):
             ok.add(r["id"])
     return ok
 

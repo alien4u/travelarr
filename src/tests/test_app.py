@@ -2130,6 +2130,58 @@ class ResyncTest(PlexFixture):
         self.assertEqual(r.status_code, 409)
         self.assertIsNone(self.store.next_queued())
 
+    # review round 3 ----------------------------------------------------------
+    def test_retry_after_an_abandoned_placement_keeps_the_new_file(self):
+        self.c.post("/api/queue", json={"keys": ["102"]})
+        jid = self.store.next_queued()["id"]
+        real = self.dl._subtitles
+        calls = {"n": 0}
+
+        def boom(job):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise RuntimeError("power cut")   # the video is placed, subtitles not done
+            return real(job)
+        with mock.patch.object(self.dl, "_subtitles", boom):
+            self.dl._process(self.store.next_queued())
+            self.assertEqual(self.store.job(jid)["phase"], "placed")
+            with open(self.m(LOOSE), "r+b") as fh:
+                fh.truncate(5)                    # changed on the NAS before it finished
+            self.dl._later.clear()
+            with mock.patch.object(worker, "remove_files", side_effect=PermissionError(13, "Permission denied")):
+                self.dl._process(self.store.next_queued())
+        job = self.store.job(jid)
+        self.assertEqual((job["status"], job["phase"]), ("failed", None))
+        self.assertIn(LOOSE, json.loads(job["cleanup"]))               # still to be deleted
+        self.c.post(f"/api/jobs/{jid}/retry")
+        self.drain()
+        job = self.store.job(jid)
+        self.assertEqual((job["status"], json.loads(job["cleanup"])), ("done", []))
+        self.assertEqual(self.read(LOOSE), self.fake.parts[1002])      # the new copy survived
+
+    def test_binding_an_older_copy_never_overrides_another_binding(self):
+        self.copy("102")
+        rid = self.row("102")["id"]
+        self.store.update(rid, server_id="other")
+        self.assertFalse(self.store.bind_server(rid, "srv1", None))
+        self.assertEqual(self.store.job(rid)["server_id"], "other")
+        self.store.update(rid, server_id=None)
+        self.assertTrue(self.store.bind_server(rid, "srv1", "plex://movie/loose"))
+
+    def test_part_replaced_before_the_subtitle_step_keeps_subtitles(self):
+        self.copy("101")
+        rid = self.row("101")["id"]
+        next(x for x in self.movie(101)["subs"] if x["id"] == 9001)["body"] = SRT_BODY("Nuevo texto")
+        self.apply("101", "101")
+        self.new_part(self.movie(101), 1101)  # replaced again before the worker runs
+        self.drain()
+        job = self.store.job(rid)
+        self.assertEqual(job["status"], "done")
+        self.assertIn("subtitles not checked", job["error"])
+        self.assertEqual(sorted(json.loads(job["sidecars"])), sorted([self.HEAT_EN, self.HEAT_ES]))
+        self.assertTrue(os.path.isfile(self.m(self.HEAT_EN)))
+        self.assertEqual(self.kinds("101"), {"101": "upgraded"})       # the next re-sync sees it
+
     # servers -----------------------------------------------------------------
     def test_jobs_of_another_server_wait(self):
         self.c.post("/api/queue", json={"keys": ["102"]})

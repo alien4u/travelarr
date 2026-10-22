@@ -422,19 +422,22 @@ def create_app(data_dir: str | None = None, media_root: str | None = None,
         if body.get("serverId") != sid:
             return err(409, "The Plex server changed; reload and try again", "other_server")
         results: dict[str, int] = {}
-        targets = []
-        for rk in body.get("ratingKeys", []):
-            targets += store.jobs_for(rating_key=str(rk), server_id=sid)
-        for sk in body.get("showKeys", []):
-            targets += store.jobs_for(show_key=str(sk), server_id=sid)
-        targets = list({j["id"]: j for j in targets}.values())
-        verified = resync.bind_legacy(store, gw, targets, sid)
-        for j in targets:
-            if not j["server_id"] and j["id"] not in verified:
-                results["skipped"] = results.get("skipped", 0) + 1
-                continue
-            r = remove_job(j)
-            results[r] = results.get(r, 0) + 1
+        with resync.LOCK:  # selecting another server waits until this removal is done
+            if store.get("server_id") != sid:
+                return err(409, "The Plex server changed; reload and try again", "other_server")
+            targets = []
+            for rk in body.get("ratingKeys", []):
+                targets += store.jobs_for(rating_key=str(rk), server_id=sid)
+            for sk in body.get("showKeys", []):
+                targets += store.jobs_for(show_key=str(sk), server_id=sid)
+            targets = list({j["id"]: j for j in targets}.values())
+            verified = resync.bind_legacy(store, gw, targets, sid)
+            for j in targets:
+                if not j["server_id"] and j["id"] not in verified:
+                    results["skipped"] = results.get("skipped", 0) + 1
+                    continue
+                r = remove_job(j)
+                results[r] = results.get(r, 0) + 1
         return {"results": results}
 
     # ---------------------------------------------------------- local files

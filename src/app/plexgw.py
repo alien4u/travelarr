@@ -650,7 +650,8 @@ class PlexGateway:
         for p in it.iterParts():
             if p.id == part_id:
                 return self.text_streams(p), getattr(it, "guid", None)
-        return [], getattr(it, "guid", None)
+        # not "no subtitles": the file is not on Plex any more, so nothing can be compared
+        raise ValueError("the file on Plex changed again; run Re-sync")
 
     def fetch_bytes(self, key: str, max_bytes: int = 20 << 20, srv: PlexServer | None = None) -> bytes:
         srv = srv or self.server()

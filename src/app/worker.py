@@ -843,6 +843,7 @@ class Downloader:
                 return []
             self._cleaned[row_id] = time.monotonic()
             names = {posixpath.basename(p) for p in paths}
+            own = {self._real(p) for p in protected(row)}  # never delete what the row itself holds now
             owners: dict[str, bool] = {}  # real path -> owned by a done row
             for r in self.store.rows("SELECT * FROM jobs WHERE id != ? AND status != 'removed'", (row_id,)):
                 for p in protected(r):
@@ -852,6 +853,8 @@ class Downloader:
             left, errors = [], []
             for p in paths:
                 rp = self._real(p)
+                if rp in own:
+                    continue
                 if rp in owners:
                     if not owners[rp]:
                         left.append(p)
