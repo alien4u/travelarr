@@ -336,8 +336,7 @@ class Downloader:
                 final = abs_path(self.media_root, j["dest_rel"])
             except PathError:
                 continue
-            if os.path.lexists(final + PART_SUFFIX):
-                self.store.update(j["id"], status="queued", note="copied file was missing; checking it again")
+            if os.path.lexists(final + PART_SUFFIX) and self.store.requeue_lost(j["id"]):
                 n += 1
         log.info("checked copied files in %.1fs; %d queued again", time.monotonic() - t, n)
 
@@ -483,7 +482,7 @@ class Downloader:
                   "subs_done": len(subs["written"]), "note": subs["note"] or note, "error": subs["error"]}
         if subs["guid"] and not job["guid"]:
             fields["guid"] = subs["guid"]
-        if job["mode"] in ("refresh", "redownload"):
+        if job["mode"] in ("refresh", "redownload", "recover"):
             fields["mode"] = None
         if job["mode"] == "upgrade":
             old = self.store.finish_upgrade(jid, json.loads(job["replaces"] or "[]"), fields)
@@ -779,6 +778,8 @@ class Downloader:
         out["total"] = len(streams)
         written, failures, skipped, used = [], [], [], set()
         for s in streams:
+            if job["mode"] == "refresh" and jid in self._cancel:
+                raise Cancelled()  # back to done; names recorded so far stay with the copy
             ext = SUB_EXT.get(s["codec"])
             if not ext:
                 skipped.append(f"{s['title'] or s['codec']}: image-based, skipped")

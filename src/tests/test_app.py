@@ -1814,6 +1814,8 @@ class ResyncTest(PlexFixture):
         self.copy("101")
         rid = self.row("101")["id"]
         self.store.update(rid, server_id="other")
+        self.assertEqual(self.check("101"), {"serverId": "srv1", "checked": 0, "items": []})  # not this server's
+        self.store.update(rid, server_id="srv1", guid="plex://movie/another")
         self.assertEqual(self.kinds("101"), {"101": "mismatch"})
         # a copy from before 2.5.0: same title and folder -> compared, and bound on apply
         self.store.update(rid, server_id=None, guid=None)
@@ -1989,6 +1991,67 @@ class ResyncTest(PlexFixture):
         self.assertFalse(os.path.lexists(self.m(LOOSE)))
         self.drain()
         self.assertEqual(self.store.job(rid)["status"], "removed")
+
+    # review findings ---------------------------------------------------------
+    def test_bulk_removal_only_touches_the_selected_server(self):
+        self.copy("102")
+        rid = self.row("102")["id"]
+        self.store.update(rid, server_id="other")
+        self.c.post("/api/remove", json={"ratingKeys": ["102"]})
+        self.assertEqual(self.store.job(rid)["status"], "done")
+        self.assertTrue(os.path.isfile(self.m(LOOSE)))
+
+    def test_removal_is_ordered_with_the_upgrade_lock(self):
+        old, up = self.upgrade_queued()
+        self.store.update(up["id"], phase="placing")
+        self.assertIsNone(self.store.remove(old["id"]))           # refused inside the same transaction
+        self.assertFalse(self.store.mark_removed(old["id"], "x"))
+        self.assertEqual(self.store.job(old["id"])["status"], "done")
+
+    def test_local_files_refuses_the_copy_an_upgrade_is_replacing(self):
+        old, up = self.upgrade_queued()
+        self.store.update(up["id"], phase="placed")
+        r = self.c.post("/api/files/delete", json={"paths": [HEAT]})
+        self.assertEqual(r.status_code, 409)
+        self.assertTrue(os.path.isfile(self.m(HEAT)))
+
+    def test_lost_rename_recovery_keeps_ownership(self):
+        self.copy("102")
+        rid = self.row("102")["id"]
+        with open(self.m(LOOSE) + paths.PART_SUFFIX, "wb") as fh:
+            fh.write(b"y" * 10)
+        self.dl._reconcile_done()
+        job = self.store.job(rid)
+        self.assertEqual((job["status"], job["mode"]), ("queued", "recover"))
+        self.assertIn(LOOSE, store_mod.owned(job))
+        self.c.post(f"/api/jobs/{rid}/cancel")
+        self.assertIn(LOOSE, store_mod.owned(self.store.job(rid)))   # still owned after cancel
+        self.assertTrue(os.path.isfile(self.m(LOOSE)))
+
+    def test_cancel_during_a_subtitle_refresh_returns_to_done(self):
+        self.copy("101")
+        rid = self.row("101")["id"]
+        es = next(x for x in self.movie(101)["subs"] if x["id"] == 9001)
+        es["body"] = SRT_BODY("Otra vez")
+        self.apply("101", "101")
+        real = self.gw.fetch_bytes
+
+        def fetch(*a, **kw):
+            self.dl.cancel(rid)          # cancelled while the first subtitle downloads
+            return real(*a, **kw)
+        with mock.patch.object(self.gw, "fetch_bytes", fetch):
+            self.drain()
+        job = self.store.job(rid)
+        self.assertEqual((job["status"], job["mode"], job["note"]), ("done", None, "re-sync cancelled"))
+        self.assertEqual(len(json.loads(job["sidecars"])), 2)                   # nothing lost or retired
+        self.assertTrue(os.path.isfile(self.m(self.HEAT_EN)))
+
+    def test_resync_ignores_rows_of_another_server(self):
+        self.copy("102")
+        other = dict(self.row("102"))
+        self.store.add_jobs([{**{k: other[k] for k in store_mod.JOB_FIELDS if k in other},
+                              "server_id": "other", "dest_rel": "Movies/elsewhere.mkv", "part_id": 1}])
+        self.assertEqual(self.check("102"), {"serverId": "srv1", "checked": 1, "items": []})
 
     # servers -----------------------------------------------------------------
     def test_jobs_of_another_server_wait(self):

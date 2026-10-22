@@ -89,9 +89,9 @@ def owned(row: dict) -> set[str]:
     if phase == "placed":
         return {dest, temp} | _sidecars(row)
     if phase == "placing":
-        # the destination is proven only once placed; a redownload owned it already
-        return {temp} | _sidecars(row) | ({dest} if mode == "redownload" else set())
-    if mode in ("refresh", "redownload"):  # an existing copy, re-queued
+        # the destination is proven only once placed; a re-queued copy owned it already
+        return {temp} | _sidecars(row) | ({dest} if mode in ("redownload", "recover") else set())
+    if mode in ("refresh", "redownload", "recover"):  # an existing copy, re-queued
         if st == "cancelled":
             return {dest} | _sidecars(row)
         return {dest, temp} | _sidecars(row)
@@ -194,6 +194,14 @@ class Store:
                 return True
         return False
 
+    def _locked(self, job_id: int) -> bool:
+        """An upgrade that is placing or placed replaces this row (inside a transaction)."""
+        for r in self.db.execute("SELECT replaces FROM jobs WHERE mode='upgrade' AND phase IS NOT NULL "
+                                 "AND status != 'removed'"):
+            if job_id in {int(i) for i in json.loads(r[0] or "[]")}:
+                return True
+        return False
+
     def upgrades_of(self, job_id: int) -> list[dict]:
         """Unfinished upgrades that replace this row."""
         return [r for r in self.rows("SELECT * FROM jobs WHERE mode='upgrade' "
@@ -279,11 +287,20 @@ class Store:
                                    **self._cancel_fields(row)) is not None
 
     def remove(self, job_id: int, statuses=("done", "failed", "cancelled"), note: str | None = None) -> dict | None:
-        """-> removed; everything the row owned goes to its cleanup list."""
+        """-> removed; everything the row owned goes to its cleanup list. Refused
+        (None) for a copy an upgrade is placing: checked in the same transaction,
+        so it is ordered with the upgrade's T1."""
         fields = {"status": "removed", "removed_at": now(), "phase": None}
         if note is not None:
             fields["note"] = note
-        return self.transition(job_id, lambda r: r["status"] in statuses, **fields)
+        return self.transition(job_id, lambda r: r["status"] in statuses and not self._locked(r["id"]), **fields)
+
+    def requeue_lost(self, job_id: int) -> bool:
+        """A done copy whose final rename was lost: check it again, keeping
+        ownership of whatever is at its destination."""
+        return self.transition(job_id, lambda r: r["status"] == "done" and not self._locked(r["id"]),
+                               status="queued", mode="recover",
+                               note="copied file was missing; checking it again") is not None
 
     def mark_removed(self, job_id: int, note: str) -> bool:
         return self.remove(job_id, ("done", "failed"), note) is not None
@@ -357,6 +374,14 @@ class Store:
                 hit = {j["id"]: {touches(t, p) for t in targets for p in paths(j)} for j in rows}
                 busy = next((j for j in rows if (j["status"] == "downloading" or j["phase"])
                              and hit[j["id"]] - {None}), None)
+                for j in rows:  # a copy being replaced right now is as busy as its upgrade
+                    if busy is None and j["mode"] == "upgrade" and j["phase"]:
+                        for o in json.loads(j["replaces"] or "[]"):
+                            old = self.db.execute("SELECT * FROM jobs WHERE id=?", (int(o),)).fetchone()
+                            if old and any(touches(t, p) for t in targets
+                                           for p in [old["dest_rel"], where(old["dest_rel"])]
+                                           + json.loads(old["sidecars"] or "[]")):
+                                busy = j
                 n = 0
                 if busy is None:
                     for j in rows:
@@ -393,10 +418,13 @@ class Store:
         sql += f" ORDER BY {order} LIMIT ? OFFSET ?"
         return self.rows(sql, args + [limit, offset])
 
-    def jobs_for(self, rating_key: str | None = None, show_key: str | None = None) -> list[dict]:
-        if show_key:
-            return self.rows("SELECT * FROM jobs WHERE show_key=? ORDER BY id", (show_key,))
-        return self.rows("SELECT * FROM jobs WHERE rating_key=? ORDER BY id", (rating_key,))
+    def jobs_for(self, rating_key: str | None = None, show_key: str | None = None,
+                 server_id: str | None = None) -> list[dict]:
+        """Rows of an item; with server_id only that server's and rows from before 2.5.0
+        (rating keys belong to one server)."""
+        col, key = ("show_key", show_key) if show_key else ("rating_key", rating_key)
+        return self.rows(f"SELECT * FROM jobs WHERE {col}=? AND (server_id IS NULL OR ? IS NULL OR server_id=?) "
+                         "ORDER BY id", (key, server_id, server_id))
 
     def status_map(self, rating_keys: list[str], server_id: str | None = None) -> dict[str, str]:
         """Best current status per item (downloading > queued > done > failed...),

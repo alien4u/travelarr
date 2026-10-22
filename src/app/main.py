@@ -296,7 +296,9 @@ def create_app(data_dir: str | None = None, media_root: str | None = None,
             d["copy"] = store.show_counts([rk], sid).get(rk)
         else:
             d["copy"] = store.status_map([rk], store.get("server_id")).get(rk)
-        jobs = store.jobs_for(show_key=rk) if d["type"] == "show" else store.jobs_for(rating_key=rk)
+        sid = store.get("server_id")
+        jobs = (store.jobs_for(show_key=rk, server_id=sid) if d["type"] == "show"
+                else store.jobs_for(rating_key=rk, server_id=sid))
         d["history"] = jobs[-50:]
         return d
 
@@ -404,10 +406,11 @@ def create_app(data_dir: str | None = None, media_root: str | None = None,
     def remove_many(body: dict = Body(...)):
         results: dict[str, int] = {}
         targets = []
+        sid = store.get("server_id")  # rating keys belong to one server
         for rk in body.get("ratingKeys", []):
-            targets += store.jobs_for(rating_key=str(rk))
+            targets += store.jobs_for(rating_key=str(rk), server_id=sid)
         for sk in body.get("showKeys", []):
-            targets += store.jobs_for(show_key=str(sk))
+            targets += store.jobs_for(show_key=str(sk), server_id=sid)
         for j in {j["id"]: j for j in targets}.values():
             r = remove_job(j)
             results[r] = results.get(r, 0) + 1

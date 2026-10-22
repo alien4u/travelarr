@@ -267,9 +267,10 @@ class PlexGateway:
         return True
 
     def sign_out(self) -> None:
-        for k in ("token", "username", "server_id", "server_name", "preferred_url"):
-            self.store.set(k, None)
-        self.reset()
+        with self._lock:  # never a snapshot pairing one server's connection with another's id
+            for k in ("token", "username", "server_id", "server_name", "preferred_url"):
+                self.store.set(k, None)
+            self.reset()
 
     def reset(self) -> None:
         with self._lock:
@@ -307,11 +308,12 @@ class PlexGateway:
 
     def select_server(self, server_id: str, name: str | None, preferred_url: str | None,
                       allow_relay: bool) -> None:
-        self.store.set("server_id", server_id)
-        self.store.set("server_name", name)
-        self.store.set("preferred_url", (preferred_url or "").strip() or None)
-        self.store.set("allow_relay", bool(allow_relay))
-        self.reset()
+        with self._lock:  # the id and the cached connection change together
+            self.store.set("server_id", server_id)
+            self.store.set("server_name", name)
+            self.store.set("preferred_url", (preferred_url or "").strip() or None)
+            self.store.set("allow_relay", bool(allow_relay))
+            self.reset()
 
     def snapshot(self) -> tuple[PlexServer, str]:
         """The selected server's connection and id, read together."""

@@ -38,19 +38,20 @@ def _label(row: dict) -> str:
     return f"{row['title']} ({row['year']})" if row.get("year") else row["title"]
 
 
-def _scope(store, srv, key: str) -> tuple[str, list[dict]]:
+def _scope(store, srv, sid: str, key: str) -> tuple[str, list[dict]]:
     try:
         root = srv.fetchItem(int(key))
     except (NotFound, ValueError):
         raise ResyncError(400, "That item is not on the selected Plex server") from None
     # done copies, plus unfinished jobs of the same items so those show as busy
-    done = "SELECT * FROM jobs WHERE status IN ('done','queued','downloading') AND "
+    done = ("SELECT * FROM jobs WHERE status IN ('done','queued','downloading') "
+            "AND (server_id IS NULL OR server_id=?) AND ")
     if root.type in ("movie", "episode"):
-        rows = store.rows(done + "rating_key=?", (str(key),))
+        rows = store.rows(done + "rating_key=?", (sid, str(key)))
     elif root.type == "show":
-        rows = store.rows(done + "show_key=?", (str(key),))
+        rows = store.rows(done + "show_key=?", (sid, str(key)))
     elif root.type == "season":
-        rows = store.rows(done + "show_key=? AND season=?", (str(root.parentRatingKey), root.index))
+        rows = store.rows(done + "show_key=? AND season=?", (sid, str(root.parentRatingKey), root.index))
     else:
         raise ResyncError(400, "Only movies, shows, seasons and episodes can be re-synced")
     if len(rows) > MAX_ROWS:
@@ -72,14 +73,15 @@ def _same_item(row: dict, it, sid: str, dest: str | None) -> bool:
     return same and dest is not None and posixpath.dirname(dest) == posixpath.dirname(row["dest_rel"])
 
 
-def _busy(store, rows_by_rk: dict) -> set[str]:
+def _busy(store, sid: str, rows_by_rk: dict) -> set[str]:
     rks = list(rows_by_rk)
     busy: set[str] = set()
     for i in range(0, len(rks), 500):
         chunk = rks[i:i + 500]
         marks = ",".join("?" * len(chunk))
         busy |= {r["rating_key"] for r in store.rows(
-            f"SELECT rating_key FROM jobs WHERE status IN ('queued','downloading') AND rating_key IN ({marks})", chunk)}
+            f"SELECT rating_key FROM jobs WHERE status IN ('queued','downloading') AND rating_key IN ({marks}) "
+            "AND (server_id IS NULL OR server_id=?)", chunk + [sid])}
     ids = {r["id"]: rk for rk, rows in rows_by_rk.items() for r in rows}
     for u in store.rows("SELECT * FROM jobs WHERE mode='upgrade' AND status IN ('queued','downloading','failed')"):
         for o in json.loads(u["replaces"] or "[]"):
@@ -92,12 +94,12 @@ def _compute(store, gw, media_root: str, key: str) -> dict:
     srv, sid = gw.snapshot()
     if not sid:
         raise ResyncError(409, "Choose a Plex server first")
-    _, rows = _scope(store, srv, key)
+    _, rows = _scope(store, srv, sid, key)
     by_rk: dict[str, list[dict]] = defaultdict(list)
     for r in rows:
         by_rk[r["rating_key"]].append(r)
     plex = gw.batch(srv, list(by_rk))
-    busy = _busy(store, by_rk)
+    busy = _busy(store, sid, by_rk)
     items, heads = [], []
     for rk, rws in by_rk.items():
         row = rws[0]
