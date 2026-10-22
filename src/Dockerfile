@@ -2,7 +2,8 @@ FROM python:3.12-slim
 
 LABEL org.opencontainers.image.title="travelarr" \
       org.opencontainers.image.description="Copy original files from your home Plex server to a travel NAS" \
-      org.opencontainers.image.source="https://github.com/alien4u/travelarr"
+      org.opencontainers.image.source="https://github.com/alien4u/travelarr" \
+      org.opencontainers.image.licenses="MIT"
 
 ENV PYTHONUNBUFFERED=1 \
     HOME=/tmp \

@@ -17,6 +17,7 @@ Downloads resume after dropped connections and restarts, and every resume is che
   <Category>Downloaders: MediaApp:Video</Category>
   <ExtraSearchTerms>plex travel offline download copy sync infuse movies tv nas</ExtraSearchTerms>
   <Date>2026-10-22</Date>
+  <License>MIT</License>
   <WebUI>http://[IP]:[PORT:8484]/</WebUI>
   <TemplateURL>https://raw.githubusercontent.com/alien4u/travelarr/main/unraid/travelarr.xml</TemplateURL>
   <Icon>https://raw.githubusercontent.com/alien4u/travelarr/main/unraid/travelarr.png</Icon>

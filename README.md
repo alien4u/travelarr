@@ -8,6 +8,7 @@
   <a href="https://github.com/alien4u/travelarr/actions/workflows/image.yml"><img alt="Build" src="https://github.com/alien4u/travelarr/actions/workflows/image.yml/badge.svg"></a>
   <a href="https://github.com/alien4u/travelarr/pkgs/container/travelarr"><img alt="Version" src="https://img.shields.io/github/v/tag/alien4u/travelarr?label=version&logo=github"></a>
   <a href="https://github.com/alien4u/travelarr/pkgs/container/travelarr"><img alt="GHCR" src="https://img.shields.io/badge/ghcr.io-alien4u%2Ftravelarr-blue?logo=docker&logoColor=white"></a>
+  <a href="LICENSE"><img alt="License" src="https://img.shields.io/github/license/alien4u/travelarr"></a>
 </p>
 
 **travelarr** fills your travel NAS with movies and TV shows from your home Plex server, so you can watch them on the
@@ -132,3 +133,7 @@ travelarr is a personal project, shared as is. Bug reports are welcome in
 ## Credits
 
 Co-Authored with Claude Code.
+
+## License
+
+[MIT](LICENSE)
