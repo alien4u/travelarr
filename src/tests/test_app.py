@@ -1587,19 +1587,104 @@ class DeviceNameTest(unittest.TestCase):
 
 
 class PasswordTest(unittest.TestCase):
-    def test_basic_auth(self):
-        tmp = tempfile.mkdtemp()
-        try:
-            app = create_app(data_dir=tmp, media_root=tmp, password="s3cret",
-                             gateway_factory=lambda s: PlexGateway(s, "t"), start_worker=False)
-            with TestClient(app) as c:
-                self.assertEqual(c.get("/api/state").status_code, 401)
-                bad = base64.b64encode(b"x:nope").decode()
-                self.assertEqual(c.get("/api/state", headers={"Authorization": f"Basic {bad}"}).status_code, 401)
-                good = base64.b64encode(b"anyone:s3cret").decode()
-                self.assertEqual(c.get("/api/state", headers={"Authorization": f"Basic {good}"}).status_code, 200)
-        finally:
-            shutil.rmtree(tmp, ignore_errors=True)
+    PW = "Zq9-pw-7731"  # distinctive, so a log line can only contain it if it was built from it
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        env = mock.patch.dict(os.environ)
+        env.start()
+        self.addCleanup(env.stop)
+        os.environ.pop("TRAVELARR_USERNAME", None)
+        os.environ.pop("TRAVELARR_PASSWORD", None)
+
+    def app(self, password=PW, **kw):
+        return create_app(data_dir=self.tmp, media_root=self.tmp, password=password, start_worker=False,
+                          gateway_factory=lambda s: PlexGateway(s, "t"), **kw)
+
+    @staticmethod
+    def basic(raw: str | bytes) -> dict:
+        raw = raw.encode() if isinstance(raw, str) else raw
+        return {"Authorization": "Basic " + base64.b64encode(raw).decode()}
+
+    @staticmethod
+    def codes(app, *headers) -> list[int]:
+        with TestClient(app) as c:
+            return [c.get("/api/state", headers=h).status_code for h in headers]
+
+    def test_user_name_is_checked(self):
+        pw = self.PW
+        self.assertEqual(self.codes(self.app(), {}, self.basic("admin:nope"), self.basic(f"anyone:{pw}"),
+                                    self.basic(f"Admin:{pw}"), self.basic(f"admin:{pw}")),
+                         [401, 401, 401, 401, 200])
+
+    def test_challenge_and_static_page(self):
+        with TestClient(self.app()) as c:
+            r = c.get("/")
+            self.assertEqual((r.status_code, r.text), (401, "Authentication required"))
+            self.assertEqual(r.headers["www-authenticate"], 'Basic realm="travelarr", charset="UTF-8"')
+            self.assertEqual(c.get("/", headers=self.basic(f"admin:{self.PW}")).status_code, 200)
+
+    def test_custom_user_name(self):
+        self.assertEqual(self.codes(self.app(username="road"), self.basic(f"road:{self.PW}"),
+                                    self.basic(f"admin:{self.PW}")), [200, 401])
+        self.assertEqual(self.codes(self.app(username=" "), self.basic(f"admin:{self.PW}")), [200])
+
+    def test_user_name_from_env(self):
+        for value, user in [("bob", "bob"), (" bob ", "bob"), ("  ", "admin"), (None, "admin")]:
+            if value is None:
+                os.environ.pop("TRAVELARR_USERNAME", None)
+            else:
+                os.environ["TRAVELARR_USERNAME"] = value
+            self.assertEqual(self.codes(self.app(), self.basic(f"{user}:{self.PW}")), [200], value)
+        os.environ["TRAVELARR_USERNAME"] = " bob "
+        self.assertEqual(self.codes(self.app(), self.basic(f" bob:{self.PW}")), [401])
+        self.assertEqual(self.codes(self.app(username="road"), self.basic(f"road:{self.PW}"),
+                                    self.basic(f"bob:{self.PW}")), [200, 401])
+
+    def test_passwords_with_colons_and_non_ascii(self):
+        self.assertEqual(self.codes(self.app(password="pa:ss"), self.basic("admin:pa:ss")), [200])
+        self.assertEqual(self.codes(self.app(password="contraseña"), self.basic("admin:contraseña"),
+                                    self.basic("admin:contrasena")), [200, 401])
+
+    def test_malformed_headers(self):
+        raw = f"admin:{self.PW}".encode()
+        good = base64.b64encode(raw).decode()
+        self.assertTrue(good.endswith("="))
+        junk = [good[:4] + "!" + good[4:], good + "*", good[:8] + " " + good[8:]]
+        for token in junk:  # a lenient decoder skips the junk and gets the right credentials
+            self.assertEqual(base64.b64decode(token), raw)
+        hdrs = [{"Authorization": "basic " + good}, {"Authorization": "Basic  " + good},
+                {"Authorization": "Bearer " + good}, {"Authorization": "Basic"},
+                {"Authorization": "Basic " + good.rstrip("=")},
+                self.basic(b"admin" + self.PW.encode()), self.basic(b"admin:\xff\xfe")]
+        hdrs += [{"Authorization": "Basic " + t} for t in junk]
+        self.assertEqual(self.codes(self.app(), *hdrs), [200, 200, 401, 401, 401, 401, 401, 401, 401, 401])
+
+    def test_user_name_validation(self):
+        for name in ["admin", "alien.torres@home", "a", "A_b-9", "x" * 64]:
+            self.app(username=name)
+        for name in ["a:b", "ad min", "José", "ad\x01min", "x" * 65]:
+            with self.assertRaises(ValueError) as cm:
+                self.app(username=name)
+            self.assertIn("TRAVELARR_USERNAME", str(cm.exception))
+        self.assertEqual(self.codes(self.app(password="", username="a:b"), {}), [200])
+
+    def test_no_password_is_open(self):
+        self.assertEqual(self.codes(self.app(password=None), {}), [200])
+
+    def test_startup_log(self):
+        with self.assertLogs("travelarr", "INFO") as cm:
+            self.app(username="road")
+        lines = [(r.levelname, r.getMessage()) for r in cm.records]
+        self.assertEqual([x for x in lines if "sign-in" in x[1] or "password" in x[1]],
+                         [("INFO", "web UI sign-in: user name road")])
+        self.assertFalse(any(self.PW in m for _, m in lines))
+        with self.assertLogs("travelarr", "INFO") as cm:
+            self.app(password="")
+        self.assertEqual([r.levelname for r in cm.records if "no password" in r.getMessage()], ["WARNING"])
+        with self.assertNoLogs("travelarr", "INFO"), self.assertRaises(ValueError):
+            self.app(username="a:b")
 
 
 class PathsTest(unittest.TestCase):

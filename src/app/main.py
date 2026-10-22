@@ -26,10 +26,18 @@ from .plexgw import NotReady, PlexGateway
 from .store import Store, now
 from .worker import CHANGED, Downloader
 
-VERSION = "2.2.0"
+VERSION = "2.3.0"
 STATIC = os.path.join(os.path.dirname(__file__), "static")
 LOCAL_NOTE = "deleted in Local Files"
+USERNAME_RE = re.compile(r"[A-Za-z0-9._@-]{1,64}")  # no ':' (impossible in Basic auth), safe to log
 log = logging.getLogger("travelarr")
+
+
+def ui_username(value: str | None = None) -> str:
+    """The web UI user name: value, else TRAVELARR_USERNAME; empty means admin."""
+    if value is None:
+        value = os.environ.get("TRAVELARR_USERNAME")
+    return (value or "").strip() or "admin"
 
 
 def device_name() -> str:
@@ -48,11 +56,15 @@ def device_name() -> str:
 
 def create_app(data_dir: str | None = None, media_root: str | None = None,
                password: str | None = None, gateway_factory=None,
-               start_worker: bool = True, device: str | None = None) -> FastAPI:
+               start_worker: bool = True, device: str | None = None,
+               username: str | None = None) -> FastAPI:
     data_dir = data_dir or os.environ.get("TRAVELARR_DATA", "/config")
     media_root = media_root or os.environ.get("TRAVELARR_MEDIA", "/media")
     if password is None:
         password = os.environ.get("TRAVELARR_PASSWORD") or None
+    username = ui_username(username)
+    if password and not USERNAME_RE.fullmatch(username):
+        raise ValueError("TRAVELARR_USERNAME must be 1 to 64 characters: letters, digits, '.', '_', '@' or '-'")
     device = device or device_name()
     os.makedirs(data_dir, exist_ok=True)
     thumbs = os.path.join(data_dir, "cache", "thumbs")
@@ -79,19 +91,24 @@ def create_app(data_dir: str | None = None, media_root: str | None = None,
 
     # ------------------------------------------------------------- security
     if password:
+        want_user, want_pw = username.encode(), password.encode()
+
         @app.middleware("http")
         async def basic_auth(request: Request, call_next):
-            hdr = request.headers.get("authorization", "")
+            scheme, _, token = request.headers.get("authorization", "").partition(" ")
             ok = False
-            if hdr.lower().startswith("basic "):
+            if scheme.lower() == "basic":
                 try:
-                    _, _, pw = base64.b64decode(hdr[6:]).decode().partition(":")
-                    ok = secrets.compare_digest(pw.encode(), password.encode())
+                    user, sep, pw = base64.b64decode(token.strip(), validate=True).decode().partition(":")
+                    # Both comparisons always run, so timing does not tell which one failed.
+                    user_ok = secrets.compare_digest(user.encode(), want_user)
+                    pw_ok = secrets.compare_digest(pw.encode(), want_pw)
+                    ok = bool(sep) and user_ok and pw_ok
                 except Exception:  # noqa: BLE001
                     ok = False
             if not ok:
                 return Response("Authentication required", status_code=401,
-                                headers={"WWW-Authenticate": 'Basic realm="travelarr"'})
+                                headers={"WWW-Authenticate": 'Basic realm="travelarr", charset="UTF-8"'})
             return await call_next(request)
 
     # --------------------------------------------------------------- errors
@@ -408,4 +425,8 @@ def create_app(data_dir: str | None = None, media_root: str | None = None,
         return FileResponse(os.path.join(STATIC, "index.html"),
                             headers={"Cache-Control": "no-cache"})
 
+    if password:
+        log.info("web UI sign-in: user name %s", username)
+    else:
+        log.warning("TRAVELARR_PASSWORD is not set: the web UI has no password")
     return app

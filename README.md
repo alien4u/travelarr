@@ -36,7 +36,7 @@ travel NAS.
 - Local Files: browse the share by folder with sizes, and delete movies, shows, seasons or episodes once you have
   watched them.
 - Keeps a free-space reserve on the NAS (10 GB by default).
-- Password-protected web UI.
+- Web UI protected by a user name and password.
 
 ## Installation
 
@@ -57,10 +57,15 @@ any other Docker container, with its icon, WebUI and Logs.
    ```
 
 2. **Docker > Add Container**, then choose **travelarr** under **Template**.
-3. Set a **Password**, check the **Media share** path, and click **Apply**.
-4. Open it from the travelarr icon > **WebUI**.
+3. Set a **Password**, check the **Media share** path, and click **Apply**. The user name is `admin` unless you
+   change **Username**.
+4. Open it from the travelarr icon > **WebUI** and sign in with that user name and password.
 
 New versions show as **update ready** in the Docker tab.
+
+> **Updating from 2.2:** the user name is now checked and is `admin` unless you set `TRAVELARR_USERNAME`
+> (Edit the container > **Add another Path, Port, Variable, Label or Device** > Variable). If your browser saved
+> the login with another user name, it stops working; sign in as `admin` with your password.
 
 ### Docker Compose
 
@@ -72,6 +77,7 @@ services:
     ports:
       - 8484:8484
     environment:
+      - TRAVELARR_USERNAME=admin
       - TRAVELARR_PASSWORD=change-me
       - TRAVELARR_NAME=Travel NAS
       - TZ=Etc/UTC
@@ -90,7 +96,8 @@ Both folders must be writable by UID 99 / GID 100.
 | Port | `8484` | Web UI |
 | Path | `/config` | Settings, copy history and the Plex sign-in (`travelarr.db`) |
 | Path | `/media` | Where copies land: `Movies/...`, `TV-Shows/...`, created as needed |
-| Variable | `TRAVELARR_PASSWORD` | Web UI password (any username). Without it, the web UI is open to anyone on the network |
+| Variable | `TRAVELARR_USERNAME` | Web UI user name, `admin` by default. Up to 64 letters, digits, `.`, `_`, `@` or `-`; case-sensitive |
+| Variable | `TRAVELARR_PASSWORD` | Web UI password. Without it, the web UI is open to anyone on the network |
 | Variable | `TRAVELARR_NAME` | What the UI calls this NAS ("Copy to ..."). Default: the Unraid server name, else the host name |
 | Variable | `TRAVELARR_LOG` | `DEBUG`, `INFO` (default), `WARNING` or `ERROR` |
 | Variable | `TZ` | Time zone for the times in History |
