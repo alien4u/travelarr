@@ -567,12 +567,14 @@ class PlexGateway:
 
     # ------------------------------------------------------------------ plan
     def plan(self, keys: list[str], mode: str = "unwatched", source: str = "browse",
-             only: set[str] | None = None) -> list[dict]:
+             only: set[str] | None = None, server_id: str | None = None) -> list[dict]:
         """Expand movies / episodes / seasons / shows into one job per file.
         `only` limits a show or season to those episode keys (one request
         for the whole show instead of one per episode). One server snapshot
         serves the whole plan, and every job records that server."""
         srv, sid = self.snapshot()
+        if server_id and sid != server_id:  # rating keys mean something else on another server
+            raise OtherServer("the selected Plex server changed")
         jobs: list[dict] = []
         for rk in keys:
             it = srv.fetchItem(int(rk))

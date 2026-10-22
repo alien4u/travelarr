@@ -195,6 +195,30 @@ def _compute(store, gw, media_root: str, key: str) -> dict:
     return {"serverId": sid, "srv": srv, "items": items, "checked": sum(1 for r in rows if r["status"] == "done")}
 
 
+def bind_legacy(store, gw, rows: list[dict], expected_sid: str) -> set[int]:
+    """Rows from before 2.5.0 (no server) that are verifiably the selected server's
+    item get bound to it; returns their ids. Unverifiable rows are left alone."""
+    legacy = [r for r in rows if not r["server_id"]]
+    if not legacy:
+        return set()
+    srv, sid = gw.snapshot()
+    if sid != expected_sid:
+        raise ResyncError(409, "The Plex server changed; reload and try again")
+    plex = gw.batch(srv, sorted({r["rating_key"] for r in legacy}))
+    ok = set()
+    for r in legacy:
+        it = plex.get(r["rating_key"])
+        if it is None:
+            continue
+        parts = list(it.iterParts())
+        sec = gw._section(it.librarySectionID, srv)
+        dest = dest_rel_for(parts[0].file, sec.locations, sec.title) if parts else None
+        if _same_item(r, it, sid, dest):
+            store.update(r["id"], server_id=sid, guid=r["guid"] or getattr(it, "guid", None))
+            ok.add(r["id"])
+    return ok
+
+
 def _public(item: dict) -> dict:
     return {k: v for k, v in item.items() if not k.startswith("_")}
 

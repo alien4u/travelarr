@@ -309,12 +309,13 @@ class Downloader:
                     self.cleanup_pass()
                     self._sleep(5)
                     continue
-                try:
-                    self.gw.server()
-                except NotReady as e:
-                    self.last_error = str(e)
-                    self._sleep(15)
-                    continue
+                if not job["phase"]:  # a placing/placed job finishes without Plex
+                    try:
+                        self.gw.server()
+                    except NotReady as e:
+                        self.last_error = str(e)
+                        self._sleep(15)
+                        continue
                 self.last_error = None
                 self._process(job)
             except Exception as e:  # noqa: BLE001 - never let the thread die
@@ -408,6 +409,8 @@ class Downloader:
             raise Cancelled()
         os.makedirs(os.path.dirname(final), exist_ok=True)
         note = NOTES.get(mode)
+        if phase == "placed" and _regular_size(final) != size:
+            self._abandon(job, "the placed file is missing or changed on the NAS; run Re-sync again")
         if mode == "refresh" or phase == "placed":
             if _regular_size(final) != size:
                 raise JobError("the copied file changed on the NAS; run Re-sync again")
@@ -429,8 +432,10 @@ class Downloader:
         server check, `placing`, the rename and `placed` happen as one step."""
         jid = job["id"]
         with self.gw._lock:
-            self.gw.server_for(job["server_id"])
             if job["phase"] != "placing":
+                # the linearization point with server selection; a job already placing
+                # passed it (its data came from its server) and finishes without Plex
+                self.gw.server_for(job["server_id"])
                 if jid in self._cancel:
                     raise Cancelled()
                 if job["mode"] == "upgrade":
@@ -466,9 +471,16 @@ class Downloader:
         if placed:
             self._place(job, None, final)
             return
-        self.store.update(job["id"], status="failed", phase=None, finished_at=now(), error=UNCONFIRMED)
+        self._abandon(job, UNCONFIRMED)
+
+    def _abandon(self, job: dict, why: str) -> None:
+        """A placement that cannot be confirmed: failed, unlocked, nothing certified.
+        What the job no longer owns goes to cleanup; files a copy owns stay."""
+        jid = job["id"]
+        self.store.transition(jid, lambda r: True, status="failed", phase=None, finished_at=now(), error=why)
         for old in json.loads(job["replaces"] or "[]"):
             self.store.update(int(old), note="unverified after an interrupted re-sync")
+        self.cleanup(jid)
         raise _Handled()
 
     def _check_stop(self) -> None:

@@ -211,6 +211,11 @@ class Store:
     def next_queued(self, server_id: str | None = None, skip: frozenset = frozenset()) -> dict | None:
         """The oldest queued job; with server_id, only jobs of that server or of
         none (rows from before 2.5.0). Jobs of another server wait."""
+        # a job whose file is being placed or is in place finishes first, whatever
+        # the selected server: it needs no Plex request to be in a consistent state
+        for r in self.rows("SELECT * FROM jobs WHERE status='queued' AND phase IS NOT NULL ORDER BY id LIMIT 200"):
+            if r["id"] not in skip:
+                return r
         sql, args = "SELECT * FROM jobs WHERE status='queued'", []
         if server_id is not None:
             sql += " AND (server_id IS NULL OR server_id=?)"

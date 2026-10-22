@@ -245,7 +245,7 @@ class AppTest(PlexFixture):
         keep = self.m("TV-Shows/Show A/Season 01/notes-i-made.txt")
         with open(keep, "w") as fh:
             fh.write("mine")
-        r = self.c.post("/api/remove", json={"showKeys": ["200"]}).json()
+        r = self.c.post("/api/remove", json={"showKeys": ["200"], "serverId": "srv1"}).json()
         self.assertEqual(r["results"], {"removed": 2})
         self.assertFalse(os.path.exists(self.m("TV-Shows/Show A/Season 01/Show A - S01E02 - Second.mkv")))
         self.assertFalse(os.path.exists(self.m("TV-Shows/Show A/Season 01/Show A - S01E02 - Second.es.srt")))
@@ -254,7 +254,7 @@ class AppTest(PlexFixture):
         self.assertTrue(os.path.isdir(self.m("TV-Shows")))
 
         # Remove a loose movie: the Movies root must survive even though it is now empty-ish
-        self.c.post("/api/remove", json={"ratingKeys": ["102"]})
+        self.c.post("/api/remove", json={"ratingKeys": ["102"], "serverId": "srv1"})
         self.assertFalse(os.path.exists(self.m("Movies/Loose Movie.mkv")))
         self.assertTrue(os.path.isdir(self.m("Movies")))
 
@@ -1997,7 +1997,7 @@ class ResyncTest(PlexFixture):
         self.copy("102")
         rid = self.row("102")["id"]
         self.store.update(rid, server_id="other")
-        self.c.post("/api/remove", json={"ratingKeys": ["102"]})
+        self.c.post("/api/remove", json={"ratingKeys": ["102"], "serverId": "srv1"})
         self.assertEqual(self.store.job(rid)["status"], "done")
         self.assertTrue(os.path.isfile(self.m(LOOSE)))
 
@@ -2052,6 +2052,83 @@ class ResyncTest(PlexFixture):
         self.store.add_jobs([{**{k: other[k] for k in store_mod.JOB_FIELDS if k in other},
                               "server_id": "other", "dest_rel": "Movies/elsewhere.mkv", "part_id": 1}])
         self.assertEqual(self.check("102"), {"serverId": "srv1", "checked": 1, "items": []})
+
+    # review round 2 ----------------------------------------------------------
+    def test_bulk_removal_names_its_server(self):
+        self.copy("102")
+        for body in ({"ratingKeys": ["102"]}, {"ratingKeys": ["102"], "serverId": "other"}):
+            self.assertEqual(self.c.post("/api/remove", json=body).status_code, 409)
+        self.assertTrue(os.path.isfile(self.m(LOOSE)))
+
+    def test_bulk_removal_verifies_older_copies(self):
+        self.copy("102", "103")
+        loose, heathers = self.row("102")["id"], self.row("103")["id"]
+        self.store.update(loose, server_id=None, guid=None)
+        self.store.update(heathers, server_id=None, guid=None, title="Another Movie")   # not this server's item
+        r = self.c.post("/api/remove", json={"ratingKeys": ["102", "103"], "serverId": "srv1"}).json()
+        self.assertEqual(r["results"], {"removed": 1, "skipped": 1})
+        self.assertEqual(self.store.job(loose)["status"], "removed")
+        self.assertEqual(self.store.job(heathers)["status"], "done")
+        self.assertTrue(os.path.isfile(self.m("Movies/Heathers (1989)/Heathers (1989).mkv")))
+
+    def placed_upgrade(self):
+        """An upgrade whose new file is in place, interrupted before it finished."""
+        old, up = self.upgrade_queued()
+        real = self.dl._subtitles
+        calls = {"n": 0}
+
+        def boom(job):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise RuntimeError("power cut")
+            return real(job)
+        self._sub_patch = mock.patch.object(self.dl, "_subtitles", boom)
+        self._sub_patch.start()
+        self.addCleanup(self._sub_patch.stop)
+        self.dl._process(self.store.next_queued())
+        job = self.store.job(up["id"])
+        self.assertEqual((job["status"], job["phase"]), ("queued", "placed"))
+        self.dl._later.clear()
+        return old, up
+
+    def test_placed_upgrade_finishes_with_another_server_selected(self):
+        old, up = self.placed_upgrade()
+        self.store.set("server_id", "other")
+        job = self.store.next_queued("other")
+        self.assertEqual(job["id"], up["id"])                       # picked whatever the server
+        self.dl._process(job)
+        done = self.store.job(up["id"])
+        self.assertEqual((done["status"], done["note"]), ("done", "subtitles not refreshed: the Plex server changed"))
+        self.assertEqual(self.store.job(old["id"])["status"], "removed")
+
+    def test_placed_upgrade_finishes_while_plex_is_unreachable(self):
+        old, up = self.placed_upgrade()
+        with mock.patch.object(self.gw, "server", side_effect=plexgw.NotReady("down")):
+            self.dl._process(self.store.next_queued("srv1"))
+        done = self.store.job(up["id"])
+        self.assertEqual(done["status"], "done")
+        self.assertIn("subtitles not checked", done["error"])
+        self.assertEqual(self.store.job(old["id"])["status"], "removed")
+
+    def test_placed_file_gone_fails_once_and_unlocks(self):
+        old, up = self.placed_upgrade()
+        os.remove(self.m("Movies/Heat (1995)/Heat (1995) v2.mkv"))
+        self.dl._process(self.store.next_queued("srv1"))
+        job = self.store.job(up["id"])
+        self.assertEqual((job["status"], job["phase"]), ("failed", None))
+        self.assertIsNone(self.store.next_queued("srv1"))          # no loop
+        o = self.store.job(old["id"])
+        self.assertEqual((o["status"], o["note"]), ("done", "unverified after an interrupted re-sync"))
+        self.assertTrue(os.path.isfile(self.m(HEAT)))
+        self.assertEqual(self.c.post(f"/api/jobs/{up['id']}/remove").json(), {"result": "removed"})
+        self.assertEqual(self.kinds("101"), {"101": "upgraded"})
+
+    def test_replanning_refuses_another_server(self):
+        with self.assertRaises(plexgw.OtherServer):
+            self.gw.plan(["101"], server_id="other")
+        r = self.c.post("/api/queue", json={"keys": ["101"], "serverId": "other"})
+        self.assertEqual(r.status_code, 409)
+        self.assertIsNone(self.store.next_queued())
 
     # servers -----------------------------------------------------------------
     def test_jobs_of_another_server_wait(self):

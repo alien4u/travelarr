@@ -509,7 +509,7 @@ async function renderLibrary(type) {
 
 async function queue(keys, mode, source, only) {
   try {
-    const r = await post('/api/queue', { keys, mode, source: source || 'browse', only });
+    const r = await post('/api/queue', { keys, mode, source: source || 'browse', only, serverId: S.state && S.state.serverId });
     const parts = [];
     if (r.added) parts.push(`Queued ${r.added} file(s), ${fmtBytes(r.bytes)}`);
     if (r.skipped) parts.push(`${r.skipped} already on ${dev()} or queued`);
@@ -538,6 +538,7 @@ document.addEventListener('keydown', e => { if (e.key === 'Escape' && !$('#sheet
 
 function removedToast(results) {
   if (results.busy) return toast(`${results.busy === 1 ? 'It is' : `${results.busy} files are`} being finished (a copy or a re-sync); try again in a moment`);
+  if (results.skipped) return toast(`${results.skipped} older cop${results.skipped === 1 ? 'y' : 'ies'} could not be matched to this Plex server and ${results.skipped === 1 ? 'was' : 'were'} kept; remove ${results.skipped === 1 ? 'it' : 'them'} in History`);
   if (results.deferred) return toast(`Removed from ${dev()}. Some old files could not be deleted yet; they will be retried`);
   const busy = results.cancelling || 0;
   if (!busy) return toast(`Removed from ${dev()}`);
@@ -579,7 +580,7 @@ function videoBody(d) {
   if (st === 'done') actions.append(h('button', {
     class: 'btn small danger', onclick: async () => {
       if (!confirm(`Delete "${d.title}" from ${dev()}?`)) return;
-      const r = await post('/api/remove', { ratingKeys: [d.ratingKey] });
+      const r = await post('/api/remove', { ratingKeys: [d.ratingKey], serverId: S.state.serverId });
       S.dirty = true; removedToast(r.results); openItem(d.ratingKey);
     },
   }, `Remove from ${dev()}`));
@@ -637,7 +638,7 @@ function showBody(d) {
   const removeBtn = onDevice || busy ? h('button', {
     class: 'btn small danger', onclick: async () => {
       if (!confirm(`Delete all ${onDevice} episode(s) of "${d.title}" from ${dev()}${busy ? ' and cancel the queued ones' : ''}?`)) return;
-      const r = await post('/api/remove', { showKeys: [d.ratingKey] });
+      const r = await post('/api/remove', { showKeys: [d.ratingKey], serverId: S.state.serverId });
       S.dirty = true; removedToast(r.results); openItem(d.ratingKey);
     },
   }, `Remove show from ${dev()}`) : null;

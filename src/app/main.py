@@ -23,7 +23,7 @@ from plexapi.exceptions import NotFound, Unauthorized
 from . import resync
 from .paths import (ListingChanged, PathError, abs_path, delete_entry, list_dir, local_entry, real_rel,
                     touches)
-from .plexgw import NotReady, PlexGateway
+from .plexgw import NotReady, OtherServer, PlexGateway
 from .resync import ResyncError
 from .store import Store, now
 from .worker import CHANGED, Downloader
@@ -312,7 +312,11 @@ def create_app(data_dir: str | None = None, media_root: str | None = None,
             return err(400, f"Too many titles at once (at most {MAX_QUEUE_KEYS})")
         mode = body.get("mode", "unwatched")
         only = {str(k) for k in body.get("only") or []} or None
-        jobs = gw.plan(keys, mode=mode, source=body.get("source", "browse"), only=only)
+        try:
+            jobs = gw.plan(keys, mode=mode, source=body.get("source", "browse"), only=only,
+                           server_id=body.get("serverId"))
+        except OtherServer:
+            return err(409, "The Plex server changed; reload and try again", "other_server")
         added, skipped = store.add_jobs(jobs)
         dl.wake()
         d = disk()
@@ -389,7 +393,12 @@ def create_app(data_dir: str | None = None, media_root: str | None = None,
                 return err(409, "The copy this re-sync would replace changed; run Re-sync again", "changed")
         if j["status"] == "failed" and (j["error"] or "").startswith(CHANGED):
             # the old file is gone from Plex: queue the item again as it is now
-            added, _ = store.add_jobs(gw.plan([j["rating_key"]], mode="all", source=j["source"] or "browse"))
+            try:
+                planned = gw.plan([j["rating_key"]], mode="all", source=j["source"] or "browse",
+                                  server_id=j["server_id"] or store.get("server_id"))
+            except OtherServer:
+                return err(409, "This job belongs to another Plex server; select it first.", "other_server")
+            added, _ = store.add_jobs(planned)
             store.update(job_id, status="cancelled", note="queued again", finished_at=now())
             dl.wake()
             return {"ok": True, "requeued": len(added)}
@@ -404,14 +413,26 @@ def create_app(data_dir: str | None = None, media_root: str | None = None,
 
     @app.post("/api/remove")
     def remove_many(body: dict = Body(...)):
+        """Remove by rating/show key. Keys belong to one Plex server, so the request
+        names the server it was made for, and copies from before 2.5.0 (no server
+        recorded) are only included once verified to be this server's item."""
+        sid = store.get("server_id")
+        if not sid:
+            return err(409, "Choose a Plex server first", "no_server")
+        if body.get("serverId") != sid:
+            return err(409, "The Plex server changed; reload and try again", "other_server")
         results: dict[str, int] = {}
         targets = []
-        sid = store.get("server_id")  # rating keys belong to one server
         for rk in body.get("ratingKeys", []):
             targets += store.jobs_for(rating_key=str(rk), server_id=sid)
         for sk in body.get("showKeys", []):
             targets += store.jobs_for(show_key=str(sk), server_id=sid)
-        for j in {j["id"]: j for j in targets}.values():
+        targets = list({j["id"]: j for j in targets}.values())
+        verified = resync.bind_legacy(store, gw, targets, sid)
+        for j in targets:
+            if not j["server_id"] and j["id"] not in verified:
+                results["skipped"] = results.get("skipped", 0) + 1
+                continue
             r = remove_job(j)
             results[r] = results.get(r, 0) + 1
         return {"results": results}
