@@ -342,7 +342,8 @@ class Store:
         with self.lock:
             self.db.execute("BEGIN")
             try:
-                self._transition(job_id, lambda r: True, dict(fields))
+                # done: it no longer replaces anything (a later refresh must not reach the old copy)
+                self._transition(job_id, lambda r: True, {**fields, "replaces": "[]"})
                 for o in old_ids:
                     if self._transition(int(o), lambda r: r["status"] == "done", {
                             "status": "removed", "removed_at": now(), "phase": None,

@@ -478,7 +478,7 @@ class Downloader:
         What the job no longer owns goes to cleanup; files a copy owns stay."""
         jid = job["id"]
         self.store.transition(jid, lambda r: True, status="failed", phase=None, finished_at=now(), error=why)
-        for old in json.loads(job["replaces"] or "[]"):
+        for old in json.loads(job["replaces"] or "[]") if job["mode"] == "upgrade" else []:
             self.store.update(int(old), note="unverified after an interrupted re-sync")
         self.cleanup(jid)
         raise _Handled()
@@ -773,7 +773,7 @@ class Downloader:
         expected subtitle was written; otherwise everything recorded is kept."""
         jid = job["id"]
         recorded = list(json.loads(self.store.job(jid)["sidecars"] or "[]"))
-        for o in json.loads(job["replaces"] or "[]"):
+        for o in json.loads(job["replaces"] or "[]") if job["mode"] == "upgrade" else []:
             old = self.store.job(int(o))
             if old:
                 recorded += [n for n in json.loads(old["sidecars"] or "[]") if n not in recorded]

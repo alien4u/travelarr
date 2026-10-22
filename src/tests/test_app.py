@@ -2182,6 +2182,33 @@ class ResyncTest(PlexFixture):
         self.assertTrue(os.path.isfile(self.m(self.HEAT_EN)))
         self.assertEqual(self.kinds("101"), {"101": "upgraded"})       # the next re-sync sees it
 
+    # review round 4 ----------------------------------------------------------
+    def test_a_later_refresh_never_reaches_the_replaced_copy(self):
+        old, up = self.upgrade_queued()
+        self.drain()
+        done = self.store.job(up["id"])
+        self.assertEqual(done["replaces"], "[]")
+        with open(self.m(self.HEAT_ES), "w") as fh:     # someone puts a file where the old subtitle was
+            fh.write("mine")
+        self.store.transition(up["id"], lambda r: True, status="queued", mode="refresh")
+        with mock.patch.object(self.gw, "subtitle_streams", side_effect=RuntimeError("Plex down")):
+            self.drain()
+        row = self.store.job(up["id"])
+        self.assertNotIn(self.HEAT_ES, json.loads(row["sidecars"]))
+        self.c.post(f"/api/jobs/{up['id']}/remove")
+        self.assertEqual(self.read(self.HEAT_ES), b"mine")
+
+    def test_removing_a_queued_redownload_deletes_the_copy(self):
+        self.copy("102")
+        rid = self.row("102")["id"]
+        with open(self.m(LOOSE), "r+b") as fh:
+            fh.truncate(10)
+        self.apply("102", "102")
+        r = self.c.post("/api/remove", json={"ratingKeys": ["102"], "serverId": "srv1"}).json()
+        self.assertEqual(r["results"], {"removed": 1})
+        self.assertEqual(self.store.job(rid)["status"], "removed")
+        self.assertFalse(os.path.lexists(self.m(LOOSE)))
+
     # servers -----------------------------------------------------------------
     def test_jobs_of_another_server_wait(self):
         self.c.post("/api/queue", json={"keys": ["102"]})

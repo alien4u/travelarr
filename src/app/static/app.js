@@ -808,7 +808,7 @@ function jobRow(j) {
   const actions = [];
   if ((j.status === 'queued' || j.status === 'downloading') && !j.phase) actions.push(h('button', { class: 'btn small', onclick: () => act('cancel') }, 'Cancel'));
   if (j.status === 'failed' || j.status === 'cancelled') actions.push(h('button', { class: 'btn small', onclick: () => act('retry') }, 'Retry'));
-  if (j.status === 'done' || j.status === 'failed') actions.push(h('button', {
+  if (j.status === 'done' || j.status === 'failed' || (j.status === 'cancelled' && ['redownload', 'recover'].includes(j.mode))) actions.push(h('button', {
     class: 'btn small danger', onclick: () => { if (confirm(`Delete "${jobTitle(j)}" from ${dev()}?`)) act('remove'); },
   }, 'Remove'));
   const when = j.status === 'removed' ? `Removed ${fmtTime(j.removed_at)}`

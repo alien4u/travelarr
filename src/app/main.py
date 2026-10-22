@@ -177,7 +177,11 @@ def create_app(data_dir: str | None = None, media_root: str | None = None,
                 return "removed" if not dl.cleanup(jid) else "deferred"
             return "busy"
         if job["status"] == "queued":
-            if job["mode"] == "refresh":
+            if job["mode"] in ("redownload", "recover"):
+                # an existing copy waiting to be copied again: removal deletes it, not just the job
+                if store.remove(jid, ("queued",)):
+                    return "removed" if not dl.cleanup(jid) else "deferred"
+            elif job["mode"] == "refresh":
                 store.cancel_queued(jid)  # back to done, then removed below
             elif store.cancel_queued(jid):
                 dl.cleanup(jid)
