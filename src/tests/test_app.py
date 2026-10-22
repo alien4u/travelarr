@@ -2305,6 +2305,23 @@ class ResyncTest(PlexFixture):
         self.drain()
         self.assertEqual(self.read("Movies/Heathers (1989)/Heathers v2.mkv"), self.fake.parts[1203])
 
+    def test_changed_file_retry_never_gives_up_an_existing_copy(self):
+        self.copy("102")
+        for mode in ("redownload", "recover"):
+            with self.subTest(mode=mode):
+                rid = self.row("102")["id"]
+                self.store.transition(rid, lambda r: True, status="failed", mode=mode,
+                                      error=worker.CHANGED + ": test")
+                self.new_part(self.movie(102), 1302 if mode == "redownload" else 1402,
+                              file=f"/data/Media/Movies/Loose {mode}.mkv", size=125_000)
+                r = self.c.post(f"/api/jobs/{rid}/retry")
+                self.assertEqual(r.status_code, 409)
+                job = self.store.job(rid)
+                self.assertEqual((job["status"], job["dest_rel"]), ("cancelled", LOOSE))
+                self.assertTrue(os.path.isfile(self.m(LOOSE)))             # the old video is still there
+                self.assertIn(LOOSE, store_mod.owned(job))
+                self.store.transition(rid, lambda r: True, status="done", mode=None, error=None)
+
     # servers -----------------------------------------------------------------
     def test_jobs_of_another_server_wait(self):
         self.c.post("/api/queue", json={"keys": ["102"]})
