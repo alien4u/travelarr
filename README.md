@@ -80,15 +80,15 @@ Both folders must be writable by UID 99 / GID 100.
 
 ## Configuration
 
-| Parameter | Function |
-|---|---|
-| `-p 8484` | Web UI |
-| `-v /config` | Settings, copy history and the Plex sign-in (`travelarr.db`) |
-| `-v /media` | Where copies land: `Movies/...`, `TV-Shows/...`, created as needed |
-| `-e TRAVELARR_PASSWORD` | Web UI password (any username). Without it, the web UI is open to anyone on the network |
-| `-e TRAVELARR_NAME` | What the UI calls this NAS ("Copy to ..."). Default: the Unraid server name, else the host name |
-| `-e TRAVELARR_LOG` | `DEBUG`, `INFO` (default), `WARNING` or `ERROR` |
-| `-e TZ` | Time zone for the times in History |
+| Type | Name | Description |
+|---|---|---|
+| Port | `8484` | Web UI |
+| Path | `/config` | Settings, copy history and the Plex sign-in (`travelarr.db`) |
+| Path | `/media` | Where copies land: `Movies/...`, `TV-Shows/...`, created as needed |
+| Variable | `TRAVELARR_PASSWORD` | Web UI password (any username). Without it, the web UI is open to anyone on the network |
+| Variable | `TRAVELARR_NAME` | What the UI calls this NAS ("Copy to ..."). Default: the Unraid server name, else the host name |
+| Variable | `TRAVELARR_LOG` | `DEBUG`, `INFO` (default), `WARNING` or `ERROR` |
+| Variable | `TZ` | Time zone for the times in History |
 
 Everything else is set in the web UI under **Settings**.
 
