@@ -9,8 +9,14 @@
   <Project>https://github.com/alien4u/travelarr</Project>
   <ReadMe>https://github.com/alien4u/travelarr#readme</ReadMe>
   <Shell>bash</Shell>
-  <Overview>Sign in with Plex, browse the watchlist, movies and shows on your home Plex server, and copy the original files (plus external subtitles) into this NAS's Media share over HTTPS. Resumes after dropped connections and verifies every resume. Infuse or any player can then play from the share without Plex on the NAS.</Overview>
+  <Overview>travelarr fills your travel NAS with movies and TV shows from your home Plex server, so you can watch them on the road without streaming.
+
+Sign in with Plex, browse your watchlist and libraries, and pick movies, whole shows, seasons or single episodes. travelarr copies the original files, with their external subtitles, into a share on this server in the same folder layout as at home. Play them with Infuse or any player that reads a network share. No transcoding, and no Plex server needed on this NAS.
+
+Downloads resume after dropped connections and restarts, and every resume is checked so a bad connection never leaves a corrupt file. At home it copies over your LAN; away it uses Plex Remote Access. Local Files lets you browse the share and delete what you have watched.</Overview>
   <Category>Downloaders: MediaApp:Video</Category>
+  <ExtraSearchTerms>plex travel offline download copy sync infuse movies tv nas</ExtraSearchTerms>
+  <Date>2026-10-22</Date>
   <WebUI>http://[IP]:[PORT:8484]/</WebUI>
   <TemplateURL>https://raw.githubusercontent.com/alien4u/travelarr/main/unraid/travelarr.xml</TemplateURL>
   <Icon>https://raw.githubusercontent.com/alien4u/travelarr/main/unraid/travelarr.png</Icon>
