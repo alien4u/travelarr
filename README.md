@@ -48,13 +48,17 @@ The image is published for `linux/amd64` at `ghcr.io/alien4u/travelarr`. It runs
 travelarr is not in Community Applications. Add the template once and it then installs, updates and shows up like
 any other Docker container, with its icon, WebUI and Logs.
 
-1. Download [`travelarr.xml`](https://raw.githubusercontent.com/alien4u/travelarr/main/unraid/travelarr.xml).
-2. Share the flash drive: **Main > Boot Device > Flash > SMB Security Settings > Export: Yes**.
-3. Copy `travelarr.xml` into `config/plugins/dockerMan/templates-user/` on the `flash` share
-   (`smb://<nas-ip>/flash` on macOS, `\\<nas-ip>\flash` on Windows). You can stop exporting the flash share afterwards.
-4. **Docker > Add Container**, then choose **travelarr** under **Template**.
-5. Set a **Password**, check the **Media share** path, and click **Apply**.
-6. Open it from the travelarr icon > **WebUI**.
+1. Open the terminal (the `>_` icon at the top right of the Unraid web UI) and download the template:
+
+   ```bash
+   mkdir -p /boot/config/plugins/dockerMan/templates-user && \
+   wget -O /boot/config/plugins/dockerMan/templates-user/my-travelarr.xml \
+     https://raw.githubusercontent.com/alien4u/travelarr/main/unraid/travelarr.xml
+   ```
+
+2. **Docker > Add Container**, then choose **travelarr** under **Template**.
+3. Set a **Password**, check the **Media share** path, and click **Apply**.
+4. Open it from the travelarr icon > **WebUI**.
 
 New versions show as **update ready** in the Docker tab.
 
