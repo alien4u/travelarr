@@ -30,9 +30,9 @@ travel NAS.
 - **Re-sync from Plex** in Local Files for everything on the NAS or one folder, and on a movie or show page for that
   title's folder: compares each folder on the NAS with the same folder on Plex, however the files got there. It picks
   up videos upgraded by Radarr/Sonarr, copies the episodes missing from a season folder (watched ones are listed but
-  not ticked), lists videos Plex no longer has without deleting them, and fetches every video's subtitles again
-  (Lingarr). It shows what changed before anything is downloaded, and an old file is only replaced once the new one
-  is in place.
+  not ticked), lists videos Plex no longer has without deleting them, and can fetch the subtitles of up-to-date
+  videos again (Lingarr). It shows what changed before anything is downloaded, and an old file is only replaced once
+  the new one is in place.
 - Original files only, plus the external subtitles Plex knows about (`Movie.es.srt`, `Movie.en.forced.srt`).
   Subtitles inside the file come along automatically.
 - Same folder layout as your home library (`Movies/...`, `TV-Shows/...`).

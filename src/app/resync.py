@@ -7,8 +7,8 @@ are matched by file name and size. Folders that exist only on Plex are left alon
 
 A check never changes anything. Apply recomputes the check and acts only on items
 that are still out of date: a new version replaces the old file once it is in place,
-a video Plex has that is missing from the folder is copied, and every video that is
-up to date gets its subtitles fetched again, without touching the video."""
+a video Plex has that is missing from the folder is copied, and on request every
+video that is up to date gets its subtitles fetched again, without touching the video."""
 from __future__ import annotations
 
 import json
@@ -313,9 +313,9 @@ CURRENT = ("rating_key", "show_key", "title", "show_title", "season", "episode",
            "size", "server_id", "guid")
 
 
-def apply(store, gw, media_root: str, path: str, server_id, rating_keys) -> dict:
-    """rating_keys are the out-of-date items to update; every video in the folder
-    that is up to date gets its subtitles fetched again."""
+def apply(store, gw, media_root: str, path: str, server_id, rating_keys, subtitles: bool = False) -> dict:
+    """rating_keys are the out-of-date items to update; with `subtitles`, every
+    video in the folder that is up to date gets its subtitles fetched again."""
     if not (isinstance(rating_keys, list)
             and all(isinstance(k, str) and re.fullmatch(r"[0-9]{1,12}", k) for k in rating_keys)
             and len(set(rating_keys)) == len(rating_keys)):
@@ -334,7 +334,7 @@ def apply(store, gw, media_root: str, path: str, server_id, rating_keys) -> dict
                "warning": None}
         picked = set(rating_keys)
         for rk, item in by_rk.items():
-            if rk not in picked and item["kind"] != "unchanged":
+            if rk not in picked and not (subtitles and item["kind"] == "unchanged"):
                 continue
             if item["kind"] not in ACTIONABLE + ("unchanged",):
                 out["skipped"] += 1

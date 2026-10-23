@@ -713,7 +713,7 @@ function resyncLine(i) {
 async function openResync(path, back = closeSheet) {
   const head = h('div', { class: 'detail-head' }, h('div', {},
     h('h1', {}, `Re-sync ${path ? path.split('/').pop() : `everything on ${dev()}`}`),
-    h('div', { class: 'muted small' }, `Compares the videos on ${dev()} with Plex and fetches their subtitles again.`)));
+    h('div', { class: 'muted small' }, `Compares the videos on ${dev()} with Plex.`)));
   const backBtn = h('button', { class: 'btn small', onclick: () => back() }, 'Back');
   openSheet(head, h('div', { class: 'spinner' }), h('p', { class: 'muted small' }, 'Checking...'));
   let d;
@@ -726,16 +726,18 @@ async function openResync(path, back = closeSheet) {
   const rest = d.items.filter(i => !RESYNC_ACT.includes(i.kind));
   const sel = new Set(act.filter(i => !(i.kind === 'absent' && i.watched)).map(i => i.ratingKey));
   const btn = h('button', { class: 'btn primary' });
+  const subs = h('input', { type: 'checkbox', checked: !act.length && !!d.unchanged });
   const paint = () => {
     const bytes = act.filter(i => sel.has(i.ratingKey)).reduce((a, i) => a + (i.videoBytes || 0), 0);
     btn.textContent = `Re-sync${bytes ? ` · ${fmtBytes(bytes)} of video` : ''}`;
-    btn.disabled = !sel.size && !d.unchanged;
+    btn.disabled = !sel.size && !subs.checked;
   };
+  subs.onchange = paint;
   btn.onclick = async () => {
     btn.disabled = true;
     btn.textContent = 'Queuing...';
     try {
-      const r = await post('/api/resync/apply', { path, serverId: d.serverId, ratingKeys: [...sel] });
+      const r = await post('/api/resync/apply', { path, serverId: d.serverId, ratingKeys: [...sel], subtitles: subs.checked });
       const parts = [r.upgrades && `${r.upgrades} new version(s)`, r.redownloads && `${r.redownloads} to copy again`,
         r.copies && `${r.copies} to copy`, r.refreshes && `subtitles of ${r.refreshes}`].filter(Boolean);
       toast(parts.length ? `Queued ${parts.join(', ')}${r.videoBytes ? ` · ${fmtBytes(r.videoBytes)}` : ''}`
@@ -756,10 +758,12 @@ async function openResync(path, back = closeSheet) {
   paint();
   openSheet(head,
     h('p', { class: 'muted small' }, [`${d.checked} checked`, act.length && `${act.length} video(s) to update`,
-      d.unchanged && `${d.unchanged} up to date (Re-sync fetches their subtitles again)`,
+      d.unchanged && `${d.unchanged} up to date`,
       d.unverified && `${d.unverified} matched by name and size only (Plex did not send their bytes)`,
       rest.length && `${rest.length} not synced`].filter(Boolean).join(' · ')),
     act.length ? rows : h('div', { class: 'empty' }, rest.length ? 'No video needs an update.' : 'Every video is up to date.'),
+    d.unchanged ? h('label', { class: 'ep rs' }, subs,
+      h('span', { class: 'et' }, `Fetch subtitles again for the ${d.unchanged} up-to-date video(s)`)) : null,
     others.length ? [h('h3', {}, 'Not synced'), others] : null,
     h('div', { class: 'sticky-actions' }, btn, backBtn));
 }

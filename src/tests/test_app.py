@@ -1670,9 +1670,10 @@ class ResyncTest(PlexFixture):
     def kinds(self, path):
         return {i["ratingKey"] or i["path"]: i["kind"] for i in self.check(path)["items"]}
 
-    def apply(self, path, *rks, server=None):
+    def apply(self, path, *rks, server=None, subtitles=False):
         sid = server or self.check(path)["serverId"]
-        return self.c.post("/api/resync/apply", json={"path": path, "serverId": sid, "ratingKeys": list(rks)})
+        return self.c.post("/api/resync/apply", json={"path": path, "serverId": sid, "ratingKeys": list(rks),
+                                                       "subtitles": subtitles})
 
     def row(self, rk, status="done"):
         rows = [j for j in self.store.jobs_for(rating_key=rk) if j["status"] == status]
@@ -1713,7 +1714,7 @@ class ResyncTest(PlexFixture):
         self.assertEqual(self.kinds(""), {"102": "changed", "203": "absent"})
         self.assertEqual(self.kinds("TV-Shows"), {"203": "absent"})
         self.assertEqual(self.kinds(self.S01), {})
-        r = self.apply("", "203").json()                                    # 102 left out
+        r = self.apply("", "203", subtitles=True).json()                    # 102 left out
         self.assertEqual((r["upgrades"], r["redownloads"], r["refreshes"]), (0, 1, 3))
         self.drain()
         self.assertEqual(self.kinds(""), {"102": "changed"})
@@ -1736,7 +1737,8 @@ class ResyncTest(PlexFixture):
         self.assertEqual(self.kinds(""), {"202": "absent"})
         self.assertEqual(self.check(self.S01)["items"][0]["watched"], False)
         r = self.apply("", "202").json()
-        self.assertEqual((r["copies"], r["videoBytes"], r["refreshes"], r["skipped"]), (1, 90_000, 1, 0))
+        self.assertEqual((r["copies"], r["videoBytes"], r["refreshes"], r["skipped"]), (1, 90_000, 0, 0))
+        self.assertIsNone(self.row("201", "queued"))                      # subtitles left alone unless asked
         self.drain()
         self.assertEqual(self.read("TV-Shows/Show A/Season 01/Show A - S01E02 - Second.mkv"), self.fake.parts[2002])
         self.assertEqual(self.kinds(""), {})
@@ -1750,7 +1752,7 @@ class ResyncTest(PlexFixture):
         d = self.check(self.S01)
         self.assertEqual((d["checked"], d["unchanged"], [(i["ratingKey"], i["kind"]) for i in d["items"]]),
                          (1, 1, [("202", "absent")]))
-        r = self.apply(self.S01, "202").json()
+        r = self.apply(self.S01, "202", subtitles=True).json()
         self.assertEqual((r["copies"], r["refreshes"]), (1, 1))
         self.drain()
         adopted = self.row("201")
@@ -1824,7 +1826,7 @@ class ResyncTest(PlexFixture):
         self.store.update(failed["id"], status="failed", error="boom")
         item = self.check(self.S01)["items"][0]
         self.assertEqual((item["ratingKey"], item["kind"], item["reason"]), ("202", "busy", resync_mod.FAILED))
-        self.assertEqual(self.apply(self.S01).json()["refreshes"], 1)
+        self.assertEqual(self.apply(self.S01, subtitles=True).json()["refreshes"], 1)
         self.assertEqual((self.store.job(row["id"])["server_id"], self.store.job(row["id"])["guid"]),
                          ("srv1", "plex://episode/201"))
         self.drain()
@@ -1901,7 +1903,7 @@ class ResyncTest(PlexFixture):
         self.new_part(self.movie(103), 1203)                     # same name and size, other bytes
         self.assertEqual(self.kinds("Movies"), {"103": "changed"})
         before = len(self.fake.requests)
-        r = self.apply("Movies", server="srv1").json()           # nothing ticked: subtitles only
+        r = self.apply("Movies", server="srv1", subtitles=True).json()  # nothing ticked: subtitles only
         self.assertEqual((r["refreshes"], r["upgrades"]), (2, 0))
         self.assertEqual(self.part_requests(1001, before) + self.part_requests(1203, before), [])
 
@@ -1938,7 +1940,7 @@ class ResyncTest(PlexFixture):
         self.drain()
         self.assertEqual(self.read(LOOSE), self.fake.parts[1002])
 
-    def test_subtitles_are_always_fetched_again(self):
+    def test_subtitles_are_fetched_again(self):
         self.copy("101")
         m = self.movie(101)
         es = next(x for x in m["subs"] if x["id"] == 9001)
@@ -1947,7 +1949,8 @@ class ResyncTest(PlexFixture):
         m["subs"].append(dict(id=9006, codec="srt", lang="fr", ext=True, body=SRT_BODY("Salut")))
         self.assertEqual(self.check(self.HEAT_DIR)["items"], [])            # subtitles are not compared
         rid = self.row("101")["id"]
-        r = self.apply(self.HEAT_DIR).json()
+        self.assertEqual(self.apply(self.HEAT_DIR).json()["refreshes"], 0)
+        r = self.apply(self.HEAT_DIR, subtitles=True).json()
         self.assertEqual((r["refreshes"], r["videoBytes"]), (1, 0))
         self.assertEqual(self.store.pending_bytes(), 0)
         before = len(self.fake.requests)
@@ -1966,7 +1969,7 @@ class ResyncTest(PlexFixture):
         m = self.movie(101)
         next(x for x in m["subs"] if x["id"] == 9001)["body"] = "<html>oops</html>"   # not a subtitle
         m["subs"] = [x for x in m["subs"] if x["id"] != 9002]
-        self.apply(self.HEAT_DIR)
+        self.apply(self.HEAT_DIR, subtitles=True)
         self.drain()
         row = self.row("101")
         self.assertTrue(os.path.isfile(self.m(self.HEAT_EN)))               # not retired
