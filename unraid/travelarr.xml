@@ -13,7 +13,9 @@
 
 Sign in with Plex, browse your watchlist and libraries, and pick movies, whole shows, seasons or single episodes. travelarr copies the original files, with their external subtitles, into a share on this server in the same folder layout as at home. Play them with Infuse or any player that reads a network share. No transcoding, and no Plex server needed on this NAS.
 
-Downloads resume after dropped connections and restarts, and every resume is checked so a bad connection never leaves a corrupt file. At home it copies over your LAN; away it uses Plex Remote Access. Local Files lets you browse the share and delete what you have watched. Turn on sign-in with a user name and password in Settings.</Overview>
+Downloads resume after dropped connections and restarts, and every resume is checked so a bad connection never leaves a corrupt file. At home it copies over your LAN; away it uses Plex Remote Access. Local Files lets you browse the share and delete what you have watched. Turn on sign-in with a user name and password in Settings.
+
+Tested with the account that owns the Plex server, on a server with Plex Pass. Without Plex Pass, copying away from home may be blocked by Plex's remote playback rules; see the README.</Overview>
   <Category>Downloaders: MediaApp:Video</Category>
   <ExtraSearchTerms>plex travel offline download copy sync infuse movies tv nas</ExtraSearchTerms>
   <Date>2026-10-22</Date>

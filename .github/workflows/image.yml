@@ -1,4 +1,4 @@
-# Publishes ghcr.io/alien4u/travelarr (tests run locally before every push, see DEVELOPMENT.md):
+# Runs the unit tests, then publishes ghcr.io/alien4u/travelarr:
 #   main      -> :latest (the only tag that moves; every main push runs, so the newest commit always publishes)
 #   tag vX.Y.Z -> :X.Y.Z (must match VERSION in src/app/main.py; never overwritten)
 name: image
@@ -43,6 +43,11 @@ jobs:
             echo "tag=latest" >> "$GITHUB_OUTPUT"
           fi
           echo "version=$version" >> "$GITHUB_OUTPUT"
+      - name: Test
+        run: |
+          python3 -m venv /tmp/venv
+          /tmp/venv/bin/pip install -q -r src/requirements.txt -r src/requirements-dev.txt
+          cd src && /tmp/venv/bin/python -m unittest tests.test_app
       - name: Log in to GHCR
         run: echo "$TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
         env:

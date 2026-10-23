@@ -1,0 +1,6 @@
+<?xml version="1.0"?>
+<CommunityApplications>
+  <Profile>travelarr copies movies and TV shows from your home Plex server to a travel NAS, so you can watch them on the road without streaming. This repository holds its Unraid template; report problems and ask questions in GitHub Issues.</Profile>
+  <Icon>https://raw.githubusercontent.com/alien4u/travelarr/main/unraid/travelarr.png</Icon>
+  <WebPage>https://github.com/alien4u/travelarr</WebPage>
+</CommunityApplications>

@@ -46,6 +46,15 @@ travel NAS.
 - Keeps a free-space reserve on the NAS (10 GB by default).
 - Optional sign-in page with a user name and password, turned on in Settings.
 
+## Requirements
+
+- **Plex account:** sign in with the account that owns your Plex server. travelarr is tested this way, on a server with
+  **Plex Pass**.
+- **Without Plex Pass** (not tested yet): at home, travelarr downloads the original file the same way **Download** in
+  Plex Web does. Away from home, Plex has required Plex Pass (on the server or on your account) or a Remote Watch Pass
+  for remote playback since April 2025, and that may also block travelarr's downloads.
+- **A server shared with you** (not tested yet): its owner may need to allow downloads for your account.
+
 ## Installation
 
 The image is published for `linux/amd64` at `ghcr.io/alien4u/travelarr`. It runs as UID 99 / GID 100 (Unraid's
@@ -69,10 +78,6 @@ any other Docker container, with its icon, WebUI and Logs.
 4. Open it from the travelarr icon > **WebUI**.
 
 New versions show as **update ready** in the Docker tab.
-
-> **Updating from 2.x:** the browser password prompt is replaced by a sign-in page. Your password carries over on the
-> first start; after that the Username and Password variables can be removed, and the password is changed in
-> **Settings > Authentication**.
 
 ### Docker Compose
 
