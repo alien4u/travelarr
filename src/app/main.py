@@ -28,7 +28,7 @@ from .resync import ResyncError
 from .store import Store, now
 from .worker import CHANGED, Downloader
 
-VERSION = "3.2.0"
+VERSION = "3.2.1"
 STATIC = os.path.join(os.path.dirname(__file__), "static")
 LOCAL_NOTE = "deleted in Local Files"
 MAX_QUEUE_KEYS = 200  # bounds the Plex requests one queue call makes
@@ -610,10 +610,12 @@ def create_app(data_dir: str | None = None, media_root: str | None = None,
 
     # --------------------------------------------------------------- static
     app.mount("/static", StaticFiles(directory=STATIC), name="static")
+    with open(os.path.join(STATIC, "index.html"), encoding="utf-8") as fh:
+        # a new version is a new URL, so browsers never run an old app.js after an update
+        page = re.sub(r'"(/static/[\w.-]+\.(?:js|css))"', rf'"\1?v={VERSION}"', fh.read())
 
     @app.get("/")
     def index():
-        return FileResponse(os.path.join(STATIC, "index.html"),
-                            headers={"Cache-Control": "no-cache"})
+        return Response(page, media_type="text/html", headers={"Cache-Control": "no-cache"})
 
     return app

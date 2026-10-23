@@ -439,7 +439,11 @@ class AppTest(PlexFixture):
         r = self.c.get("/")
         self.assertEqual(r.status_code, 200)
         self.assertIn("travelarr", r.text)
-        self.assertEqual(self.c.get("/static/app.js").status_code, 200)
+        self.assertEqual(r.headers["cache-control"], "no-cache")
+        for asset in ("app.js", "style.css"):
+            url = f"/static/{asset}?v={main_mod.VERSION}"
+            self.assertIn(f'"{url}"', r.text)
+            self.assertEqual(self.c.get(url).status_code, 200)
 
     # connection selection ----------------------------------------------------
     def test_probes_never_send_the_token(self):
