@@ -62,20 +62,11 @@ The image is published for `linux/amd64` at `ghcr.io/alien4u/travelarr`. It runs
 
 ### Unraid
 
-travelarr is not in Community Applications. Add the template once and it then installs, updates and shows up like
-any other Docker container, with its icon, WebUI and Logs.
+travelarr is in Community Applications.
 
-1. Open the terminal (the `>_` icon at the top right of the Unraid web UI) and download the template:
-
-   ```bash
-   mkdir -p /boot/config/plugins/dockerMan/templates-user && \
-   wget -O /boot/config/plugins/dockerMan/templates-user/my-travelarr.xml \
-     https://raw.githubusercontent.com/alien4u/travelarr/main/unraid/travelarr.xml
-   ```
-
-2. **Docker > Add Container**, then choose **travelarr** under **Template**.
-3. Check the **Media share** path and click **Apply**.
-4. Open it from the travelarr icon > **WebUI**.
+1. Open **Apps**, search for **travelarr** and click **Install**.
+2. Check the **Media share** path and click **Apply**.
+3. Open it from the travelarr icon > **WebUI**.
 
 New versions show as **update ready** in the Docker tab.
 

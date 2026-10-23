@@ -1,19 +1,21 @@
 # Runs the unit tests, then publishes ghcr.io/alien4u/travelarr:
-#   main      -> :latest (the only tag that moves; every main push runs, so the newest commit always publishes)
-#   tag vX.Y.Z -> :X.Y.Z (must match VERSION in src/app/main.py; never overwritten)
+#   main      -> :latest (the only tag that moves; only pushes that change src/ or this file run, so a docs commit
+#                never shows as an update)
+#   tag vX.Y.Z -> :X.Y.Z (must match VERSION in src/app/main.py; never overwritten; tag pushes ignore paths)
 name: image
 
 on:
   push:
     branches: [main]
     tags: ["v*"]
+    paths: ["src/**", ".github/workflows/image.yml"]
   workflow_dispatch:
 
 permissions:
   contents: read
 
 # Whole runs per ref, one at a time. A newer push replaces a run still waiting, so on main the newest commit always
-# runs last, and the tip check below stops an older run from moving latest.
+# runs last, and the tip check below stops an older run from moving latest past a newer change to src/.
 concurrency:
   group: image-${{ github.ref }}
   cancel-in-progress: false
@@ -81,8 +83,12 @@ jobs:
             if ! [[ "$tip" =~ ^[0-9a-f]{40}$ ]]; then
               echo "::error::could not read the tip of main"; exit 1
             fi
+            # a newer commit that only changes docs has no run of its own, so this one still publishes
             if [ "$tip" != "$GITHUB_SHA" ]; then
-              echo "main moved on to $tip; its own run publishes latest"; exit 0
+              git fetch -q --depth=1 origin "$tip"
+              if ! git diff --quiet "$GITHUB_SHA" "$tip" -- src .github/workflows/image.yml; then
+                echo "main moved on to $tip; its own run publishes latest"; exit 0
+              fi
             fi
           fi
           docker push "$IMAGE:$tag"
