@@ -1,29 +1,23 @@
-"""Re-sync: compare copies on the NAS with what Plex has now, and queue what changed.
+"""Re-sync: compare the videos copied into a Local Files folder with what Plex has
+now, and queue what changed.
 
 A check never changes anything. Apply recomputes the check and acts only on items
 that are still out of date: an upgraded video gets a new job that replaces the old
-copy once it is in place; a missing or damaged copy is copied again; changed
-subtitles are fetched again without touching the video."""
+copy once it is in place; a missing or damaged copy is copied again. Every other
+copy in the folder gets its subtitles fetched again, without touching the video."""
 from __future__ import annotations
 
 import json
 import posixpath
 import re
 import threading
-import time
 from collections import defaultdict
-from concurrent.futures import ThreadPoolExecutor
 
-from plexapi.exceptions import NotFound
-
-from .paths import SUB_EXT, PathError, abs_path, dest_rel_for, sidecar_rel
+from .paths import PathError, abs_path, dest_rel_for, local_rel
 from .worker import _regular_size
 
 LOCK = threading.Lock()  # one check or apply at a time; selecting a server waits for it
-MAX_ROWS = 500
-HEAD_WORKERS = 4
-BUDGET = 60.0  # seconds a check may spend asking Plex for subtitle sizes
-ACTIONABLE = ("upgraded", "missing", "subtitles")
+ACTIONABLE = ("upgraded", "missing")
 
 
 class ResyncError(Exception):
@@ -34,29 +28,18 @@ class ResyncError(Exception):
 
 def _label(row: dict) -> str:
     if row["kind"] == "episode":
-        return f"S{(row['season'] or 0):02d}E{(row['episode'] or 0):02d} {row['title']}"
+        return f"{row['show_title']} S{(row['season'] or 0):02d}E{(row['episode'] or 0):02d} {row['title']}"
     return f"{row['title']} ({row['year']})" if row.get("year") else row["title"]
 
 
-def _scope(store, srv, sid: str, key: str) -> tuple[str, list[dict]]:
-    try:
-        root = srv.fetchItem(int(key))
-    except (NotFound, ValueError):
-        raise ResyncError(400, "That item is not on the selected Plex server") from None
-    # done copies, plus unfinished jobs of the same items so those show as busy
-    done = ("SELECT * FROM jobs WHERE status IN ('done','queued','downloading') "
-            "AND (server_id IS NULL OR server_id=?) AND ")
-    if root.type in ("movie", "episode"):
-        rows = store.rows(done + "rating_key=?", (sid, str(key)))
-    elif root.type == "show":
-        rows = store.rows(done + "show_key=?", (sid, str(key)))
-    elif root.type == "season":
-        rows = store.rows(done + "show_key=? AND season=?", (sid, str(root.parentRatingKey), root.index))
-    else:
-        raise ResyncError(400, "Only movies, shows, seasons and episodes can be re-synced")
-    if len(rows) > MAX_ROWS:
-        raise ResyncError(400, "Too many copies to check at once; re-sync one season at a time")
-    return root.type, rows
+def _scope(store, sid: str, path: str) -> list[dict]:
+    """Copies inside a Local Files folder ('' is the whole media folder), plus
+    unfinished jobs of the same items so those show as busy."""
+    sql = ("SELECT * FROM jobs WHERE status IN ('done','queued','downloading') "
+           "AND (server_id IS NULL OR server_id=?)")
+    if not path:
+        return store.rows(sql, (sid,))
+    return store.rows(sql + " AND (dest_rel=? OR substr(dest_rel, 1, ?)=?)", (sid, path, len(path) + 1, path + "/"))
 
 
 def _same_item(row: dict, it, sid: str, dest: str | None) -> bool:
@@ -90,22 +73,22 @@ def _busy(store, sid: str, rows_by_rk: dict) -> set[str]:
     return busy
 
 
-def _compute(store, gw, media_root: str, key: str) -> dict:
+def _compute(store, gw, media_root: str, path: str) -> dict:
     srv, sid = gw.snapshot()
     if not sid:
         raise ResyncError(409, "Choose a Plex server first")
-    _, rows = _scope(store, srv, sid, key)
+    rows = _scope(store, sid, path)
     by_rk: dict[str, list[dict]] = defaultdict(list)
     for r in rows:
         by_rk[r["rating_key"]].append(r)
     plex = gw.batch(srv, list(by_rk))
     busy = _busy(store, sid, by_rk)
-    items, heads = [], []
+    items = []
     for rk, rws in by_rk.items():
         row = rws[0]
         it = plex.get(rk)
         item = {"ratingKey": rk, "title": row["show_title"] or row["title"], "label": _label(row),
-                "kind": "unchanged", "reason": None, "video": None, "subtitles": None, "videoBytes": 0,
+                "kind": "unchanged", "reason": None, "video": None, "videoBytes": 0,
                 "_rows": rws, "_item": it}
         items.append(item)
         if rk in busy or any(r["status"] != "done" for r in rws):
@@ -141,57 +124,6 @@ def _compute(store, gw, media_root: str, key: str) -> dict:
         if here != row["size"]:
             item.update(kind="missing", videoBytes=row["size"], reason="missing on the NAS" if here is None
                         else "the file on the NAS has the wrong size")
-            continue
-        expected, used = [], set()
-        for s in gw.text_streams(p):
-            ext = SUB_EXT.get(s["codec"])
-            if ext:
-                expected.append((sidecar_rel(row["dest_rel"], s["lang"], s["forced"], s["hi"], ext, used), s["key"]))
-        item["_expected"] = expected
-        heads += [(item, rel, k) for rel, k in expected]
-
-    deadline = time.monotonic() + BUDGET
-
-    def head(job):
-        _, _, k = job
-        if time.monotonic() > deadline:
-            return "late"
-        try:
-            return gw.head_length(srv, k)
-        except Exception:  # noqa: BLE001
-            return None
-    with ThreadPoolExecutor(HEAD_WORKERS) as ex:
-        sizes = list(ex.map(head, heads))
-    plexsize: dict[int, dict] = defaultdict(dict)
-    for (item, rel, _), n in zip(heads, sizes):
-        plexsize[id(item)][rel] = n
-    for item in items:
-        if item["kind"] != "unchanged" or "_expected" not in item:
-            continue
-        row = item["_rows"][0]
-        got = plexsize.get(id(item), {})
-        if any(v is None or v == "late" for v in got.values()):
-            late = any(v == "late" for v in got.values())
-            item.update(kind="unchecked", reason="time limit reached before its subtitles were checked" if late
-                        else "Plex did not report its subtitle sizes")
-            continue
-        recorded = json.loads(row["sidecars"] or "[]")
-        names = [rel for rel, _ in item["_expected"]]
-        added, changed = [], []
-        for rel in names:
-            try:
-                local = _regular_size(abs_path(media_root, rel))
-            except PathError:
-                local = None
-            if rel not in recorded or local is None:
-                added.append(rel)
-            elif local != got.get(rel):
-                changed.append(rel)
-        removed = [rel for rel in recorded if rel not in names]
-        if added or changed or removed:
-            base = lambda xs: [posixpath.basename(x) for x in xs]  # noqa: E731
-            item.update(kind="subtitles", subtitles={"added": base(added), "changed": base(changed),
-                                                     "removed": base(removed)})
     return {"serverId": sid, "srv": srv, "items": items, "checked": sum(1 for r in rows if r["status"] == "done")}
 
 
@@ -222,26 +154,38 @@ def _public(item: dict) -> dict:
     return {k: v for k, v in item.items() if not k.startswith("_")}
 
 
-def check(store, gw, media_root: str, key: str) -> dict:
+def scope_path(path) -> str:
+    if not isinstance(path, str):
+        raise ResyncError(400, "path must be a folder in Local Files")
+    try:
+        return local_rel(path)
+    except PathError as e:
+        raise ResyncError(400, str(e)) from None
+
+
+def check(store, gw, media_root: str, path: str) -> dict:
     if not LOCK.acquire(blocking=False):
         raise ResyncError(409, "A re-sync check is already running")
     try:
-        d = _compute(store, gw, media_root, str(key))
+        d = _compute(store, gw, media_root, path)
     finally:
         LOCK.release()
     return {"serverId": d["serverId"], "checked": d["checked"],
+            "unchanged": sum(1 for i in d["items"] if i["kind"] == "unchanged"),
             "items": [_public(i) for i in d["items"] if i["kind"] != "unchanged"]}
 
 
-def apply(store, gw, media_root: str, key: str, server_id, rating_keys) -> dict:
-    if not (isinstance(rating_keys, list) and 1 <= len(rating_keys) <= MAX_ROWS
+def apply(store, gw, media_root: str, path: str, server_id, rating_keys) -> dict:
+    """rating_keys are the out-of-date items to update; every unchanged copy in
+    the folder gets its subtitles fetched again."""
+    if not (isinstance(rating_keys, list)
             and all(isinstance(k, str) and re.fullmatch(r"[0-9]{1,12}", k) for k in rating_keys)
             and len(set(rating_keys)) == len(rating_keys)):
-        raise ResyncError(400, "ratingKeys must be 1 to 500 different rating keys")
+        raise ResyncError(400, "ratingKeys must be different rating keys")
     if not LOCK.acquire(blocking=False):
         raise ResyncError(409, "A re-sync check is already running")
     try:
-        d = _compute(store, gw, media_root, str(key))
+        d = _compute(store, gw, media_root, path)
         if server_id != d["serverId"]:
             raise ResyncError(409, "The Plex server changed since the check; check again")
         by_rk = {i["ratingKey"]: i for i in d["items"]}
@@ -250,9 +194,11 @@ def apply(store, gw, media_root: str, key: str, server_id, rating_keys) -> dict:
             raise ResyncError(400, f"Not part of this re-sync: {', '.join(outside[:5])}")
         out = {"upgrades": 0, "redownloads": 0, "refreshes": 0, "videoBytes": 0, "skipped": 0, "warning": None}
         sid = d["serverId"]
-        for rk in rating_keys:
-            item = by_rk[rk]
-            if item["kind"] not in ACTIONABLE:
+        picked = set(rating_keys)
+        for rk, item in by_rk.items():
+            if rk not in picked and item["kind"] != "unchanged":
+                continue
+            if item["kind"] not in ACTIONABLE + ("unchanged",):
                 out["skipped"] += 1
                 continue
             row, it = item["_rows"][0], item["_item"]

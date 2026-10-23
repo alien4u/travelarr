@@ -1621,7 +1621,11 @@ class DeviceNameTest(unittest.TestCase):
 
 
 class ResyncTest(PlexFixture):
-    """Re-sync: compare copies with Plex and bring them up to date."""
+    """Re-sync: compare the copies in a Local Files folder with Plex and bring them up to date."""
+    HEAT_DIR = "Movies/Heat (1995)"
+    HEATHERS_DIR = "Movies/Heathers (1989)"
+    SHOW = "TV-Shows/Show A"
+    S01, S02 = "TV-Shows/Show A/Season 01", "TV-Shows/Show A/Season 02"
     HEAT_ES = "Movies/Heat (1995)/Heat (1995).es.srt"
     HEAT_EN = "Movies/Heat (1995)/Heat (1995).en.forced.srt"
 
@@ -1640,17 +1644,17 @@ class ResyncTest(PlexFixture):
         self.c.post("/api/queue", json={"keys": list(keys), "mode": mode})
         self.drain()
 
-    def check(self, key):
-        r = self.c.post("/api/resync/check", json={"key": key})
+    def check(self, path):
+        r = self.c.post("/api/resync/check", json={"path": path})
         self.assertEqual(r.status_code, 200, r.text)
         return r.json()
 
-    def kinds(self, key):
-        return {i["ratingKey"]: i["kind"] for i in self.check(key)["items"]}
+    def kinds(self, path):
+        return {i["ratingKey"]: i["kind"] for i in self.check(path)["items"]}
 
-    def apply(self, key, *rks, server=None):
-        sid = server or self.check(key)["serverId"]
-        return self.c.post("/api/resync/apply", json={"key": key, "serverId": sid, "ratingKeys": list(rks)})
+    def apply(self, path, *rks, server=None):
+        sid = server or self.check(path)["serverId"]
+        return self.c.post("/api/resync/apply", json={"path": path, "serverId": sid, "ratingKeys": list(rks)})
 
     def row(self, rk, status="done"):
         rows = [j for j in self.store.jobs_for(rating_key=rk) if j["status"] == status]
@@ -1673,20 +1677,40 @@ class ResyncTest(PlexFixture):
     # check -----------------------------------------------------------------
     def test_unchanged_copy_reports_nothing(self):
         self.copy("101")
-        d = self.check("101")
-        self.assertEqual((d["checked"], d["items"]), (1, []))
+        d = self.check(self.HEAT_DIR)
+        self.assertEqual((d["checked"], d["unchanged"], d["items"]), (1, 1, []))
         self.assertEqual(d["serverId"], "srv1")
+        self.assertEqual(self.check(LOOSE), {"serverId": "srv1", "checked": 0, "unchanged": 0, "items": []})
+        self.assertEqual(self.check("Movies/Heat"), {"serverId": "srv1", "checked": 0, "unchanged": 0, "items": []})
+
+    def test_whole_media_folder_and_library_folders(self):
+        self.copy("101", "102")
+        self.copy("200")
+        for path in ("", "Movies", "TV-Shows", self.SHOW, self.S01):
+            self.assertEqual(self.check(path)["items"], [], path)
+        self.assertEqual([self.check(p)["checked"] for p in ("", "Movies", self.SHOW, self.S01, self.S02)],
+                         [5, 2, 3, 2, 1])
+        self.new_part(self.movie(102), 1102, size=125_000)
+        os.remove(self.m("TV-Shows/Show A/Season 02/Show A - S02E01 - Third.mkv"))
+        self.assertEqual(self.kinds(""), {"102": "upgraded", "203": "missing"})
+        self.assertEqual(self.kinds("TV-Shows"), {"203": "missing"})
+        self.assertEqual(self.kinds(self.S01), {})
+        r = self.apply("", "203").json()                                    # 102 left out
+        self.assertEqual((r["upgrades"], r["redownloads"], r["refreshes"]), (0, 1, 3))
+        self.drain()
+        self.assertEqual(self.kinds(""), {"102": "upgraded"})
+        self.assertEqual(self.row("201")["note"], "re-synced: subtitles")
 
     def test_upgrade_with_a_new_file_name(self):
         self.copy("101")
         old = self.row("101")
         new = "/data/Media/Movies/Heat (1995)/Heat (1995) Bluray-2160p.mkv"
         self.new_part(self.movie(101), 1101, file=new, size=310_000)
-        item = self.check("101")["items"][0]
+        item = self.check(self.HEAT_DIR)["items"][0]
         self.assertEqual(item["kind"], "upgraded")
         self.assertEqual(item["video"], {"from": {"file": "Heat (1995).mkv", "size": 300_000},
                                          "to": {"file": "Heat (1995) Bluray-2160p.mkv", "size": 310_000}})
-        r = self.apply("101", "101").json()
+        r = self.apply(self.HEAT_DIR, "101").json()
         self.assertEqual((r["upgrades"], r["videoBytes"]), (1, 310_000))
         self.drain()
         self.assertEqual(self.store.job(old["id"])["status"], "removed")
@@ -1701,14 +1725,14 @@ class ResyncTest(PlexFixture):
         self.assertEqual(json.loads(self.store.job(old["id"])["cleanup"]), [])
         leftovers = [n for n in os.listdir(self.m("Movies/Heat (1995)")) if "travelarr" in n]
         self.assertEqual(leftovers, [])
-        self.assertEqual(self.check("101")["items"], [])
+        self.assertEqual(self.check(self.HEAT_DIR)["items"], [])
 
     def test_upgrade_in_place_same_name_new_size(self):
         self.copy("101")
         old = self.row("101")
         self.new_part(self.movie(101), 1101, size=320_000)
-        self.assertEqual(self.kinds("101"), {"101": "upgraded"})
-        self.apply("101", "101")
+        self.assertEqual(self.kinds(self.HEAT_DIR), {"101": "upgraded"})
+        self.apply(self.HEAT_DIR, "101")
         self.drain()
         self.assertEqual(self.read(HEAT), self.fake.parts[1101])
         self.assertTrue(os.path.isfile(self.m(self.HEAT_ES)))       # same name: re-fetched, kept
@@ -1718,8 +1742,8 @@ class ResyncTest(PlexFixture):
     def test_upgrade_same_size_new_part_downloads(self):
         self.copy("101")
         self.new_part(self.movie(101), 1101)  # same name, same size, different bytes
-        self.assertEqual(self.kinds("101"), {"101": "upgraded"})
-        self.apply("101", "101")
+        self.assertEqual(self.kinds(self.HEAT_DIR), {"101": "upgraded"})
+        self.apply(self.HEAT_DIR, "101")
         before = len(self.fake.requests)
         self.drain()
         self.assertTrue(self.part_requests(1101, before))          # never adopted by size
@@ -1732,7 +1756,7 @@ class ResyncTest(PlexFixture):
         self.new_part(self.movie(101), 1101, size=320_000)
         self.fake.drop_after[1101] = 100_000
         self.dl.backoff = 0.01
-        self.apply("101", "101")
+        self.apply(self.HEAT_DIR, "101")
         self.drain()
         self.assertEqual(self.row("101")["staging_mark"], hashlib.sha256(self.fake.parts[1101]).hexdigest())
         self.assertEqual(self.read(HEAT), self.fake.parts[1101])
@@ -1740,8 +1764,8 @@ class ResyncTest(PlexFixture):
     def test_missing_copy_is_copied_again(self):
         self.copy("102")
         os.remove(self.m(LOOSE))
-        self.assertEqual(self.check("102")["items"][0]["reason"], "missing on the NAS")
-        r = self.apply("102", "102").json()
+        self.assertEqual(self.check(LOOSE)["items"][0]["reason"], "missing on the NAS")
+        r = self.apply(LOOSE, "102").json()
         self.assertEqual((r["redownloads"], r["videoBytes"]), (1, 120_000))
         rid = self.row("102", "queued")["id"]
         self.drain()
@@ -1753,24 +1777,21 @@ class ResyncTest(PlexFixture):
         self.copy("102")
         with open(self.m(LOOSE), "r+b") as fh:
             fh.truncate(10)
-        self.assertEqual(self.check("102")["items"][0]["reason"], "the file on the NAS has the wrong size")
-        self.apply("102", "102")
+        self.assertEqual(self.check(LOOSE)["items"][0]["reason"], "the file on the NAS has the wrong size")
+        self.apply(LOOSE, "102")
         self.drain()
         self.assertEqual(self.read(LOOSE), self.fake.parts[1002])
 
-    def test_subtitles_added_changed_removed(self):
+    def test_subtitles_are_always_fetched_again(self):
         self.copy("101")
         m = self.movie(101)
         es = next(x for x in m["subs"] if x["id"] == 9001)
-        es["body"] = SRT_BODY("Hola de nuevo")                              # changed size
+        es["body"] = SRT_BODY("Hole")                                        # same size, new text
         m["subs"] = [x for x in m["subs"] if x["id"] != 9002]               # en forced removed
         m["subs"].append(dict(id=9006, codec="srt", lang="fr", ext=True, body=SRT_BODY("Salut")))
-        item = self.check("101")["items"][0]
-        self.assertEqual(item["kind"], "subtitles")
-        self.assertEqual(item["subtitles"], {"added": ["Heat (1995).fr.srt"], "changed": ["Heat (1995).es.srt"],
-                                             "removed": ["Heat (1995).en.forced.srt"]})
+        self.assertEqual(self.check(self.HEAT_DIR)["items"], [])            # subtitles are not compared
         rid = self.row("101")["id"]
-        r = self.apply("101", "101").json()
+        r = self.apply(self.HEAT_DIR).json()
         self.assertEqual((r["refreshes"], r["videoBytes"]), (1, 0))
         self.assertEqual(self.store.pending_bytes(), 0)
         before = len(self.fake.requests)
@@ -1782,14 +1803,14 @@ class ResyncTest(PlexFixture):
         self.assertTrue(os.path.isfile(self.m("Movies/Heat (1995)/Heat (1995).fr.srt")))
         self.assertFalse(os.path.lexists(self.m(self.HEAT_EN)))
         self.assertNotIn(self.HEAT_EN, json.loads(row["sidecars"]))
-        self.assertEqual(self.check("101")["items"], [])
+        self.assertEqual(self.check(self.HEAT_DIR)["items"], [])
 
     def test_failed_subtitle_fetch_keeps_old_ones(self):
         self.copy("101")
         m = self.movie(101)
         next(x for x in m["subs"] if x["id"] == 9001)["body"] = "<html>oops</html>"   # not a subtitle
         m["subs"] = [x for x in m["subs"] if x["id"] != 9002]
-        self.apply("101", "101")
+        self.apply(self.HEAT_DIR)
         self.drain()
         row = self.row("101")
         self.assertTrue(os.path.isfile(self.m(self.HEAT_EN)))               # not retired
@@ -1797,62 +1818,63 @@ class ResyncTest(PlexFixture):
         self.assertEqual(row["note"], "old subtitles kept: some subtitles could not be fetched")
         self.assertEqual(self.read(self.HEAT_ES), SRT_BODY("Hola").encode())  # old file of that name kept
 
-    def test_season_scope_reports_an_episode_gone_from_plex(self):
+    def test_folder_scope_reports_an_episode_gone_from_plex(self):
         self.copy("200")
         self.fake.episodes = [e for e in self.fake.episodes if e["rk"] != 202]
-        self.assertEqual(self.kinds("210"), {"202": "gone"})
-        self.assertEqual(self.check("220")["checked"], 1)
-        self.assertEqual(self.kinds("200"), {"202": "gone"})
+        self.assertEqual(self.kinds(self.S01), {"202": "gone"})
+        self.assertEqual(self.check(self.S01)["items"][0]["label"], "Show A S01E02 Second")
+        self.assertEqual(self.check(self.S02)["checked"], 1)
+        self.assertEqual(self.kinds(self.SHOW), {"202": "gone"})
+        self.fake.episodes = []
+        self.assertEqual(self.kinds(""), {"201": "gone", "202": "gone", "203": "gone"})
+        r = self.apply("", "201").json()                                    # nothing to do, the copies stay
+        self.assertEqual((r["upgrades"], r["redownloads"], r["refreshes"], r["skipped"]), (0, 0, 0, 1))
 
     def test_busy_and_double_apply(self):
         self.copy("102")
         os.remove(self.m(LOOSE))
-        self.apply("102", "102")
-        self.assertEqual(self.kinds("102"), {"102": "busy"})
-        r = self.apply("102", "102").json()
+        self.apply(LOOSE, "102")
+        self.assertEqual(self.kinds(LOOSE), {"102": "busy"})
+        r = self.apply(LOOSE, "102").json()
         self.assertEqual((r["redownloads"], r["skipped"]), (0, 1))
 
     def test_identity(self):
         self.copy("101")
         rid = self.row("101")["id"]
         self.store.update(rid, server_id="other")
-        self.assertEqual(self.check("101"), {"serverId": "srv1", "checked": 0, "items": []})  # not this server's
+        self.assertEqual(self.check(self.HEAT_DIR),
+                         {"serverId": "srv1", "checked": 0, "unchanged": 0, "items": []})  # not this server's
         self.store.update(rid, server_id="srv1", guid="plex://movie/another")
-        self.assertEqual(self.kinds("101"), {"101": "mismatch"})
+        self.assertEqual(self.kinds(self.HEAT_DIR), {"101": "mismatch"})
         # a copy from before 2.5.0: same title and folder -> compared, and bound on apply
         self.store.update(rid, server_id=None, guid=None)
         os.remove(self.m(HEAT))
-        self.assertEqual(self.kinds("101"), {"101": "missing"})
-        self.apply("101", "101")
+        self.assertEqual(self.kinds(self.HEAT_DIR), {"101": "missing"})
+        self.apply(self.HEAT_DIR, "101")
         self.assertEqual((self.store.job(rid)["server_id"], self.store.job(rid)["guid"]), ("srv1", "plex://movie/heat"))
         self.store.update(rid, server_id=None, guid=None, status="done", mode=None)
         self.movie(101)["title"] = "Something Else"
-        self.assertEqual(self.kinds("101"), {"101": "mismatch"})
+        self.assertEqual(self.kinds(self.HEAT_DIR), {"101": "mismatch"})
 
     def test_multipart_and_unavailable(self):
         self.copy("103")
         h = self.movie(103)
         h["extra_parts"] = [dict(part=1203, file=f"{h['file']}.cd2", size=10)]
-        self.assertEqual(self.kinds("103"), {"103": "multipart"})
+        self.assertEqual(self.kinds(self.HEATHERS_DIR), {"103": "multipart"})
         h["extra_parts"], h["no_parts"] = [], True
-        self.assertEqual(self.kinds("103"), {"103": "unavailable"})
-
-    def test_unreadable_subtitle_size_is_unchecked(self):
-        self.copy("101")
-        self.fake.head_fail.add(9001)
-        self.assertEqual(self.kinds("101"), {"101": "unchecked"})
+        self.assertEqual(self.kinds(self.HEATHERS_DIR), {"103": "unavailable"})
 
     def test_requests_are_validated(self):
         self.copy("101")
-        self.assertEqual(self.c.post("/api/resync/check", json={"key": "x"}).status_code, 400)
-        self.assertEqual(self.c.post("/api/resync/check", json={"key": "999"}).status_code, 400)
-        self.assertEqual(self.apply("101", "101", server="other").status_code, 409)
-        for bad in ([], ["101", "101"], [101], ["102"]):
-            r = self.c.post("/api/resync/apply", json={"key": "101", "serverId": "srv1", "ratingKeys": bad})
+        for bad in ("../x", "/etc", "Movies/../..", 5, None):
+            self.assertEqual(self.c.post("/api/resync/check", json={"path": bad}).status_code, 400, bad)
+        self.assertEqual(self.apply(self.HEAT_DIR, "101", server="other").status_code, 409)
+        for bad in (None, "101", ["101", "101"], [101], ["102"]):
+            r = self.c.post("/api/resync/apply", json={"path": self.HEAT_DIR, "serverId": "srv1", "ratingKeys": bad})
             self.assertEqual(r.status_code, 400, bad)
         from app import resync
         with resync.LOCK:
-            r = self.c.post("/api/resync/check", json={"key": "101"})
+            r = self.c.post("/api/resync/check", json={"path": self.HEAT_DIR})
         self.assertEqual((r.status_code, r.json()["error"]), (409, "A re-sync check is already running"))
 
     # upgrade lifecycle -------------------------------------------------------
@@ -1861,7 +1883,7 @@ class ResyncTest(PlexFixture):
         old = self.row("101")
         self.new_part(self.movie(101), 1101, file="/data/Media/Movies/Heat (1995)/Heat (1995) v2.mkv",
                       size=310_000)
-        self.apply("101", "101")
+        self.apply(self.HEAT_DIR, "101")
         return old, self.row("101", "queued")
 
     def test_cancel_before_placement_keeps_the_old_copy(self):
@@ -1900,7 +1922,7 @@ class ResyncTest(PlexFixture):
         self.assertEqual(self.c.post(f"/api/jobs/{old['id']}/remove").json(), {"result": "busy"})
         self.assertEqual(self.c.post(f"/api/jobs/{up['id']}/remove").json(), {"result": "busy"})
         self.assertFalse(self.store.cancel_queued(up["id"]))
-        self.assertEqual(self.kinds("101"), {"101": "busy"})
+        self.assertEqual(self.kinds(self.HEAT_DIR), {"101": "busy"})
 
     def test_crash_after_the_rename_is_recovered_by_hash(self):
         old, up = self.upgrade_queued()
@@ -1934,9 +1956,9 @@ class ResyncTest(PlexFixture):
         o = self.store.job(old["id"])
         self.assertEqual((o["status"], o["note"]), ("done", "unverified after an interrupted re-sync"))
         self.assertEqual(self.read(HEAT), self.fake.parts[1001])
-        self.assertEqual(self.kinds("101"), {"101": "busy"})                  # the failed upgrade comes first
+        self.assertEqual(self.kinds(self.HEAT_DIR), {"101": "busy"})                  # the failed upgrade comes first
         self.c.post(f"/api/jobs/{up['id']}/remove")
-        self.assertEqual(self.kinds("101"), {"101": "upgraded"})              # unlocked, can be re-synced
+        self.assertEqual(self.kinds(self.HEAT_DIR), {"101": "upgraded"})              # unlocked, can be re-synced
 
     def test_rename_error_fails_and_retry_does_not_download(self):
         old, up = self.upgrade_queued()
@@ -2035,7 +2057,7 @@ class ResyncTest(PlexFixture):
         rid = self.row("101")["id"]
         es = next(x for x in self.movie(101)["subs"] if x["id"] == 9001)
         es["body"] = SRT_BODY("Otra vez")
-        self.apply("101", "101")
+        self.apply(self.HEAT_DIR, "101")
         real = self.gw.fetch_bytes
 
         def fetch(*a, **kw):
@@ -2053,7 +2075,7 @@ class ResyncTest(PlexFixture):
         other = dict(self.row("102"))
         self.store.add_jobs([{**{k: other[k] for k in store_mod.JOB_FIELDS if k in other},
                               "server_id": "other", "dest_rel": "Movies/elsewhere.mkv", "part_id": 1}])
-        self.assertEqual(self.check("102"), {"serverId": "srv1", "checked": 1, "items": []})
+        self.assertEqual(self.check("Movies"), {"serverId": "srv1", "checked": 1, "unchanged": 1, "items": []})
 
     # review round 2 ----------------------------------------------------------
     def test_bulk_removal_names_its_server(self):
@@ -2123,7 +2145,7 @@ class ResyncTest(PlexFixture):
         self.assertEqual((o["status"], o["note"]), ("done", "unverified after an interrupted re-sync"))
         self.assertTrue(os.path.isfile(self.m(HEAT)))
         self.assertEqual(self.c.post(f"/api/jobs/{up['id']}/remove").json(), {"result": "removed"})
-        self.assertEqual(self.kinds("101"), {"101": "upgraded"})
+        self.assertEqual(self.kinds(self.HEAT_DIR), {"101": "upgraded"})
 
     def test_replanning_refuses_another_server(self):
         with self.assertRaises(plexgw.OtherServer):
@@ -2174,7 +2196,7 @@ class ResyncTest(PlexFixture):
         self.copy("101")
         rid = self.row("101")["id"]
         next(x for x in self.movie(101)["subs"] if x["id"] == 9001)["body"] = SRT_BODY("Nuevo texto")
-        self.apply("101", "101")
+        self.apply(self.HEAT_DIR, "101")
         self.new_part(self.movie(101), 1101)  # replaced again before the worker runs
         self.drain()
         job = self.store.job(rid)
@@ -2182,7 +2204,7 @@ class ResyncTest(PlexFixture):
         self.assertIn("subtitles not checked", job["error"])
         self.assertEqual(sorted(json.loads(job["sidecars"])), sorted([self.HEAT_EN, self.HEAT_ES]))
         self.assertTrue(os.path.isfile(self.m(self.HEAT_EN)))
-        self.assertEqual(self.kinds("101"), {"101": "upgraded"})       # the next re-sync sees it
+        self.assertEqual(self.kinds(self.HEAT_DIR), {"101": "upgraded"})       # the next re-sync sees it
 
     # review round 4 ----------------------------------------------------------
     def test_a_later_refresh_never_reaches_the_replaced_copy(self):
@@ -2205,7 +2227,7 @@ class ResyncTest(PlexFixture):
         rid = self.row("102")["id"]
         with open(self.m(LOOSE), "r+b") as fh:
             fh.truncate(10)
-        self.apply("102", "102")
+        self.apply(LOOSE, "102")
         r = self.c.post("/api/remove", json={"ratingKeys": ["102"], "serverId": "srv1"}).json()
         self.assertEqual(r["results"], {"removed": 1})
         self.assertEqual(self.store.job(rid)["status"], "removed")
@@ -2312,7 +2334,7 @@ class ResyncTest(PlexFixture):
                 old = self.row("102")
                 if mode == "redownload":
                     os.remove(self.m(LOOSE))
-                    self.apply("102", "102")
+                    self.apply(LOOSE, "102")
                 else:                                                  # a lost final rename
                     shutil.copyfile(self.m(LOOSE), self.m(LOOSE) + paths.PART_SUFFIX)
                     self.assertTrue(self.store.requeue_lost(old["id"]))
@@ -2332,14 +2354,14 @@ class ResyncTest(PlexFixture):
                 self.assertEqual(self.store.status_map(["102"], "srv1"), {"102": "done"})   # no plain Copy offered
                 self.assertFalse(os.path.lexists(self.m(LOOSE) + paths.PART_SUFFIX))
 
-                self.assertEqual(self.kinds("102"), {"102": "upgraded"})
-                self.assertEqual(self.apply("102", "102").json()["upgrades"], 1)
+                self.assertEqual(self.kinds(LOOSE), {"102": "upgraded"})
+                self.assertEqual(self.apply(LOOSE, "102").json()["upgrades"], 1)
                 self.drain()
                 self.assertEqual(self.store.job(old["id"])["status"], "removed")
                 done = self.row("102")
                 self.assertEqual((done["mode"], done["dest_rel"]), ("upgrade", LOOSE))
                 self.assertEqual(self.read(LOOSE), new)
-                self.assertEqual(self.check("102")["items"], [])
+                self.assertEqual(self.check(LOOSE)["items"], [])
                 self.c.post(f"/api/jobs/{done['id']}/remove")
                 self.assertFalse(os.path.lexists(self.m(LOOSE)))
 

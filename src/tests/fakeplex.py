@@ -46,7 +46,6 @@ class FakePlex:
         self.redirect_to: str | None = None       # target for /redir
         self.https_required = False
         self.conns: list | None = None            # overrides the advertised connections
-        self.head_fail: set[int] = set()          # subtitle stream ids whose HEAD answers 500
         self.pin_polls = 0
         self.parts: dict[int, bytes] = {}
         self.movies = [
@@ -270,15 +269,6 @@ class FakePlex:
             for v in self.movies + self.episodes:
                 for s in v["subs"]:
                     if s["id"] == sid and s.get("body"):
-                        if method == "HEAD":   # what Plex sends: the length, no body
-                            if sid in self.head_fail:
-                                h.send_response(500)
-                                h.send_header("Content-Length", "0")
-                                return h.end_headers()
-                            h.send_response(200)
-                            h.send_header("Content-Type", "text/html")
-                            h.send_header("Content-Length", str(len(s["body"].encode())))
-                            return h.end_headers()
                         return self.send(h, 200, s["body"].encode(), "text/plain")
             return self.send(h, 404, b"<html>404</html>", "text/html")
         if path == "/photo/:/transcode":

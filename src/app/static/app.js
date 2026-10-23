@@ -627,9 +627,6 @@ function videoBody(d) {
     }, 'Cancel'));
   }
   if (st === 'done') actions.append(h('button', {
-    class: 'btn small', onclick: () => openResync(d.ratingKey, d.ratingKey, d.title),
-  }, 'Re-sync from Plex'));
-  if (st === 'done') actions.append(h('button', {
     class: 'btn small danger', onclick: async () => {
       if (!confirm(`Delete "${d.title}" from ${dev()}?`)) return;
       const r = await post('/api/remove', { ratingKeys: [d.ratingKey], serverId: S.state.serverId });
@@ -671,8 +668,7 @@ function showBody(d) {
     const sTitle = s.title || `Season ${s.index}`;
     return h('div', { class: 'season' },
       h('label', { class: 'season-h' }, scb, sTitle,
-        h('span', { class: 'muted small grow' }, `${s.episodes.length} ep${done ? ` · ${done} on ${dev()}` : ''}`),
-        done && s.ratingKey ? resyncButton(s.ratingKey, d.ratingKey, `${d.title} ${sTitle}`) : null),
+        h('span', { class: 'muted small grow' }, `${s.episodes.length} ep${done ? ` · ${done} on ${dev()}` : ''}`)),
       s.episodes.map(e => {
         const cb = h('input', { type: 'checkbox', disabled: !eligible(e) });
         cb.onchange = () => { cb.checked ? sel.add(e.ratingKey) : sel.delete(e.ratingKey); refresh(); };
@@ -682,8 +678,7 @@ function showBody(d) {
           h('span', { class: 'et' }, e.title),
           e.copy ? h('span', { class: `chip ${e.copy}` }, statusOf(e.copy)[0])
             : e.watched ? h('span', { class: 'chip' }, 'Watched') : null,
-          h('span', { class: 'sz' }, fmtBytes(e.size)),
-          e.copy === 'done' ? resyncButton(e.ratingKey, d.ratingKey, `${d.title} E${pad(e.index)}`) : null);
+          h('span', { class: 'sz' }, fmtBytes(e.size)));
       }));
   });
 
@@ -703,46 +698,30 @@ function showBody(d) {
       h('button', { class: 'btn small', onclick: pick(() => true) }, 'All'),
       h('button', { class: 'btn small', onclick: pick(() => false) }, 'None')),
     seasons,
-    h('div', { class: 'sticky-actions' }, copyBtn,
-      onDevice ? h('button', { class: 'btn small', onclick: () => openResync(d.ratingKey, d.ratingKey, d.title) },
-        'Re-sync show') : null,
-      removeBtn));
+    h('div', { class: 'sticky-actions' }, copyBtn, removeBtn));
 }
 
 /* ----------------------------------------------------------------- resync */
-function resyncButton(key, back, title) {
-  return h('button', {
-    class: 'btn small resync', type: 'button', title: 'Compare with Plex and update',
-    onclick: e => { e.preventDefault(); e.stopPropagation(); openResync(key, back, title); },
-  }, 'Re-sync');
-}
-
-const RESYNC_ACT = ['upgraded', 'missing', 'subtitles'];
+const RESYNC_ACT = ['upgraded', 'missing'];
 
 function resyncLine(i) {
   if (i.kind === 'upgraded') {
     return `new version: ${fmtBytes(i.video.from.size)} -> ${fmtBytes(i.video.to.size)} (${i.video.to.file})`;
   }
-  if (i.kind === 'subtitles') {
-    const s = i.subtitles;
-    return ['subtitles:', s.added.length && `${s.added.length} added (${s.added.join(', ')})`,
-      s.changed.length && `${s.changed.length} changed (${s.changed.join(', ')})`,
-      s.removed.length && `${s.removed.length} removed (${s.removed.join(', ')})`].filter(Boolean).join(' ');
-  }
   return (i.reason || i.kind).replace('the NAS', dev());
 }
 
-async function openResync(key, back, title) {
+async function openResync(path) {
   const head = h('div', { class: 'detail-head' }, h('div', {},
-    h('h1', {}, `Re-sync ${title}`),
-    h('div', { class: 'muted small' }, `Compares what is on ${dev()} with Plex: new versions, missing files, subtitles.`)));
-  const backBtn = h('button', { class: 'btn small', onclick: () => openItem(back) }, 'Back');
+    h('h1', {}, `Re-sync ${path ? path.split('/').pop() : `everything on ${dev()}`}`),
+    h('div', { class: 'muted small' }, `Compares the videos on ${dev()} with Plex and fetches their subtitles again.`)));
+  const backBtn = h('button', { class: 'btn small', onclick: closeSheet }, 'Back');
   openSheet(head, h('div', { class: 'spinner' }), h('p', { class: 'muted small' }, 'Checking...'));
   let d;
-  try { d = await post('/api/resync/check', { key }); }
-  catch (e) { return openSheet(head, errorPanel(e, () => openResync(key, back, title)), backBtn); }
-  if (!d.items.length) {
-    return openSheet(head, h('div', { class: 'empty' }, `Everything is up to date (${d.checked} checked).`), backBtn);
+  try { d = await post('/api/resync/check', { path }); }
+  catch (e) { return openSheet(head, errorPanel(e, () => openResync(path)), backBtn); }
+  if (!d.checked && !d.items.length) {
+    return openSheet(head, h('div', { class: 'empty' }, 'Nothing travelarr copied is in this folder.'), backBtn);
   }
   const act = d.items.filter(i => RESYNC_ACT.includes(i.kind));
   const rest = d.items.filter(i => !RESYNC_ACT.includes(i.kind));
@@ -750,22 +729,22 @@ async function openResync(key, back, title) {
   const btn = h('button', { class: 'btn primary' });
   const paint = () => {
     const bytes = act.filter(i => sel.has(i.ratingKey)).reduce((a, i) => a + (i.videoBytes || 0), 0);
-    btn.textContent = sel.size ? `Sync ${sel.size}${bytes ? ` · ${fmtBytes(bytes)} of video` : ''}` : 'Select items to sync';
-    btn.disabled = !sel.size;
+    btn.textContent = `Re-sync${bytes ? ` · ${fmtBytes(bytes)} of video` : ''}`;
+    btn.disabled = !sel.size && !d.unchanged;
   };
   btn.onclick = async () => {
     btn.disabled = true;
     btn.textContent = 'Queuing...';
     try {
-      const r = await post('/api/resync/apply', { key, serverId: d.serverId, ratingKeys: [...sel] });
+      const r = await post('/api/resync/apply', { path, serverId: d.serverId, ratingKeys: [...sel] });
       const parts = [r.upgrades && `${r.upgrades} new version(s)`, r.redownloads && `${r.redownloads} to copy again`,
-        r.refreshes && `${r.refreshes} subtitle update(s)`].filter(Boolean);
+        r.refreshes && `subtitles of ${r.refreshes}`].filter(Boolean);
       toast(parts.length ? `Queued ${parts.join(', ')}${r.videoBytes ? ` · ${fmtBytes(r.videoBytes)}` : ''}`
         : 'Nothing to sync any more');
       if (r.warning) setTimeout(() => toast(r.warning), 3600);
       S.dirty = true;
       refreshState();
-      openItem(back);
+      closeSheet();
     } catch (e) { toast(e.message); paint(); }
   };
   const rows = act.map(i => {
@@ -777,8 +756,11 @@ async function openResync(key, back, title) {
     h('span', { class: 'et' }, h('b', {}, i.label), ` · ${resyncLine(i)}`)));
   paint();
   openSheet(head,
-    h('p', { class: 'muted small' }, `${d.checked} checked · ${act.length} to sync${rest.length ? ` · ${rest.length} not synced` : ''}`),
-    rows, others.length ? [h('h3', {}, 'Not synced'), others] : null,
+    h('p', { class: 'muted small' }, [`${d.checked} checked`, act.length && `${act.length} video(s) to update`,
+      d.unchanged && `${d.unchanged} up to date (Re-sync fetches their subtitles again)`,
+      rest.length && `${rest.length} not synced`].filter(Boolean).join(' · ')),
+    act.length ? rows : h('div', { class: 'empty' }, rest.length ? 'No video needs an update.' : 'Every video is up to date.'),
+    others.length ? [h('h3', {}, 'Not synced'), others] : null,
     h('div', { class: 'sticky-actions' }, btn, backBtn));
 }
 
@@ -1037,7 +1019,9 @@ async function renderFiles() {
   refresh();
   paintMore();
   view.replaceChildren(...[
-    h('div', { class: 'bar' }, crumbs, h('button', { class: 'btn small', onclick: render }, 'Refresh')),
+    h('div', { class: 'bar' }, crumbs,
+      h('button', { class: 'btn small', onclick: () => openResync(path) }, 'Re-sync from Plex'),
+      h('button', { class: 'btn small', onclick: render }, 'Refresh')),
     summary,
     parts.length ? null : h('p', { class: 'muted small' }, 'Library folders cannot be deleted here. Open one to delete what is inside.'),
     list, more,

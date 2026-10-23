@@ -622,14 +622,6 @@ class PlexGateway:
                 out[str(it.ratingKey)] = it
         return out
 
-    def head_length(self, srv: PlexServer, key: str) -> int | None:
-        r = self.session.head(f"{srv._baseurl}{key}", headers={"X-Plex-Token": srv._token},
-                              timeout=(5, 10), allow_redirects=False)
-        if r.status_code != 200:
-            return None
-        v = (r.headers.get("Content-Length") or "").strip()
-        return int(v) if v.isdigit() else None
-
     # -------------------------------------------------------------- download
     def file_request(self, part_key: str, srv: PlexServer | None = None) -> tuple[str, dict]:
         srv = srv or self.server()

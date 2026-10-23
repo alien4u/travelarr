@@ -28,7 +28,7 @@ from .resync import ResyncError
 from .store import Store, now
 from .worker import CHANGED, Downloader
 
-VERSION = "3.0.0"
+VERSION = "3.1.0"
 STATIC = os.path.join(os.path.dirname(__file__), "static")
 LOCAL_NOTE = "deleted in Local Files"
 MAX_QUEUE_KEYS = 200  # bounds the Plex requests one queue call makes
@@ -421,17 +421,12 @@ def create_app(data_dir: str | None = None, media_root: str | None = None,
     # --------------------------------------------------------------- resync
     @app.post("/api/resync/check")
     def resync_check(body: dict = Body(...)):
-        key = str(body.get("key") or "")
-        if not re.fullmatch(r"[0-9]{1,12}", key):
-            return err(400, "key must be a rating key", "bad_request")
-        return resync.check(store, gw, media_root, key)
+        return resync.check(store, gw, media_root, resync.scope_path(body.get("path", "")))
 
     @app.post("/api/resync/apply")
     def resync_apply(body: dict = Body(...)):
-        key = str(body.get("key") or "")
-        if not re.fullmatch(r"[0-9]{1,12}", key):
-            return err(400, "key must be a rating key", "bad_request")
-        out = resync.apply(store, gw, media_root, key, body.get("serverId"), body.get("ratingKeys"))
+        out = resync.apply(store, gw, media_root, resync.scope_path(body.get("path", "")),
+                           body.get("serverId"), body.get("ratingKeys"))
         dl.wake()
         d = disk()
         if d and store.pending_bytes() > d["free"] - dl.reserve_bytes():
