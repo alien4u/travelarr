@@ -388,6 +388,16 @@ class Store:
                 raise
         return retired
 
+    def adopt(self, job: dict, sidecars: list[str]) -> int:
+        """A file on the NAS that no row knows, recorded as a done copy (with its
+        subtitles) so a re-sync can replace it like any other copy."""
+        cols = [f for f in JOB_FIELDS if f in job]
+        cur = self.exec(
+            f"INSERT INTO jobs({','.join(cols)},status,bytes_done,sidecars,note,queued_at,finished_at) "
+            f"VALUES({','.join('?' * len(cols))},'done',?,?,?,?,?)",
+            [job[c] for c in cols] + [job["size"], json.dumps(sidecars), "found on the NAS by a re-sync", now(), now()])
+        return cur.lastrowid
+
     def bind_server(self, job_id: int, server_id: str, guid: str | None) -> bool:
         """Bind a row from before 2.5.0 to a server, only if it still has none."""
         n = self.exec("UPDATE jobs SET server_id=?, guid=COALESCE(guid, ?) WHERE id=? AND server_id IS NULL "

@@ -622,6 +622,10 @@ class PlexGateway:
             chunk = keys[i:i + 100]
             for it in srv.fetchItems("/library/metadata/" + ",".join(chunk)):
                 it._autoReload = False
+                # plexapi gives every item the container's library, the first item's
+                own = it._data.attrib.get("librarySectionID")
+                if own:
+                    it.librarySectionID = int(own)
                 out[str(it.ratingKey)] = it
         return out
 
@@ -629,6 +633,18 @@ class PlexGateway:
     def file_request(self, part_key: str, srv: PlexServer | None = None) -> tuple[str, dict]:
         srv = srv or self.server()
         return f"{srv._baseurl}{part_key}?download=1", {"X-Plex-Token": srv._token}
+
+    def read_range(self, srv: PlexServer, part_key: str, size: int, start: int, length: int) -> bytes | None:
+        """`length` bytes of a Plex file from `start`; None when Plex does not send
+        that range of a file of that size."""
+        url, headers = self.file_request(part_key, srv)
+        headers.update({"Range": f"bytes={start}-{start + length - 1}", "Accept-Encoding": "identity"})
+        with self.session.get(url, headers=headers, stream=True, timeout=(15, 30)) as r:
+            got = (r.headers.get("Content-Range") or "").replace("bytes ", "").replace("/", "-").split("-")
+            if r.status_code != 206 or len(got) != 3 or got[0] != str(start) or got[2] != str(size):
+                return None
+            data = r.raw.read(length, decode_content=False)
+        return data if len(data) == length else None
 
     @staticmethod
     def text_streams(part) -> list[dict]:

@@ -4,6 +4,7 @@ with Range support plus knobs to simulate failures."""
 from __future__ import annotations
 
 import json
+import posixpath
 import re
 import threading
 import time
@@ -152,6 +153,23 @@ class FakePlex:
             "librarySectionID": 2, "viewCount": 1 if e["watched"] else None}) + ">" + \
             self.part_xml(e, full) + "</Video>"
 
+    def folder(self, h, sec: int, parent: str | None):
+        """Plex's folder view: the library folder's subfolders and the videos in it."""
+        root = MOVIES if sec == 1 else TV
+        videos = [(v, v["file"][len(root) + 1:]) for v in (self.movies if sec == 1 else self.episodes)
+                  if v["file"].startswith(root + "/") and not v.get("no_parts")]
+        dirs = sorted({"/".join(r.split("/")[:i]) for _, r in videos for i in range(1, r.count("/") + 1)})
+        ids = {d: str(1000 * sec + n) for n, d in enumerate(dirs)}
+        here = "" if parent is None else next((d for d, i in ids.items() if i == parent), None)
+        if here is None:
+            return self.send(h, 404, b"<html>404</html>", "text/html")
+        body = "".join("<Directory " + attrs({"key": f"/library/sections/{sec}/folder?parent={ids[d]}",
+                                               "title": posixpath.basename(d)}) + "/>"
+                       for d in dirs if posixpath.dirname(d) == here)
+        body += "".join(self.movie_xml(v) if sec == 1 else self.ep_xml(v)
+                        for v, r in videos if posixpath.dirname(r) == here)
+        return self.mc(h, body, librarySectionID=sec)
+
     # ------------------------------------------------------------- routing
     def send(self, h, code, body: bytes, ctype="text/xml;charset=utf-8", extra=None):
         h.send_response(code)
@@ -232,13 +250,17 @@ class FakePlex:
             if q["guid"] == self.show["guid"]:
                 hits.append(self.show_xml())
             return self.mc(h, "".join(hits), size=len(hits))
+        m = re.fullmatch(r"/library/sections/(\d+)/folder", path)
+        if m:
+            return self.folder(h, int(m.group(1)), q.get("parent"))
         m = re.fullmatch(r"/library/metadata/(\d+(?:,\d+)+)", path)
         if m:   # several items in one request, each with its parts and streams
             out = []
             for rk in map(int, m.group(1).split(",")):
                 out += [self.movie_xml(x, full=True) for x in self.movies if x["rk"] == rk]
                 out += [self.ep_xml(e, full=True) for e in self.episodes if e["rk"] == rk]
-            return self.mc(h, "".join(out), size=len(out))
+            first = re.search(r'librarySectionID="(\d+)"', out[0]) if out else None  # as Plex does
+            return self.mc(h, "".join(out), size=len(out), librarySectionID=first and first.group(1))
         m = re.fullmatch(r"/library/metadata/(\d+)(/allLeaves)?", path)
         if m:
             rk, leaves = int(m.group(1)), m.group(2)

@@ -1,31 +1,39 @@
-"""Re-sync: compare the videos copied into a Local Files folder with what Plex has
-now, and queue what changed.
+"""Re-sync: compare the videos in a Local Files folder with the same folder on Plex,
+and queue what changed.
+
+The NAS decides what is compared: every folder in the scope is listed next to Plex's
+folder of the same name (Plex's folder view mirrors the library folders), and videos
+are matched by file name and size. Folders that exist only on Plex are left alone.
 
 A check never changes anything. Apply recomputes the check and acts only on items
-that are still out of date: an upgraded video gets a new job that replaces the old
-copy once it is in place; a missing or damaged copy is copied again; a video Plex
-has that is not on the NAS is copied. Every other copy in the folder gets its
-subtitles fetched again, without touching the video."""
+that are still out of date: a new version replaces the old file once it is in place,
+a video Plex has that is missing from the folder is copied, and every video that is
+up to date gets its subtitles fetched again, without touching the video."""
 from __future__ import annotations
 
 import json
+import logging
 import os
 import posixpath
 import re
 import threading
-from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
 
-from plexapi.exceptions import NotFound
+import requests
 
-from .paths import PathError, abs_path, dest_rel_for, local_rel
-from .worker import _regular_size
+from .paths import SUB_EXT, PathError, abs_path, dest_rel_for, local_rel, safe_name
 
 LOCK = threading.Lock()  # one check or apply at a time; selecting a server waits for it
-ACTIONABLE = ("upgraded", "missing", "absent")
-# a copy that is, or once was, on the NAS: done, re-queued by a re-sync (a mode is
-# set), or removed after it was complete (removed rows keep their size and bytes)
-COPIED = ("(status='done' OR (status IN ('queued','downloading') AND mode IS NOT NULL) "
-          "OR (status='removed' AND size>0 AND bytes_done=size))")
+ACTIONABLE = ("upgraded", "changed", "absent")
+VIDEO_EXT = {".mkv", ".mp4", ".m4v", ".avi", ".mov", ".wmv", ".ts", ".m2ts", ".mts", ".mpg", ".mpeg",
+             ".webm", ".flv", ".vob", ".divx", ".ogm", ".3gp", ".asf", ".iso"}
+EPISODE = re.compile(r"S(\d{1,3})E(\d{1,4})", re.I)
+BUSY = "being copied, or a re-sync of it is unfinished (see the Queue)"
+FAILED = "its copy failed; retry or remove it in the Queue"
+SAMPLE = 64 << 10  # bytes compared at the start and at the end of a file with Plex's name and size
+READERS = 4
+NEW_BYTES = "new version on Plex: same name and size, different content"
+log = logging.getLogger("travelarr.resync")
 
 
 class ResyncError(Exception):
@@ -40,76 +48,6 @@ def _label(row: dict) -> str:
     return f"{row['title']} ({row['year']})" if row.get("year") else row["title"]
 
 
-def _inside(path: str) -> tuple[str, tuple]:
-    """SQL limiting dest_rel to a Local Files folder ('' is the whole media folder)."""
-    if not path:
-        return "", ()
-    return " AND (dest_rel=? OR substr(dest_rel, 1, ?)=?)", (path, len(path) + 1, path + "/")
-
-
-def _scope(store, sid: str, path: str) -> list[dict]:
-    """Copies inside the folder, plus unfinished jobs of the same items so those
-    show as busy."""
-    where, args = _inside(path)
-    return store.rows("SELECT * FROM jobs WHERE status IN ('done','queued','downloading') "
-                      "AND (server_id IS NULL OR server_id=?)" + where, (sid,) + args)
-
-
-def _absent(store, gw, srv, sid: str, media_root: str, path: str) -> list[dict]:
-    """Videos Plex has that are not on the NAS: every episode of a season copied
-    into the folder, and every movie copied into it. A copy deleted since counts,
-    so a deleted video is offered again."""
-    where, args = _inside(path)
-    seeds = store.rows(f"SELECT * FROM jobs WHERE server_id=? AND {COPIED}" + where, (sid,) + args)
-    taken = {r["rating_key"] for r in store.rows(
-        "SELECT rating_key FROM jobs WHERE status IN ('done','queued','downloading','failed') "
-        "AND (server_id IS NULL OR server_id=?)", (sid,))}
-    seasons: dict[str, set] = defaultdict(set)
-    movies: dict[str, dict] = {}
-    for r in seeds:
-        if r["kind"] == "episode" and r["show_key"]:
-            seasons[r["show_key"]].add(r["season"])
-        elif r["kind"] == "movie" and r["rating_key"] not in taken:
-            movies[r["rating_key"]] = r
-    videos = []
-    for key, indexes in seasons.items():
-        try:
-            show = srv.fetchItem(int(key))
-            if show.type != "show":
-                continue
-            sec = gw._section(show.librarySectionID, srv)
-            episodes = show.episodes()
-        except NotFound:
-            continue
-        for ep in episodes:
-            ep._autoReload = False
-            if ep.parentIndex in indexes and str(ep.ratingKey) not in taken:
-                videos.append((ep, sec))
-    plex = gw.batch(srv, list(movies))
-    for rk, r in movies.items():
-        it = plex.get(rk)
-        if it is not None and r["guid"] in (None, getattr(it, "guid", None)):
-            videos.append((it, gw._section(it.librarySectionID, srv)))
-    items = []
-    for v, sec in videos:
-        parts = list(v.iterParts())
-        if len(parts) != 1:
-            continue
-        job = gw.job(v, parts[0], sec, sid, "resync")
-        dest = job["dest_rel"]
-        if path and dest != path and not dest.startswith(path + "/"):
-            continue
-        try:
-            if os.path.lexists(abs_path(media_root, dest)):
-                continue  # something else is in its place
-        except PathError:
-            continue
-        items.append({"ratingKey": job["rating_key"], "title": job["show_title"] or job["title"],
-                      "label": _label(job), "kind": "absent", "reason": "not on the NAS", "video": None,
-                      "videoBytes": job["size"], "_job": job})
-    return items
-
-
 def _same_item(row: dict, it, sid: str, dest: str | None) -> bool:
     if row["server_id"] and row["server_id"] != sid:
         return False
@@ -122,78 +60,6 @@ def _same_item(row: dict, it, sid: str, dest: str | None) -> bool:
     else:
         same = it.title == row["title"] and (row["year"] is None or getattr(it, "year", None) == row["year"])
     return same and dest is not None and posixpath.dirname(dest) == posixpath.dirname(row["dest_rel"])
-
-
-def _busy(store, sid: str, rows_by_rk: dict) -> set[str]:
-    rks = list(rows_by_rk)
-    busy: set[str] = set()
-    for i in range(0, len(rks), 500):
-        chunk = rks[i:i + 500]
-        marks = ",".join("?" * len(chunk))
-        busy |= {r["rating_key"] for r in store.rows(
-            f"SELECT rating_key FROM jobs WHERE status IN ('queued','downloading') AND rating_key IN ({marks}) "
-            "AND (server_id IS NULL OR server_id=?)", chunk + [sid])}
-    ids = {r["id"]: rk for rk, rows in rows_by_rk.items() for r in rows}
-    for u in store.rows("SELECT * FROM jobs WHERE mode='upgrade' AND status IN ('queued','downloading','failed')"):
-        for o in json.loads(u["replaces"] or "[]"):
-            if int(o) in ids and (u["phase"] or u["status"] == "failed"):
-                busy.add(ids[int(o)])
-    return busy
-
-
-def _compute(store, gw, media_root: str, path: str) -> dict:
-    srv, sid = gw.snapshot()
-    if not sid:
-        raise ResyncError(409, "Choose a Plex server first")
-    rows = _scope(store, sid, path)
-    by_rk: dict[str, list[dict]] = defaultdict(list)
-    for r in rows:
-        by_rk[r["rating_key"]].append(r)
-    plex = gw.batch(srv, list(by_rk))
-    busy = _busy(store, sid, by_rk)
-    items = []
-    for rk, rws in by_rk.items():
-        row = rws[0]
-        it = plex.get(rk)
-        item = {"ratingKey": rk, "title": row["show_title"] or row["title"], "label": _label(row),
-                "kind": "unchanged", "reason": None, "video": None, "videoBytes": 0,
-                "_rows": rws, "_item": it}
-        items.append(item)
-        if rk in busy or any(r["status"] != "done" for r in rws):
-            item.update(kind="busy", reason="being copied, or a re-sync of it is unfinished (see the Queue)")
-            continue
-        if it is None:
-            item.update(kind="gone", reason="no longer on Plex; the copy stays")
-            continue
-        parts = list(it.iterParts())
-        sec = gw._section(it.librarySectionID, srv)
-        dests = [dest_rel_for(p.file, sec.locations, sec.title) for p in parts]
-        if not all(_same_item(r, it, sid, dests[0] if dests else None) for r in rws):
-            item.update(kind="mismatch", reason="this copy came from a different item or Plex server")
-            continue
-        if not parts:
-            item.update(kind="unavailable", reason="Plex has no file for it right now")
-            continue
-        if len(parts) > 1 or len(rws) > 1:
-            item.update(kind="multipart", reason="videos split into several files are not re-synced; "
-                                                 "remove and copy again")
-            continue
-        p, dest = parts[0], dests[0]
-        item["_part"], item["_dest"] = p, dest
-        if p.id != row["part_id"] or dest != row["dest_rel"] or (p.size or 0) != row["size"]:
-            item.update(kind="upgraded", videoBytes=p.size or 0, video={
-                "from": {"file": posixpath.basename(row["dest_rel"]), "size": row["size"]},
-                "to": {"file": posixpath.basename(dest), "size": p.size or 0}})
-            continue
-        try:
-            here = _regular_size(abs_path(media_root, row["dest_rel"]))
-        except PathError:
-            here = None
-        if here != row["size"]:
-            item.update(kind="missing", videoBytes=row["size"], reason="missing on the NAS" if here is None
-                        else "the file on the NAS has the wrong size")
-    items += _absent(store, gw, srv, sid, media_root, path)
-    return {"serverId": sid, "srv": srv, "items": items, "checked": sum(1 for r in rows if r["status"] == "done")}
 
 
 def bind_legacy(store, gw, rows: list[dict], expected_sid: str) -> set[int]:
@@ -219,6 +85,229 @@ def bind_legacy(store, gw, rows: list[dict], expected_sid: str) -> set[int]:
     return ok
 
 
+# ------------------------------------------------------------------ the NAS
+def _nas_dir(media_root: str, rel: str) -> tuple[dict[str, int], list[str]] | None:
+    """Videos (name -> size) and subfolders of a NAS folder; None for a folder
+    that is missing or reached through a link."""
+    root = os.path.realpath(media_root)
+    full = os.path.join(root, *rel.split("/")) if rel else root
+    if os.path.realpath(full) != full or not os.path.isdir(full):
+        return None
+    files: dict[str, int] = {}
+    dirs: list[str] = []
+    with os.scandir(full) as it:
+        for e in it:
+            if e.name.startswith("."):
+                continue
+            if e.is_dir(follow_symlinks=False):
+                dirs.append(e.name)
+            elif e.is_file(follow_symlinks=False) and posixpath.splitext(e.name)[1].lower() in VIDEO_EXT:
+                files[e.name] = e.stat(follow_symlinks=False).st_size
+    return files, sorted(dirs)
+
+
+def _sidecars(media_root: str, video_rel: str) -> list[str]:
+    """Subtitle files next to a video that carry its name: 'Movie.mkv' -> 'Movie.en.srt'."""
+    folder, stem = posixpath.split(posixpath.splitext(video_rel)[0])
+    names = os.listdir(os.path.join(os.path.realpath(media_root), *folder.split("/")))
+    exts = {"." + e for e in SUB_EXT.values()}
+    return sorted(posixpath.join(folder, n) for n in names
+                  if n.startswith(stem + ".") and posixpath.splitext(n)[1].lower() in exts)
+
+
+# ------------------------------------------------------------------ Plex
+def _libraries(srv) -> dict[str, tuple]:
+    """NAS library folder name -> (section, key of its Plex folder view), the same
+    name the copies are placed under (see `dest_rel_for`)."""
+    out = {}
+    for sec in srv.library.sections():
+        locs = [x.replace("\\", "/").rstrip("/") for x in sec.locations]
+        if sec.type in ("movie", "show") and len(locs) == 1:
+            out[posixpath.basename(locs[0]) or safe_name(sec.title)] = (sec, f"/library/sections/{sec.key}/folder")
+    return out
+
+
+def _plex_dir(srv, key: str | None) -> tuple[list, dict[str, str]]:
+    """Videos and subfolders (name -> key) of a folder in Plex's folder view."""
+    if key is None:
+        return [], {}
+    data = srv.query(key)
+    dirs = {e.attrib["title"]: e.attrib["key"] for e in data
+            if e.tag == "Directory" and e.attrib.get("title") and e.attrib.get("key")}
+    videos = [v for v in srv.findItems(data, initpath=key) if getattr(v, "type", None) in ("movie", "episode")]
+    for v in videos:
+        v._autoReload = False
+    return videos, dirs
+
+
+# ------------------------------------------------------------------ compare
+def _item(kind: str, path: str, job: dict | None = None, **fields) -> dict:
+    return {"ratingKey": job["rating_key"] if job else None,
+            "title": (job["show_title"] or job["title"]) if job else posixpath.basename(path),
+            "label": _label(job) if job else posixpath.basename(path),
+            "kind": kind, "reason": None, "video": None, "videoBytes": 0, "watched": False, "path": path,
+            "_job": job, **fields}
+
+
+def _folder(rel: str, files: dict[str, int], videos: list, sec, sid: str, gw, root: bool) -> list[dict]:
+    """Compare one NAS folder with its Plex folder. `root` is a library folder,
+    where only what is on the NAS is compared (Plex has every title there)."""
+    out, plex = [], []
+    claimed: set[str] = set()
+    for v in videos:
+        parts = list(v.iterParts())
+        names = {posixpath.basename((p.file or "").replace("\\", "/")) for p in parts}
+        if len(parts) != 1:
+            here = sorted(names & set(files))
+            claimed |= names
+            if here:
+                out.append(_item("multipart", f"{rel}/{here[0]}", reason="videos split into several files "
+                                                                         "are not re-synced"))
+            continue
+        job = gw.job(v, parts[0], sec, sid, "resync")
+        if posixpath.dirname(job["dest_rel"]) == rel:
+            plex.append((v, job))
+    waiting = []
+    for v, job in plex:  # the same name: up to date, or a new version of the same file
+        name = posixpath.basename(job["dest_rel"])
+        if name not in files:
+            waiting.append((v, job))
+            continue
+        claimed.add(name)
+        if files[name] == job["size"]:
+            out.append(_item("unchanged", job["dest_rel"], job))
+        else:
+            out.append(_item("changed", job["dest_rel"], job, videoBytes=job["size"], video={
+                "from": {"file": name, "size": files[name]}, "to": {"file": name, "size": job["size"]}}))
+    for v, job in waiting:  # a new name: the old file is the same episode, or the movie folder's only video
+        free = [n for n in files if n not in claimed]
+        if job["kind"] == "episode":
+            same = [n for n in free if (m := EPISODE.search(n))
+                    and (int(m.group(1)), int(m.group(2))) == (job["season"], job["episode"])]
+        else:
+            same = free if not root and len(waiting) == 1 else []
+        if len(same) == 1:
+            old = same[0]
+            claimed.add(old)
+            out.append(_item("upgraded", job["dest_rel"], job, videoBytes=job["size"], _old=f"{rel}/{old}", video={
+                "from": {"file": old, "size": files[old]},
+                "to": {"file": posixpath.basename(job["dest_rel"]), "size": job["size"]}}))
+        elif not root:
+            out.append(_item("absent", job["dest_rel"], job, videoBytes=job["size"], reason="not on the NAS",
+                             watched=bool(getattr(v, "isWatched", False))))
+    for name in sorted(set(files) - claimed):
+        out.append(_item("notonplex", f"{rel}/{name}", reason="not on Plex; the file stays"))
+    return out
+
+
+def _same_bytes(gw, srv, media_root: str, job: dict) -> bool | None:
+    """The first and last SAMPLE bytes of the NAS file against Plex's; None when
+    Plex's could not be read."""
+    size = job["size"]
+    n = min(SAMPLE, size)
+    try:
+        with open(os.path.join(os.path.realpath(media_root), *job["dest_rel"].split("/")), "rb") as fh:
+            for start in sorted({0, size - n}):
+                fh.seek(start)
+                theirs = gw.read_range(srv, job["part_key"], size, start, n)
+                if theirs is None:
+                    return None
+                if theirs != fh.read(n):
+                    return False
+    except (OSError, requests.RequestException) as e:
+        log.warning("re-sync could not compare %s: %s", job["dest_rel"], e)
+        return None
+    return True
+
+
+def _verify(gw, srv, media_root: str, items: list[dict], only: set | None) -> None:
+    """Videos with Plex's name and size whose bytes differ are a new version."""
+    todo = [i for i in items if i["kind"] == "unchanged" and i["_job"]["size"]
+            and (only is None or i["ratingKey"] in only)]
+    with ThreadPoolExecutor(READERS) as pool:
+        for i, same in zip(todo, pool.map(lambda i: _same_bytes(gw, srv, media_root, i["_job"]), todo)):
+            if same is False:
+                i.update(kind="changed", reason=NEW_BYTES, videoBytes=i["_job"]["size"])
+            elif same is None:
+                i["_unverified"] = True
+
+
+def _compute(store, gw, media_root: str, path: str, only: set | None = None) -> dict:
+    """`only`: the rating keys whose bytes are compared (all when None)."""
+    srv, sid = gw.snapshot()
+    if not sid:
+        raise ResyncError(409, "Choose a Plex server first")
+    libs = _libraries(srv)
+    parts = path.split("/") if path else []
+    if parts:
+        tops = [parts[0]] if parts[0] in libs else []
+    else:
+        tops = [n for n in (_nas_dir(media_root, "") or ({}, []))[1] if n in libs]
+    items: list[dict] = []
+    checked = 0
+
+    def walk(rel: str, key: str | None, sec, root: bool) -> None:
+        nonlocal checked
+        nas = _nas_dir(media_root, rel)
+        if nas is None:  # only on Plex: never copied, or deleted on purpose
+            return
+        files, subdirs = nas
+        videos, pdirs = _plex_dir(srv, key)
+        checked += len(files)
+        items.extend(_folder(rel, files, videos, sec, sid, gw, root))
+        for d in subdirs:
+            walk(f"{rel}/{d}", pdirs.get(d), sec, False)
+
+    for top in tops:
+        sec, key = libs[top]
+        rel = top
+        for name in parts[1:]:  # Plex's folder for the scope, one level at a time
+            key = _plex_dir(srv, key)[1].get(name)
+            rel = f"{rel}/{name}"
+        walk(rel, key, sec, rel == top)
+    _rows(store, sid, media_root, items)
+    _verify(gw, srv, media_root, items, only)
+    return {"serverId": sid, "items": items, "checked": checked}
+
+
+def _rows(store, sid: str, media_root: str, items: list[dict]) -> None:
+    """The done rows of each item's files (`_row`, `_oldrow`, and `_stale`: the row
+    of the same Plex file at a path whose video is gone). Items with an unfinished
+    or failed job are left to the Queue."""
+    rows = store.rows("SELECT * FROM jobs WHERE status='done'")
+    done = {r["dest_rel"]: r for r in rows}
+    by_part = {r["part_id"]: r for r in rows if not r["server_id"] or r["server_id"] == sid}
+    active, failed, locked = set(), set(), set()
+    for r in store.rows("SELECT * FROM jobs WHERE status IN ('queued','downloading','failed')"):
+        mine = not r["server_id"] or r["server_id"] == sid
+        if r["status"] != "failed":
+            active |= {r["dest_rel"]} | ({("rk", r["rating_key"])} if mine else set())
+        else:
+            failed |= {r["dest_rel"]} | ({("rk", r["rating_key"])} if mine else set())
+        if r["mode"] == "upgrade" and (r["phase"] or r["status"] == "failed"):
+            locked |= {int(o) for o in json.loads(r["replaces"] or "[]")}
+    for i in items:
+        if not i["ratingKey"]:
+            continue
+        paths = {i["path"]} | ({i["_old"]} if i.get("_old") else set())
+        mine = [done[p] for p in paths if p in done]
+        i["_row"] = done.get(i["path"])
+        i["_oldrow"] = done.get(i.get("_old"))
+        stale = by_part.get(i["_job"]["part_id"])
+        i["_stale"] = stale if i["kind"] == "absent" and stale and not _exists(media_root, stale["dest_rel"]) else None
+        if paths & active or ("rk", i["ratingKey"]) in active or any(r["id"] in locked for r in mine):
+            i.update(kind="busy", reason=BUSY)
+        elif paths & failed or ("rk", i["ratingKey"]) in failed:
+            i.update(kind="busy", reason=FAILED)
+
+
+def _exists(media_root: str, rel: str) -> bool:
+    try:
+        return os.path.lexists(abs_path(media_root, rel))
+    except PathError:
+        return True
+
+
 def _public(item: dict) -> dict:
     return {k: v for k, v in item.items() if not k.startswith("_")}
 
@@ -241,12 +330,17 @@ def check(store, gw, media_root: str, path: str) -> dict:
         LOCK.release()
     return {"serverId": d["serverId"], "checked": d["checked"],
             "unchanged": sum(1 for i in d["items"] if i["kind"] == "unchanged"),
+            "unverified": sum(1 for i in d["items"] if i.get("_unverified")),
             "items": [_public(i) for i in d["items"] if i["kind"] != "unchanged"]}
 
 
+CURRENT = ("rating_key", "show_key", "title", "show_title", "season", "episode", "year", "part_id", "part_key",
+           "size", "server_id", "guid")
+
+
 def apply(store, gw, media_root: str, path: str, server_id, rating_keys) -> dict:
-    """rating_keys are the out-of-date items to update; every unchanged copy in
-    the folder gets its subtitles fetched again."""
+    """rating_keys are the out-of-date items to update; every video in the folder
+    that is up to date gets its subtitles fetched again."""
     if not (isinstance(rating_keys, list)
             and all(isinstance(k, str) and re.fullmatch(r"[0-9]{1,12}", k) for k in rating_keys)
             and len(set(rating_keys)) == len(rating_keys)):
@@ -254,16 +348,15 @@ def apply(store, gw, media_root: str, path: str, server_id, rating_keys) -> dict
     if not LOCK.acquire(blocking=False):
         raise ResyncError(409, "A re-sync check is already running")
     try:
-        d = _compute(store, gw, media_root, path)
+        d = _compute(store, gw, media_root, path, set(rating_keys))  # bytes compared again only for the ticked
         if server_id != d["serverId"]:
             raise ResyncError(409, "The Plex server changed since the check; check again")
-        by_rk = {i["ratingKey"]: i for i in d["items"]}
+        by_rk = {i["ratingKey"]: i for i in d["items"] if i["ratingKey"]}
         outside = [k for k in rating_keys if k not in by_rk]
         if outside:
             raise ResyncError(400, f"Not part of this re-sync: {', '.join(outside[:5])}")
         out = {"upgrades": 0, "redownloads": 0, "copies": 0, "refreshes": 0, "videoBytes": 0, "skipped": 0,
                "warning": None}
-        sid = d["serverId"]
         picked = set(rating_keys)
         for rk, item in by_rk.items():
             if rk not in picked and item["kind"] != "unchanged":
@@ -271,38 +364,50 @@ def apply(store, gw, media_root: str, path: str, server_id, rating_keys) -> dict
             if item["kind"] not in ACTIONABLE + ("unchanged",):
                 out["skipped"] += 1
                 continue
-            if item["kind"] == "absent":
-                added, _ = store.add_jobs([item["_job"]])
-                out["copies" if added else "skipped"] += 1
-                out["videoBytes"] += item["videoBytes"] if added else 0
-                continue
-            row, it = item["_rows"][0], item["_item"]
-            if not row["server_id"] or not row["guid"]:  # a verified copy from before 2.5.0
-                store.update(row["id"], server_id=row["server_id"] or sid,
-                             guid=row["guid"] or getattr(it, "guid", None))
-            if item["kind"] == "upgraded":
-                p = item["_part"]
-                job = {k: row[k] for k in ("rating_key", "show_key", "kind", "show_title", "season", "episode", "year")}
-                job.update(title=it.title, part_id=p.id, part_key=p.key, size=p.size or 0, dest_rel=item["_dest"],
-                           source="resync", server_id=sid, guid=getattr(it, "guid", None), mode="upgrade",
-                           replaces=json.dumps([row["id"]]))
-                added, _ = store.add_jobs([job])
-                if added:
-                    out["upgrades"] += 1
-                    out["videoBytes"] += p.size or 0
-                else:
-                    out["skipped"] += 1
-            elif item["kind"] == "missing":
-                ok = store.transition(row["id"], lambda r: r["status"] == "done", status="queued",
-                                      mode="redownload", bytes_done=0, validator=None,
-                                      note="re-sync: copying again")
-                out["redownloads" if ok else "skipped"] += 1
-                if ok:
-                    out["videoBytes"] += row["size"]
-            else:
-                ok = store.transition(row["id"], lambda r: r["status"] == "done", status="queued",
-                                      mode="refresh", note="re-sync: subtitles")
-                out["refreshes" if ok else "skipped"] += 1
+            key = _act(store, media_root, item)
+            out[key or "skipped"] += 1
+            if key and key != "refreshes":
+                out["videoBytes"] += item["videoBytes"]
         return out
     finally:
         LOCK.release()
+
+
+def _adopt(store, media_root: str, job: dict, rel: str, current: bool) -> dict:
+    """A file travelarr never copied, recorded with its subtitles as a done copy so
+    it is refreshed or replaced like any other. `current`: it is Plex's file."""
+    fields = {**job, "dest_rel": rel}
+    if not current:
+        size = os.path.getsize(os.path.join(os.path.realpath(media_root), *rel.split("/")))
+        fields.update(part_id=0, part_key="", size=size)
+    fields["id"] = store.adopt(fields, _sidecars(media_root, rel))
+    return fields
+
+
+def _act(store, media_root: str, item: dict) -> str | None:
+    """Queue one item; returns the counter it adds to, None when it was skipped."""
+    job, kind = item["_job"], item["kind"]
+    current = {k: job[k] for k in CURRENT}
+    done = lambda r: r["status"] == "done"  # noqa: E731
+    if kind == "absent":
+        row = item["_row"] or item["_stale"]
+        if row is None:
+            return "copies" if store.add_jobs([job])[0] else None
+        # travelarr's copy is gone: the same row copies Plex's file again, at Plex's path
+        ok = store.transition(row["id"], done, status="queued", mode="redownload", bytes_done=0, validator=None,
+                              note="re-sync: copying again", dest_rel=job["dest_rel"], **current)
+        return "redownloads" if ok else None
+    if kind == "upgraded":
+        old = item["_oldrow"] or _adopt(store, media_root, job, item["_old"], False)
+    else:
+        old = item["_row"] or _adopt(store, media_root, job, job["dest_rel"], kind == "unchanged")
+    if kind == "unchanged":
+        ok = store.transition(old["id"], done, status="queued", mode="refresh", note="re-sync: subtitles", **current)
+        return "refreshes" if ok else None
+    if kind == "changed" and (old["part_id"], old["size"]) == (job["part_id"], job["size"]):
+        # travelarr's copy of Plex's current file is damaged: the same row copies it again
+        ok = store.transition(old["id"], done, status="queued", mode="redownload", bytes_done=0, validator=None,
+                              note="re-sync: copying again", **current)
+        return "redownloads" if ok else None
+    added, _ = store.add_jobs([{**job, "mode": "upgrade", "replaces": json.dumps([old["id"]])}])
+    return "upgrades" if added else None

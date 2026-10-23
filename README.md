@@ -27,10 +27,11 @@ travel NAS.
   before you start.
 - **Select** in Movies, TV Shows and Watchlist to pick many titles at once (shift-click for a range) and copy them in
   one go; selected shows copy their unwatched or all episodes.
-- **Re-sync from Plex** in Local Files, for everything on the NAS or one folder: picks up videos upgraded by
-  Radarr/Sonarr, copies missing files again, copies the episodes Plex has that are missing from a season you copied
-  (and movies you deleted), and fetches every copy's subtitles again (Lingarr). It shows which videos changed before
-  anything is downloaded, and an old copy is only replaced once the new file is in place.
+- **Re-sync from Plex** in Local Files, for everything on the NAS or one folder: compares each folder on the NAS
+  with the same folder on Plex, however the files got there. It picks up videos upgraded by Radarr/Sonarr, copies
+  the episodes missing from a season folder (watched ones are listed but not ticked), lists videos Plex no longer
+  has without deleting them, and fetches every video's subtitles again (Lingarr). It shows what changed before
+  anything is downloaded, and an old file is only replaced once the new one is in place.
 - Original files only, plus the external subtitles Plex knows about (`Movie.es.srt`, `Movie.en.forced.srt`).
   Subtitles inside the file come along automatically.
 - Same folder layout as your home library (`Movies/...`, `TV-Shows/...`).
@@ -138,8 +139,8 @@ Fill the NAS at home if you can: copying over your own network is much faster th
 - A file that is already on the NAS with the same name and size is added to the History instead of being copied
   again.
 - Image-based subtitles stored as separate files (PGS, VobSub) are skipped and noted in the History.
-- Re-sync spots a new video version by its Plex file, name and size (Plex offers no checksums), and covers only
-  what travelarr copied, plus the other episodes of those seasons.
+- Re-sync spots a new video version by its file name, size and first and last 64 KB (Plex offers no checksums), and
+  only looks at folders that are on the NAS: a season or movie folder you deleted is not offered again.
 
 ## Support
 

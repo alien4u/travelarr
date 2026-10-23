@@ -702,13 +702,14 @@ function showBody(d) {
 }
 
 /* ----------------------------------------------------------------- resync */
-const RESYNC_ACT = ['upgraded', 'missing', 'absent'];
+const RESYNC_ACT = ['upgraded', 'changed', 'absent'];
 
 function resyncLine(i) {
-  if (i.kind === 'upgraded') {
-    return `new version: ${fmtBytes(i.video.from.size)} -> ${fmtBytes(i.video.to.size)} (${i.video.to.file})`;
+  if (i.video) {
+    const name = i.kind === 'upgraded' ? ` (${i.video.to.file})` : '';
+    return `new version: ${fmtBytes(i.video.from.size)} -> ${fmtBytes(i.video.to.size)}${name}`;
   }
-  return (i.reason || i.kind).replace('the NAS', dev());
+  return (i.reason || i.kind).replace('the NAS', dev()) + (i.watched ? ' · watched' : '');
 }
 
 async function openResync(path) {
@@ -721,11 +722,11 @@ async function openResync(path) {
   try { d = await post('/api/resync/check', { path }); }
   catch (e) { return openSheet(head, errorPanel(e, () => openResync(path)), backBtn); }
   if (!d.checked && !d.items.length) {
-    return openSheet(head, h('div', { class: 'empty' }, 'Nothing travelarr copied is in this folder.'), backBtn);
+    return openSheet(head, h('div', { class: 'empty' }, 'No videos from Plex in this folder.'), backBtn);
   }
   const act = d.items.filter(i => RESYNC_ACT.includes(i.kind));
   const rest = d.items.filter(i => !RESYNC_ACT.includes(i.kind));
-  const sel = new Set(act.map(i => i.ratingKey));
+  const sel = new Set(act.filter(i => !(i.kind === 'absent' && i.watched)).map(i => i.ratingKey));
   const btn = h('button', { class: 'btn primary' });
   const paint = () => {
     const bytes = act.filter(i => sel.has(i.ratingKey)).reduce((a, i) => a + (i.videoBytes || 0), 0);
@@ -748,7 +749,7 @@ async function openResync(path) {
     } catch (e) { toast(e.message); paint(); }
   };
   const rows = act.map(i => {
-    const cb = h('input', { type: 'checkbox', checked: true });
+    const cb = h('input', { type: 'checkbox', checked: sel.has(i.ratingKey) });
     cb.onchange = () => { cb.checked ? sel.add(i.ratingKey) : sel.delete(i.ratingKey); paint(); };
     return h('label', { class: 'ep rs' }, cb, h('span', { class: 'et' }, h('b', {}, i.label), ` · ${resyncLine(i)}`));
   });
@@ -758,6 +759,7 @@ async function openResync(path) {
   openSheet(head,
     h('p', { class: 'muted small' }, [`${d.checked} checked`, act.length && `${act.length} video(s) to update`,
       d.unchanged && `${d.unchanged} up to date (Re-sync fetches their subtitles again)`,
+      d.unverified && `${d.unverified} matched by name and size only (Plex did not send their bytes)`,
       rest.length && `${rest.length} not synced`].filter(Boolean).join(' · ')),
     act.length ? rows : h('div', { class: 'empty' }, rest.length ? 'No video needs an update.' : 'Every video is up to date.'),
     others.length ? [h('h3', {}, 'Not synced'), others] : null,
