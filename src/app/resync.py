@@ -3,21 +3,29 @@ now, and queue what changed.
 
 A check never changes anything. Apply recomputes the check and acts only on items
 that are still out of date: an upgraded video gets a new job that replaces the old
-copy once it is in place; a missing or damaged copy is copied again. Every other
-copy in the folder gets its subtitles fetched again, without touching the video."""
+copy once it is in place; a missing or damaged copy is copied again; a video Plex
+has that is not on the NAS is copied. Every other copy in the folder gets its
+subtitles fetched again, without touching the video."""
 from __future__ import annotations
 
 import json
+import os
 import posixpath
 import re
 import threading
 from collections import defaultdict
 
+from plexapi.exceptions import NotFound
+
 from .paths import PathError, abs_path, dest_rel_for, local_rel
 from .worker import _regular_size
 
 LOCK = threading.Lock()  # one check or apply at a time; selecting a server waits for it
-ACTIONABLE = ("upgraded", "missing")
+ACTIONABLE = ("upgraded", "missing", "absent")
+# a copy that is, or once was, on the NAS: done, re-queued by a re-sync (a mode is
+# set), or removed after it was complete (removed rows keep their size and bytes)
+COPIED = ("(status='done' OR (status IN ('queued','downloading') AND mode IS NOT NULL) "
+          "OR (status='removed' AND size>0 AND bytes_done=size))")
 
 
 class ResyncError(Exception):
@@ -32,14 +40,74 @@ def _label(row: dict) -> str:
     return f"{row['title']} ({row['year']})" if row.get("year") else row["title"]
 
 
-def _scope(store, sid: str, path: str) -> list[dict]:
-    """Copies inside a Local Files folder ('' is the whole media folder), plus
-    unfinished jobs of the same items so those show as busy."""
-    sql = ("SELECT * FROM jobs WHERE status IN ('done','queued','downloading') "
-           "AND (server_id IS NULL OR server_id=?)")
+def _inside(path: str) -> tuple[str, tuple]:
+    """SQL limiting dest_rel to a Local Files folder ('' is the whole media folder)."""
     if not path:
-        return store.rows(sql, (sid,))
-    return store.rows(sql + " AND (dest_rel=? OR substr(dest_rel, 1, ?)=?)", (sid, path, len(path) + 1, path + "/"))
+        return "", ()
+    return " AND (dest_rel=? OR substr(dest_rel, 1, ?)=?)", (path, len(path) + 1, path + "/")
+
+
+def _scope(store, sid: str, path: str) -> list[dict]:
+    """Copies inside the folder, plus unfinished jobs of the same items so those
+    show as busy."""
+    where, args = _inside(path)
+    return store.rows("SELECT * FROM jobs WHERE status IN ('done','queued','downloading') "
+                      "AND (server_id IS NULL OR server_id=?)" + where, (sid,) + args)
+
+
+def _absent(store, gw, srv, sid: str, media_root: str, path: str) -> list[dict]:
+    """Videos Plex has that are not on the NAS: every episode of a season copied
+    into the folder, and every movie copied into it. A copy deleted since counts,
+    so a deleted video is offered again."""
+    where, args = _inside(path)
+    seeds = store.rows(f"SELECT * FROM jobs WHERE server_id=? AND {COPIED}" + where, (sid,) + args)
+    taken = {r["rating_key"] for r in store.rows(
+        "SELECT rating_key FROM jobs WHERE status IN ('done','queued','downloading','failed') "
+        "AND (server_id IS NULL OR server_id=?)", (sid,))}
+    seasons: dict[str, set] = defaultdict(set)
+    movies: dict[str, dict] = {}
+    for r in seeds:
+        if r["kind"] == "episode" and r["show_key"]:
+            seasons[r["show_key"]].add(r["season"])
+        elif r["kind"] == "movie" and r["rating_key"] not in taken:
+            movies[r["rating_key"]] = r
+    videos = []
+    for key, indexes in seasons.items():
+        try:
+            show = srv.fetchItem(int(key))
+            if show.type != "show":
+                continue
+            sec = gw._section(show.librarySectionID, srv)
+            episodes = show.episodes()
+        except NotFound:
+            continue
+        for ep in episodes:
+            ep._autoReload = False
+            if ep.parentIndex in indexes and str(ep.ratingKey) not in taken:
+                videos.append((ep, sec))
+    plex = gw.batch(srv, list(movies))
+    for rk, r in movies.items():
+        it = plex.get(rk)
+        if it is not None and r["guid"] in (None, getattr(it, "guid", None)):
+            videos.append((it, gw._section(it.librarySectionID, srv)))
+    items = []
+    for v, sec in videos:
+        parts = list(v.iterParts())
+        if len(parts) != 1:
+            continue
+        job = gw.job(v, parts[0], sec, sid, "resync")
+        dest = job["dest_rel"]
+        if path and dest != path and not dest.startswith(path + "/"):
+            continue
+        try:
+            if os.path.lexists(abs_path(media_root, dest)):
+                continue  # something else is in its place
+        except PathError:
+            continue
+        items.append({"ratingKey": job["rating_key"], "title": job["show_title"] or job["title"],
+                      "label": _label(job), "kind": "absent", "reason": "not on the NAS", "video": None,
+                      "videoBytes": job["size"], "_job": job})
+    return items
 
 
 def _same_item(row: dict, it, sid: str, dest: str | None) -> bool:
@@ -124,6 +192,7 @@ def _compute(store, gw, media_root: str, path: str) -> dict:
         if here != row["size"]:
             item.update(kind="missing", videoBytes=row["size"], reason="missing on the NAS" if here is None
                         else "the file on the NAS has the wrong size")
+    items += _absent(store, gw, srv, sid, media_root, path)
     return {"serverId": sid, "srv": srv, "items": items, "checked": sum(1 for r in rows if r["status"] == "done")}
 
 
@@ -192,7 +261,8 @@ def apply(store, gw, media_root: str, path: str, server_id, rating_keys) -> dict
         outside = [k for k in rating_keys if k not in by_rk]
         if outside:
             raise ResyncError(400, f"Not part of this re-sync: {', '.join(outside[:5])}")
-        out = {"upgrades": 0, "redownloads": 0, "refreshes": 0, "videoBytes": 0, "skipped": 0, "warning": None}
+        out = {"upgrades": 0, "redownloads": 0, "copies": 0, "refreshes": 0, "videoBytes": 0, "skipped": 0,
+               "warning": None}
         sid = d["serverId"]
         picked = set(rating_keys)
         for rk, item in by_rk.items():
@@ -200,6 +270,11 @@ def apply(store, gw, media_root: str, path: str, server_id, rating_keys) -> dict
                 continue
             if item["kind"] not in ACTIONABLE + ("unchanged",):
                 out["skipped"] += 1
+                continue
+            if item["kind"] == "absent":
+                added, _ = store.add_jobs([item["_job"]])
+                out["copies" if added else "skipped"] += 1
+                out["videoBytes"] += item["videoBytes"] if added else 0
                 continue
             row, it = item["_rows"][0], item["_item"]
             if not row["server_id"] or not row["guid"]:  # a verified copy from before 2.5.0

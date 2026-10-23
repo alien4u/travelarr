@@ -1701,6 +1701,58 @@ class ResyncTest(PlexFixture):
         self.assertEqual(self.kinds(""), {"102": "upgraded"})
         self.assertEqual(self.row("201")["note"], "re-synced: subtitles")
 
+    def test_what_plex_has_and_the_nas_does_not(self):
+        self.copy("201")
+        self.assertEqual(self.kinds(self.S01), {"202": "absent"})        # never copied, same season
+        for path in ("", "TV-Shows", self.SHOW):
+            self.assertEqual(self.kinds(path), {"202": "absent"}, path)  # Season 02 was never copied
+        self.assertEqual(self.check(self.S02)["items"], [])
+        item = self.check(self.S01)["items"][0]
+        self.assertEqual((item["label"], item["reason"], item["videoBytes"]),
+                         ("Show A S01E02 Second", "not on the NAS", 90_000))
+        # deleted in Local Files: offered again, the movie too
+        self.copy("103")
+        self.c.post("/api/files/delete", json={"paths": ["TV-Shows/Show A/Season 01/Show A - S01E01 - Pilot.mkv",
+                                                         self.HEATHERS_DIR]})
+        self.assertEqual(self.row("201", "removed")["note"], main_mod.LOCAL_NOTE)
+        self.assertEqual(self.kinds(""), {"201": "absent", "202": "absent", "103": "absent"})
+        self.assertEqual(self.kinds(self.HEATHERS_DIR), {"103": "absent"})
+        self.assertEqual(self.kinds(self.HEAT_DIR), {})
+        # something else in its place is left alone
+        other = self.m("TV-Shows/Show A/Season 01/Show A - S01E02 - Second.mkv")
+        with open(other, "wb") as fh:
+            fh.write(b"x")
+        self.assertEqual(self.kinds(self.S01), {"201": "absent"})
+        os.remove(other)
+        # only the ticked ones are copied
+        r = self.apply("", "201", "202").json()
+        self.assertEqual((r["copies"], r["videoBytes"], r["skipped"]), (2, 170_000, 0))
+        self.drain()
+        for rk, pid in (("201", 2001), ("202", 2002)):
+            self.assertEqual(self.read(self.row(rk)["dest_rel"]), self.fake.parts[pid])
+        self.assertEqual(self.kinds(""), {"103": "absent"})
+        r = self.apply(self.HEATHERS_DIR, "103").json()
+        self.assertEqual(r["copies"], 1)
+        self.drain()
+        self.assertEqual(self.kinds(""), {})
+
+    def test_absent_skips_failed_jobs_and_other_servers(self):
+        self.copy("201")
+        row = self.row("201")
+        self.store.update(row["id"], server_id="srv2")
+        self.assertEqual(self.kinds(self.S01), {})           # the season was copied from another server
+        self.store.update(row["id"], server_id="srv1")
+        self.c.post("/api/queue", json={"keys": ["202"], "mode": "all"})
+        failed = self.row("202", "queued")
+        self.store.update(failed["id"], status="failed", error="boom")
+        self.assertEqual(self.kinds(self.S01), {})           # retried from the Queue instead
+        os.remove(self.m(row["dest_rel"]))
+        self.store.update(row["id"], status="removed")
+        self.store.update(failed["id"], status="queued", error=None)
+        self.assertEqual(self.kinds(self.S01), {"201": "absent", "202": "busy"})
+        self.store.update(row["id"], status="cancelled")
+        self.assertEqual(self.kinds(self.S01), {"202": "busy"})   # only a queued episode: not a copied season
+
     def test_upgrade_with_a_new_file_name(self):
         self.copy("101")
         old = self.row("101")

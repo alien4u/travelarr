@@ -702,7 +702,7 @@ function showBody(d) {
 }
 
 /* ----------------------------------------------------------------- resync */
-const RESYNC_ACT = ['upgraded', 'missing'];
+const RESYNC_ACT = ['upgraded', 'missing', 'absent'];
 
 function resyncLine(i) {
   if (i.kind === 'upgraded') {
@@ -738,7 +738,7 @@ async function openResync(path) {
     try {
       const r = await post('/api/resync/apply', { path, serverId: d.serverId, ratingKeys: [...sel] });
       const parts = [r.upgrades && `${r.upgrades} new version(s)`, r.redownloads && `${r.redownloads} to copy again`,
-        r.refreshes && `subtitles of ${r.refreshes}`].filter(Boolean);
+        r.copies && `${r.copies} to copy`, r.refreshes && `subtitles of ${r.refreshes}`].filter(Boolean);
       toast(parts.length ? `Queued ${parts.join(', ')}${r.videoBytes ? ` · ${fmtBytes(r.videoBytes)}` : ''}`
         : 'Nothing to sync any more');
       if (r.warning) setTimeout(() => toast(r.warning), 3600);

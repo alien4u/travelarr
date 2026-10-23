@@ -591,26 +591,29 @@ class PlexGateway:
                     videos = [v for v in videos if not v.isWatched]
             else:
                 continue
-            for v in videos:
-                for p in v.iterParts():
-                    jobs.append({
-                        "rating_key": str(v.ratingKey),
-                        "show_key": str(v.grandparentRatingKey) if v.type == "episode" else None,
-                        "kind": v.type,
-                        "title": v.title,
-                        "show_title": getattr(v, "grandparentTitle", None),
-                        "season": getattr(v, "parentIndex", None),
-                        "episode": getattr(v, "index", None) if v.type == "episode" else None,
-                        "year": getattr(v, "year", None),
-                        "part_id": p.id,
-                        "part_key": p.key,
-                        "size": p.size or 0,
-                        "dest_rel": dest_rel_for(p.file, sec.locations, sec.title),
-                        "source": source,
-                        "server_id": sid,
-                        "guid": getattr(v, "guid", None),
-                    })
+            jobs += [self.job(v, p, sec, sid, source) for v in videos for p in v.iterParts()]
         return jobs
+
+    @staticmethod
+    def job(v, p, sec, sid: str, source: str) -> dict:
+        """The job that copies part p of movie or episode v."""
+        return {
+            "rating_key": str(v.ratingKey),
+            "show_key": str(v.grandparentRatingKey) if v.type == "episode" else None,
+            "kind": v.type,
+            "title": v.title,
+            "show_title": getattr(v, "grandparentTitle", None),
+            "season": getattr(v, "parentIndex", None),
+            "episode": getattr(v, "index", None) if v.type == "episode" else None,
+            "year": getattr(v, "year", None),
+            "part_id": p.id,
+            "part_key": p.key,
+            "size": p.size or 0,
+            "dest_rel": dest_rel_for(p.file, sec.locations, sec.title),
+            "source": source,
+            "server_id": sid,
+            "guid": getattr(v, "guid", None),
+        }
 
     def batch(self, srv: PlexServer, keys: list[str]) -> dict[str, object]:
         """Full metadata (parts and streams) for many items, 100 per request."""
