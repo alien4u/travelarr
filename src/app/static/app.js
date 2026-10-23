@@ -1,6 +1,5 @@
 'use strict';
 
-/* ---------------------------------------------------------------- helpers */
 const $ = (s, el = document) => el.querySelector(s);
 const view = $('#view');
 const S = { state: null, tab: 'watchlist', libs: null, lib: {}, q: {}, sort: {}, rid: 0, timer: null, dirty: false, path: '',
@@ -23,7 +22,7 @@ function h(tag, attrs, ...kids) {
 }
 
 async function api(path, opts = {}) {
-  const o = { headers: {}, ...opts };
+  const o = { headers: { 'X-Requested-With': 'travelarr' }, ...opts };
   if (o.body && typeof o.body !== 'string') {
     o.body = JSON.stringify(o.body);
     o.headers['Content-Type'] = 'application/json';
@@ -90,7 +89,6 @@ function errorPanel(e, retry) {
       h('button', { class: 'btn', onclick: () => setTab('settings') }, 'Settings')));
 }
 
-/* ----------------------------------------------------------------- images */
 function thumbUrl(t, w = 240, hh = 360) {
   if (!t) return null;
   if (t.startsWith('/library/')) return `/api/thumb?path=${encodeURIComponent(t)}&w=${w}&h=${hh}`;
@@ -144,7 +142,6 @@ function card(item, recent) {
   return el;
 }
 
-/* ----------------------------------------------------------------- select */
 // One selection at a time, for the tab it was started on. S.pick.busy locks it
 // while its copy request runs.
 const MAX_PICK = 100;  // the server takes at most 200 titles per request
@@ -286,7 +283,6 @@ async function pickCopy() {
   else paintPick();
 }
 
-/* ------------------------------------------------------------ state & nav */
 async function refreshState() {
   if (S.locked) return;
   try {
@@ -343,7 +339,6 @@ $('#tabs').addEventListener('click', e => {
 });
 $('#pill').addEventListener('click', () => setTab('settings'));
 
-/* -------------------------------------------------------- travelarr login */
 // A full-page overlay, so a tab still loading underneath cannot paint over it.
 function renderLogin() {
   S.locked = true;
@@ -391,7 +386,6 @@ function renderLogin() {
   user.focus();
 }
 
-/* ---------------------------------------------------------------- sign-in */
 function renderSignIn() {
   const msg = h('p', { class: 'small' });
   const btn = h('button', { class: 'btn primary', onclick: () => signIn(btn, msg) }, 'Sign in with Plex');
@@ -472,7 +466,6 @@ async function renderServers() {
     h('div', { class: 'bar', style: 'justify-content:center;margin-top:14px' }, save), msg));
 }
 
-/* --------------------------------------------------------------- browsing */
 async function renderWatchlist() {
   const rid = S.rid;
   view.replaceChildren(h('div', { class: 'spinner' }));
@@ -574,7 +567,6 @@ async function queue(keys, mode, source, only) {
   } catch (e) { toast(e.message); return null; }
 }
 
-/* ----------------------------------------------------------------- detail */
 function openSheet(...nodes) {
   $('#sheet-body').replaceChildren(...nodes.flat(Infinity).filter(n => n != null && n !== false));
   $('#sheet').hidden = false;
@@ -590,7 +582,6 @@ document.addEventListener('keydown', e => { if (e.key === 'Escape' && !$('#sheet
 
 function removedToast(results) {
   if (results.busy) return toast(`${results.busy === 1 ? 'It is' : `${results.busy} files are`} being finished (a copy or a re-sync); try again in a moment`);
-  if (results.skipped) return toast(`${results.skipped} older cop${results.skipped === 1 ? 'y' : 'ies'} could not be matched to this Plex server and ${results.skipped === 1 ? 'was' : 'were'} kept; remove ${results.skipped === 1 ? 'it' : 'them'} in History`);
   if (results.deferred) return toast(`Removed from ${dev()}. Some old files could not be deleted yet; they will be retried`);
   const busy = results.cancelling || 0;
   if (!busy) return toast(`Removed from ${dev()}`);
@@ -709,7 +700,6 @@ function resyncButton(d) {
   }, 'Re-sync from Plex') : null;
 }
 
-/* ----------------------------------------------------------------- resync */
 const RESYNC_ACT = ['upgraded', 'changed', 'absent'];
 
 function resyncLine(i) {
@@ -782,7 +772,6 @@ function historyBlock(jobs) {
       h('span', { class: 'muted' }, fmtTime(j.removed_at || j.finished_at || j.queued_at))))));
 }
 
-/* ------------------------------------------------------------------ queue */
 function renderQueue() {
   const rid = S.rid;
   const box = h('div', {}, h('div', { class: 'spinner' }));
@@ -871,7 +860,6 @@ function jobRow(j) {
     h('div', { class: 'actions' }, actions));
 }
 
-/* ---------------------------------------------------------------- history */
 async function renderHistory() {
   await refreshState();
   const rid = S.rid;
@@ -900,7 +888,6 @@ async function renderHistory() {
   load(true);
 }
 
-/* ------------------------------------------------------------ local files */
 const MAX_SELECT = 500;  // the delete API's limit per request
 
 function totalOf(entries) {
@@ -1042,7 +1029,6 @@ async function renderFiles() {
   ].filter(Boolean));
 }
 
-/* --------------------------------------------------------------- settings */
 function renderSettings() {
   const st = S.state;
   const reserve = h('input', { type: 'number', min: '0', step: '1', value: st.reserveGb, style: 'width:110px' });
@@ -1137,7 +1123,6 @@ function authPanel() {
   return panel;
 }
 
-/* ------------------------------------------------------------------- boot */
 (async function init() {
   const tab = location.hash.slice(1);
   if (['watchlist', 'movies', 'tv', 'queue', 'history', 'files', 'settings'].includes(tab)) S.tab = tab;

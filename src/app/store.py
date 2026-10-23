@@ -1,4 +1,4 @@
-"""SQLite store: settings and one row per copied file (the sync history)."""
+"""SQLite store: settings, sign-in sessions and one row per copied file (the sync history)."""
 from __future__ import annotations
 
 import json
@@ -52,7 +52,6 @@ CREATE TABLE IF NOT EXISTS sessions (
 );
 """
 
-PRESENT = ("queued", "downloading", "done")
 RANK = {"downloading": 5, "queued": 4, "done": 3, "failed": 2, "cancelled": 1, "removed": 0}
 
 JOB_FIELDS = ("rating_key", "show_key", "kind", "title", "show_title", "season", "episode",
@@ -117,6 +116,12 @@ def now() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%S")
 
 
+def label(row: dict) -> str:
+    if row["kind"] == "episode":
+        return f"{row['show_title']} S{(row['season'] or 0):02d}E{(row['episode'] or 0):02d} {row['title']}"
+    return f"{row['title']} ({row['year']})" if row.get("year") else row["title"]
+
+
 class Store:
     def __init__(self, path: str):
         self.media_root: str | None = None  # set by the app; hand-offs skip paths not on disk
@@ -137,7 +142,6 @@ class Store:
         with self.lock:
             self.db.close()
 
-    # -- low level -------------------------------------------------------------
     def rows(self, sql: str, args=()) -> list[dict]:
         with self.lock:
             return [dict(r) for r in self.db.execute(sql, args).fetchall()]
@@ -146,7 +150,6 @@ class Store:
         with self.lock:
             return self.db.execute(sql, args)
 
-    # -- settings --------------------------------------------------------------
     def get(self, key: str, default=None):
         r = self.rows("SELECT value FROM settings WHERE key=?", (key,))
         return json.loads(r[0]["value"]) if r else default
@@ -158,7 +161,6 @@ class Store:
             self.exec("INSERT INTO settings(key,value) VALUES(?,?) "
                       "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, json.dumps(value)))
 
-    # -- jobs ------------------------------------------------------------------
     def add_jobs(self, jobs: list[dict]) -> tuple[list[dict], list[dict]]:
         with self.lock:
             self.db.execute("BEGIN")
@@ -180,8 +182,8 @@ class Store:
             try:
                 dup = self.db.execute(
                     "SELECT id FROM jobs WHERE status IN ('queued','downloading','done') AND id != ? "
-                    "AND (dest_rel=? OR (part_id=? AND (server_id IS NULL OR ? IS NULL OR server_id=?)))",
-                    (job_id, job["dest_rel"], job["part_id"], job.get("server_id"), job.get("server_id"))).fetchone()
+                    "AND (dest_rel=? OR (part_id=? AND server_id IS ?))",
+                    (job_id, job["dest_rel"], job["part_id"], job.get("server_id"))).fetchone()
                 ok = dup is None and self._transition(job_id, lambda r: r["status"] == "failed", {
                     "status": "queued", "part_id": job["part_id"], "part_key": job["part_key"], "size": job["size"],
                     "dest_rel": job["dest_rel"], "title": job["title"], "server_id": job.get("server_id"),
@@ -201,8 +203,8 @@ class Store:
             ignore = ",".join(str(int(i)) for i in replaces) or "0"
             dup = self.db.execute(
                 f"SELECT id FROM jobs WHERE status IN ('queued','downloading','done') AND id NOT IN ({ignore}) "
-                "AND (dest_rel=? OR (part_id=? AND (server_id IS NULL OR ? IS NULL OR server_id=?)))",
-                (j["dest_rel"], j["part_id"], j.get("server_id"), j.get("server_id"))).fetchone()
+                "AND (dest_rel=? OR (part_id=? AND server_id IS ?))",
+                (j["dest_rel"], j["part_id"], j.get("server_id"))).fetchone()
             if dup or (replaces and self._replaced_by_other(replaces)):
                 skipped.append(j)
                 continue
@@ -242,8 +244,8 @@ class Store:
                 if job_id in {int(i) for i in json.loads(r["replaces"] or "[]")}]
 
     def next_queued(self, server_id: str | None = None, skip: frozenset = frozenset()) -> dict | None:
-        """The oldest queued job; with server_id, only jobs of that server or of
-        none (rows from before 2.5.0). Jobs of another server wait."""
+        """The oldest queued job; with server_id, only jobs of that server. Jobs of
+        another server wait."""
         # a job whose file is being placed or is in place finishes first, whatever
         # the selected server: it needs no Plex request to be in a consistent state
         for r in self.rows("SELECT * FROM jobs WHERE status='queued' AND phase IS NOT NULL ORDER BY id LIMIT 200"):
@@ -251,7 +253,7 @@ class Store:
                 return r
         sql, args = "SELECT * FROM jobs WHERE status='queued'", []
         if server_id is not None:
-            sql += " AND (server_id IS NULL OR server_id=?)"
+            sql += " AND server_id=?"
             args.append(server_id)
         for r in self.rows(sql + " ORDER BY id LIMIT 200", args):
             if r["id"] not in skip:
@@ -260,14 +262,11 @@ class Store:
 
     # Every way out of 'queued' is one conditional UPDATE, so the worker's claim
     # and a cancel or removal can never both win.
-    def claim(self, job_id: int, server_id: str | None = None) -> bool:
-        """queued -> downloading; False when the job left the queue first. A row
-        without a server is bound to the one it is about to use."""
-        return self.exec("UPDATE jobs SET status='downloading', started_at=?, error=NULL, note=NULL, "
-                         "server_id=COALESCE(server_id, ?) WHERE id=? AND status='queued'",
-                         (now(), server_id, job_id)).rowcount == 1
+    def claim(self, job_id: int) -> bool:
+        """queued -> downloading; False when the job left the queue first."""
+        return self.exec("UPDATE jobs SET status='downloading', started_at=?, error=NULL, note=NULL "
+                         "WHERE id=? AND status='queued'", (now(), job_id)).rowcount == 1
 
-    # -- transitions that give up files ------------------------------------------
     def _exists(self, rel: str) -> bool:
         if self.media_root is None:
             return True
@@ -398,12 +397,6 @@ class Store:
             [job[c] for c in cols] + [job["size"], json.dumps(sidecars), "found on the NAS by a re-sync", now(), now()])
         return cur.lastrowid
 
-    def bind_server(self, job_id: int, server_id: str, guid: str | None) -> bool:
-        """Bind a row from before 2.5.0 to a server, only if it still has none."""
-        n = self.exec("UPDATE jobs SET server_id=?, guid=COALESCE(guid, ?) WHERE id=? AND server_id IS NULL "
-                      "AND status IN ('done','failed','cancelled','queued')", (server_id, guid, job_id)).rowcount
-        return n == 1 or (self.job(job_id) or {}).get("server_id") == server_id
-
     def add_sidecar(self, job_id: int, rel: str) -> None:
         """Recorded before the file is written, so a written file is never unowned."""
         with self.lock:
@@ -478,21 +471,20 @@ class Store:
 
     def jobs_for(self, rating_key: str | None = None, show_key: str | None = None,
                  server_id: str | None = None) -> list[dict]:
-        """Rows of an item; with server_id only that server's and rows from before 2.5.0
-        (rating keys belong to one server)."""
+        """Rows of an item; with server_id only that server's (rating keys belong to one server)."""
         col, key = ("show_key", show_key) if show_key else ("rating_key", rating_key)
-        return self.rows(f"SELECT * FROM jobs WHERE {col}=? AND (server_id IS NULL OR ? IS NULL OR server_id=?) "
+        return self.rows(f"SELECT * FROM jobs WHERE {col}=? AND (? IS NULL OR server_id=?) "
                          "ORDER BY id", (key, server_id, server_id))
 
     def status_map(self, rating_keys: list[str], server_id: str | None = None) -> dict[str, str]:
         """Best current status per item (downloading > queued > done > failed...),
-        counting rows of server_id and rows from before 2.5.0 (no server)."""
+        counting rows of server_id."""
         if not rating_keys:
             return {}
         marks = ",".join("?" * len(rating_keys))
         out: dict[str, str] = {}
         for r in self.rows(f"SELECT rating_key, status FROM jobs WHERE rating_key IN ({marks}) "
-                           "AND (server_id IS NULL OR ? IS NULL OR server_id=?)",
+                           "AND (? IS NULL OR server_id=?)",
                            list(rating_keys) + [server_id, server_id]):
             cur = out.get(r["rating_key"])
             if cur is None or RANK[r["status"]] > RANK[cur]:
@@ -507,7 +499,7 @@ class Store:
         for r in self.rows(
                 f"SELECT show_key, status, COUNT(DISTINCT rating_key) n FROM jobs "
                 f"WHERE show_key IN ({marks}) AND status IN ('queued','downloading','done','failed') "
-                f"AND (server_id IS NULL OR ? IS NULL OR server_id=?) "
+                f"AND (? IS NULL OR server_id=?) "
                 f"GROUP BY show_key, status", list(show_keys) + [server_id, server_id]):
             d = out.setdefault(r["show_key"], {"done": 0, "active": 0, "failed": 0})
             key = {"done": "done", "failed": "failed"}.get(r["status"], "active")

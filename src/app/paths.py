@@ -95,7 +95,6 @@ def remove_files(media_root: str, rels: list[str]) -> list[str]:
     return removed
 
 
-# ------------------------------------------------------------ Local Files
 # Paths here are exact POSIX entry paths, so a listed path always names the
 # same entry again: unlike clean_rel, a backslash is an ordinary character.
 

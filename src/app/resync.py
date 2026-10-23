@@ -21,7 +21,8 @@ from concurrent.futures import ThreadPoolExecutor
 
 import requests
 
-from .paths import SUB_EXT, PathError, abs_path, dest_rel_for, local_rel, safe_name
+from .paths import SUB_EXT, PathError, abs_path, local_rel, safe_name
+from .store import label
 
 LOCK = threading.Lock()  # one check or apply at a time; selecting a server waits for it
 ACTIONABLE = ("upgraded", "changed", "absent")
@@ -42,50 +43,7 @@ class ResyncError(Exception):
         self.status = status
 
 
-def _label(row: dict) -> str:
-    if row["kind"] == "episode":
-        return f"{row['show_title']} S{(row['season'] or 0):02d}E{(row['episode'] or 0):02d} {row['title']}"
-    return f"{row['title']} ({row['year']})" if row.get("year") else row["title"]
-
-
-def _same_item(row: dict, it, sid: str, dest: str | None) -> bool:
-    if row["server_id"] and row["server_id"] != sid:
-        return False
-    if row["guid"]:
-        return row["guid"] == getattr(it, "guid", None)
-    # a copy from before 2.5.0: same title, and Plex's file is in the same folder
-    if row["kind"] == "episode":
-        same = (getattr(it, "grandparentTitle", None) == row["show_title"]
-                and getattr(it, "parentIndex", None) == row["season"] and getattr(it, "index", None) == row["episode"])
-    else:
-        same = it.title == row["title"] and (row["year"] is None or getattr(it, "year", None) == row["year"])
-    return same and dest is not None and posixpath.dirname(dest) == posixpath.dirname(row["dest_rel"])
-
-
-def bind_legacy(store, gw, rows: list[dict], expected_sid: str) -> set[int]:
-    """Rows from before 2.5.0 (no server) that are verifiably the selected server's
-    item get bound to it; returns their ids. Unverifiable rows are left alone."""
-    legacy = [r for r in rows if not r["server_id"]]
-    if not legacy:
-        return set()
-    srv, sid = gw.snapshot()
-    if sid != expected_sid:
-        raise ResyncError(409, "The Plex server changed; reload and try again")
-    plex = gw.batch(srv, sorted({r["rating_key"] for r in legacy}))
-    ok = set()
-    for r in legacy:
-        it = plex.get(r["rating_key"])
-        if it is None:
-            continue
-        parts = list(it.iterParts())
-        sec = gw._section(it.librarySectionID, srv)
-        dest = dest_rel_for(parts[0].file, sec.locations, sec.title) if parts else None
-        if _same_item(r, it, sid, dest) and store.bind_server(r["id"], sid, getattr(it, "guid", None)):
-            ok.add(r["id"])
-    return ok
-
-
-# ------------------------------------------------------------------ the NAS
+#------------------------------------------------------------------ the NAS
 def _nas_dir(media_root: str, rel: str) -> tuple[dict[str, int], list[str]] | None:
     """Videos (name -> size) and subfolders of a NAS folder; None for a folder
     that is missing or reached through a link."""
@@ -115,7 +73,6 @@ def _sidecars(media_root: str, video_rel: str) -> list[str]:
                   if n.startswith(stem + ".") and posixpath.splitext(n)[1].lower() in exts)
 
 
-# ------------------------------------------------------------------ Plex
 def _libraries(srv) -> dict[str, tuple]:
     """NAS library folder name -> (section, key of its Plex folder view), the same
     name the copies are placed under (see `dest_rel_for`)."""
@@ -140,11 +97,10 @@ def _plex_dir(srv, key: str | None) -> tuple[list, dict[str, str]]:
     return videos, dirs
 
 
-# ------------------------------------------------------------------ compare
 def _item(kind: str, path: str, job: dict | None = None, **fields) -> dict:
     return {"ratingKey": job["rating_key"] if job else None,
             "title": (job["show_title"] or job["title"]) if job else posixpath.basename(path),
-            "label": _label(job) if job else posixpath.basename(path),
+            "label": label(job) if job else posixpath.basename(path),
             "kind": kind, "reason": None, "video": None, "videoBytes": 0, "watched": False, "path": path,
             "_job": job, **fields}
 
@@ -276,10 +232,10 @@ def _rows(store, sid: str, media_root: str, items: list[dict]) -> None:
     or failed job are left to the Queue."""
     rows = store.rows("SELECT * FROM jobs WHERE status='done'")
     done = {r["dest_rel"]: r for r in rows}
-    by_part = {r["part_id"]: r for r in rows if not r["server_id"] or r["server_id"] == sid}
+    by_part = {r["part_id"]: r for r in rows if r["server_id"] == sid}
     active, failed, locked = set(), set(), set()
     for r in store.rows("SELECT * FROM jobs WHERE status IN ('queued','downloading','failed')"):
-        mine = not r["server_id"] or r["server_id"] == sid
+        mine = r["server_id"] == sid
         if r["status"] != "failed":
             active |= {r["dest_rel"]} | ({("rk", r["rating_key"])} if mine else set())
         else:

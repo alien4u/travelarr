@@ -294,6 +294,8 @@ class FakePlex:
                         return self.send(h, 200, s["body"].encode(), "text/plain")
             return self.send(h, 404, b"<html>404</html>", "text/html")
         if path == "/photo/:/transcode":
+            if "missing" in q.get("url", ""):
+                return self.send(h, 404, b"<html>404</html>", "text/html")
             return self.send(h, 200, b"\xff\xd8\xff\xe0fakejpeg", "image/jpeg")
         return self.send(h, 404, b"<html>404</html>", "text/html")
 

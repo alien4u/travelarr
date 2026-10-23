@@ -24,7 +24,7 @@ from unittest import mock
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import requests  # noqa: E402
 import urllib3  # noqa: E402
-from fastapi.testclient import TestClient  # noqa: E402
+from fastapi import testclient  # noqa: E402
 
 from app import paths, plexgw, worker  # noqa: E402
 from app import auth as auth_mod  # noqa: E402
@@ -39,6 +39,13 @@ LOOSE = "Movies/Loose Movie.mkv"                        # part 1002, 120,000 byt
 HEATHERS = "Movies/Heathers (1989)/Heathers (1989).mkv"  # part 1003, 50,000 bytes
 from tests.fakeplex import SRT as SRT_BODY  # noqa: E402
 from tests.fakeplex import TOKEN, FakeAccount, FakeConn, FakePlex  # noqa: E402
+
+
+class TestClient(testclient.TestClient):
+    """Sends the header every request from the page carries (see `api()` in app.js)."""
+
+    def __init__(self, app, **kw):
+        super().__init__(app, headers={"X-Requested-With": "travelarr"}, **kw)
 
 
 class PlexFixture(unittest.TestCase):
@@ -277,6 +284,10 @@ class AppTest(PlexFixture):
         self.c.get("/api/thumb?path=/library/metadata/101/thumb/1")
         self.assertEqual(len(self.fake.requests), before)
         self.assertEqual(self.c.get("/api/thumb?path=http://evil/x").status_code, 400)
+        r = self.c.get("/api/thumb?path=/library/metadata/missing/thumb/1")   # Plex answers 404
+        self.assertEqual(r.status_code, 502)
+        self.assertNotIn(TOKEN, r.text)
+        self.assertFalse(any(TOKEN in p for _m, p, _h in self.fake.requests if p.startswith("/photo/")))
 
     def _all_files(self):
         for root, _d, files in os.walk(self.media):
@@ -1987,12 +1998,6 @@ class ResyncTest(PlexFixture):
         r = self.apply(self.HEATHERS_DIR, "103").json()
         self.assertEqual((r["redownloads"], r["skipped"]), (0, 1))
 
-    def test_plex_ids_of_mixed_libraries(self):
-        """Plex puts the first item's library on a mixed answer; each item keeps its own."""
-        srv, _ = self.gw.snapshot()
-        got = self.gw.batch(srv, ["201", "101"])
-        self.assertEqual((got["201"].librarySectionID, got["101"].librarySectionID), (2, 1))
-
     def test_multipart_and_unavailable(self):
         self.copy("103")
         h = self.movie(103)
@@ -2221,17 +2226,6 @@ class ResyncTest(PlexFixture):
             self.assertEqual(self.c.post("/api/remove", json=body).status_code, 409)
         self.assertTrue(os.path.isfile(self.m(LOOSE)))
 
-    def test_bulk_removal_verifies_older_copies(self):
-        self.copy("102", "103")
-        loose, heathers = self.row("102")["id"], self.row("103")["id"]
-        self.store.update(loose, server_id=None, guid=None)
-        self.store.update(heathers, server_id=None, guid=None, title="Another Movie")   # not this server's item
-        r = self.c.post("/api/remove", json={"ratingKeys": ["102", "103"], "serverId": "srv1"}).json()
-        self.assertEqual(r["results"], {"removed": 1, "skipped": 1})
-        self.assertEqual(self.store.job(loose)["status"], "removed")
-        self.assertEqual(self.store.job(heathers)["status"], "done")
-        self.assertTrue(os.path.isfile(self.m("Movies/Heathers (1989)/Heathers (1989).mkv")))
-
     def placed_upgrade(self):
         """An upgrade whose new file is in place, interrupted before it finished."""
         old, up = self.upgrade_queued()
@@ -2319,15 +2313,6 @@ class ResyncTest(PlexFixture):
         job = self.store.job(jid)
         self.assertEqual((job["status"], json.loads(job["cleanup"])), ("done", []))
         self.assertEqual(self.read(LOOSE), self.fake.parts[1002])      # the new copy survived
-
-    def test_binding_an_older_copy_never_overrides_another_binding(self):
-        self.copy("102")
-        rid = self.row("102")["id"]
-        self.store.update(rid, server_id="other")
-        self.assertFalse(self.store.bind_server(rid, "srv1", None))
-        self.assertEqual(self.store.job(rid)["server_id"], "other")
-        self.store.update(rid, server_id=None)
-        self.assertTrue(self.store.bind_server(rid, "srv1", "plex://movie/loose"))
 
     def test_part_replaced_before_the_subtitle_step_keeps_subtitles(self):
         self.copy("101")
@@ -2530,13 +2515,6 @@ class ResyncTest(PlexFixture):
         self.drain()
         self.assertEqual(self.store.job(jid)["status"], "done")
 
-    def test_legacy_job_is_bound_at_claim(self):
-        self.c.post("/api/queue", json={"keys": ["102"]})
-        jid = self.store.next_queued()["id"]
-        self.store.update(jid, server_id=None)
-        self.drain()
-        self.assertEqual(self.store.job(jid)["server_id"], "srv1")
-
     def test_badges_count_only_the_selected_server(self):
         self.copy("102")
         rid = self.row("102")["id"]
@@ -2736,34 +2714,32 @@ class AuthTest(unittest.TestCase):
         with self.at(t0 + 50 * day + 1):
             self.assertEqual(c.get("/api/state").status_code, 401)
 
-    def test_password_from_2x_is_imported_once(self):
-        env = {"TRAVELARR_PASSWORD": "short", "TRAVELARR_USERNAME": " bob "}
-        with self.assertLogs("travelarr", "INFO") as cm:
-            c = self.client(env)
-        self.assertFalse(any("short" in r.getMessage() for r in cm.records))
-        self.assertEqual(c.post("/api/login", json={"user": "bob", "password": "short"}).status_code, 200)
-        c = self.client({"TRAVELARR_PASSWORD": "other", "TRAVELARR_USERNAME": "eve"})    # ignored from now on
-        self.assertEqual(c.post("/api/login", json={"user": "bob", "password": "short"}).status_code, 200)
-
-    def test_import_edge_cases(self):
-        with self.assertLogs("travelarr", "WARNING"):
-            c = self.client({"TRAVELARR_PASSWORD": self.PW, "TRAVELARR_USERNAME": "a:b"})
-        self.assertEqual(c.post("/api/login", json={"user": "admin", "password": self.PW}).status_code, 200)
-        shutil.rmtree(self.tmp)
-        self.tmp = tempfile.mkdtemp()
-        c = self.client({"TRAVELARR_PASSWORD": ""})
-        self.assertEqual(c.get("/api/session").json()["authRequired"], False)
-
     def test_reset_variable(self):
         c = self.client()
         self.enable(c)
         with self.assertLogs("travelarr", "WARNING") as cm:
-            c = self.client({"TRAVELARR_RESET_LOGIN": "yes", "TRAVELARR_PASSWORD": self.PW})
+            c = self.client({"TRAVELARR_RESET_LOGIN": "yes"})
         self.assertTrue(any("TRAVELARR_RESET_LOGIN" in r.getMessage() for r in cm.records))
         self.assertEqual(TestClient(c.app).get("/api/state").status_code, 200)
         self.assertEqual(c.app.state.store.rows("SELECT * FROM sessions"), [])
-        c = self.client()                                              # without it: still off, nothing imported
+        c = self.client()                                              # without it: still off
         self.assertFalse(c.get("/api/session").json()["authRequired"])
+
+    def test_changes_need_the_page_header(self):
+        c = self.client()
+        bare = testclient.TestClient(c.app)                           # what another site can send
+        r = bare.post("/api/security", json={"action": "enable", "user": "admin", "password": self.PW,
+                                             "repeat": self.PW})
+        self.assertEqual((r.status_code, r.json()["code"]), (403, "reload"))
+        self.assertFalse(c.get("/api/session").json()["authRequired"])
+        self.assertEqual(bare.post("/api/auth/signout").status_code, 403)
+        self.assertEqual(bare.get("/api/state").status_code, 200)
+
+    def test_reserve_must_be_a_number(self):
+        c = self.client()
+        for bad in ("inf", "nan", "", "ten", None, [1]):
+            self.assertEqual(c.post("/api/settings", json={"reserveGb": bad}).status_code, 400, bad)
+        self.assertEqual(c.post("/api/settings", json={"reserveGb": "-3"}).json()["reserveGb"], 0.0)
 
     def test_hash_and_password_never_leave(self):
         with self.assertLogs("travelarr", "INFO") as cm:

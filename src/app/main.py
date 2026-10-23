@@ -1,5 +1,5 @@
 """travelarr web app: pick titles from your home Plex and copy the original
-files (plus subtitles) to this box over HTTPS."""
+files (plus subtitles) to this box."""
 from __future__ import annotations
 
 import hashlib
@@ -25,10 +25,10 @@ from .paths import (ListingChanged, PathError, abs_path, delete_entry, list_dir,
                     touches)
 from .plexgw import NotReady, OtherServer, PlexGateway
 from .resync import ResyncError
-from .store import Store, now
+from .store import Store, label, now
 from .worker import CHANGED, Downloader
 
-VERSION = "3.4.0"
+VERSION = "3.5.0"
 STATIC = os.path.join(os.path.dirname(__file__), "static")
 LOCAL_NOTE = "deleted in Local Files"
 MAX_QUEUE_KEYS = 200  # bounds the Plex requests one queue call makes
@@ -81,7 +81,6 @@ def create_app(data_dir: str | None = None, media_root: str | None = None,
                   docs_url=None, redoc_url=None, openapi_url=None)
     app.state.store, app.state.gw, app.state.dl = store, gw, dl
 
-    # --------------------------------------------------------------- errors
     def err(status: int, msg: str, code: str = "error") -> JSONResponse:
         return JSONResponse({"error": msg, "code": code}, status_code=status)
 
@@ -110,7 +109,6 @@ def create_app(data_dir: str | None = None, media_root: str | None = None,
         gw.invalidate()
         return err(502, f"Plex did not answer: {e}", "network")
 
-    # -------------------------------------------------------------- helpers
     def disk() -> dict | None:
         if not os.path.isdir(media_root):
             return None
@@ -170,13 +168,21 @@ def create_app(data_dir: str | None = None, media_root: str | None = None,
             return "busy"
         return "removed" if not dl.cleanup(jid) else "deferred"
 
-    # -------------------------------------------------------------- sign-in
     # Open while sign-in is off. When it is on, every /api/ path but these needs a session.
     public = {"/api/session", "/api/login", "/api/logout", "/api/security"}
 
     def set_session_cookie(resp: Response, token: str, request: Request) -> None:
         resp.set_cookie(auth_mod.COOKIE, token, max_age=auth_mod.SESSION, path="/", httponly=True,
                         samesite="strict", secure=request.url.scheme == "https")
+
+    @app.middleware("http")
+    async def own_page_only(request: Request, call_next):
+        """Changes need a header another site cannot send without a CORS preflight,
+        which travelarr never answers."""
+        if (request.method != "GET" and request.url.path.startswith("/api/")
+                and request.headers.get("x-requested-with") != "travelarr"):
+            return err(403, "Reload the page: it is out of date", "reload")
+        return await call_next(request)
 
     @app.middleware("http")
     async def require_session(request: Request, call_next):
@@ -277,7 +283,6 @@ def create_app(data_dir: str | None = None, media_root: str | None = None,
         resp.delete_cookie(auth_mod.COOKIE, path="/")
         return resp
 
-    # ---------------------------------------------------------------- state
     @app.get("/api/state")
     def state():
         return {
@@ -303,7 +308,6 @@ def create_app(data_dir: str | None = None, media_root: str | None = None,
             "pendingBytes": store.pending_bytes(),
         }
 
-    # ----------------------------------------------------------------- auth
     @app.post("/api/auth/start")
     def auth_start():
         return {"url": gw.start_login()}
@@ -317,7 +321,6 @@ def create_app(data_dir: str | None = None, media_root: str | None = None,
         gw.sign_out()
         return {"ok": True}
 
-    # --------------------------------------------------------------- server
     @app.get("/api/servers")
     def servers():
         return {"servers": gw.servers()}
@@ -339,14 +342,19 @@ def create_app(data_dir: str | None = None, media_root: str | None = None,
 
     @app.post("/api/settings")
     def settings(body: dict = Body(...)):
+        if "reserveGb" in body:
+            try:
+                gb = float(body["reserveGb"])
+            except (TypeError, ValueError):
+                gb = math.nan
+            if not math.isfinite(gb):
+                return err(400, "The free space to keep must be a number of GB", "bad_request")
+            store.set("reserve_gb", max(0.0, gb))
         if "paused" in body:
             store.set("paused", bool(body["paused"]))
             dl.wake()
-        if "reserveGb" in body:
-            store.set("reserve_gb", max(0.0, float(body["reserveGb"])))
         return state()
 
-    # --------------------------------------------------------------- browse
     @app.get("/api/libraries")
     def libraries():
         return {"libraries": gw.libraries()}
@@ -382,7 +390,6 @@ def create_app(data_dir: str | None = None, media_root: str | None = None,
         d["nasFolder"] = resync.title_folder(media_root, d)
         return d
 
-    # ---------------------------------------------------------------- queue
     @app.post("/api/queue")
     def queue(body: dict = Body(...)):
         keys = [str(k) for k in body.get("keys", []) if k]
@@ -415,11 +422,10 @@ def create_app(data_dir: str | None = None, media_root: str | None = None,
         sid = store.get("server_id")
         rows = store.jobs(view, q, min(max(limit, 1), 1000), max(offset, 0))
         for j in rows:
-            j["waiting"] = j["status"] == "queued" and bool(j["server_id"]) and j["server_id"] != sid
+            j["waiting"] = j["status"] == "queued" and j["server_id"] != sid
         return {"jobs": rows, "current": dl.snapshot(),
                 "paused": bool(store.get("paused", False)), "workerError": dl.last_error}
 
-    # --------------------------------------------------------------- resync
     @app.post("/api/resync/check")
     def resync_check(body: dict = Body(...)):
         return resync.check(store, gw, media_root, resync.scope_path(body.get("path", "")))
@@ -454,7 +460,7 @@ def create_app(data_dir: str | None = None, media_root: str | None = None,
     @app.post("/api/jobs/{job_id}/retry")
     def retry(job_id: int):
         j = _job(job_id)
-        if j["server_id"] and j["server_id"] != store.get("server_id"):
+        if j["server_id"] != store.get("server_id"):
             return err(409, "This job belongs to another Plex server; select it first.", "other_server")
         if j["mode"] in ("redownload", "recover") and (j["error"] or "").startswith(CHANGED):
             # an existing copy: it stays a copy, and replacing it with Plex's new file is a
@@ -479,7 +485,7 @@ def create_app(data_dir: str | None = None, media_root: str | None = None,
             # the old file is gone from Plex: queue the item again as it is now
             try:
                 planned = gw.plan([j["rating_key"]], mode="all", source=j["source"] or "browse",
-                                  server_id=j["server_id"] or store.get("server_id"))
+                                  server_id=j["server_id"])
             except OtherServer:
                 return err(409, "This job belongs to another Plex server; select it first.", "other_server")
             if len(planned) != 1:
@@ -503,8 +509,7 @@ def create_app(data_dir: str | None = None, media_root: str | None = None,
     @app.post("/api/remove")
     def remove_many(body: dict = Body(...)):
         """Remove by rating/show key. Keys belong to one Plex server, so the request
-        names the server it was made for, and copies from before 2.5.0 (no server
-        recorded) are only included once verified to be this server's item."""
+        names the server it was made for."""
         sid = store.get("server_id")
         if not sid:
             return err(409, "Choose a Plex server first", "no_server")
@@ -519,17 +524,11 @@ def create_app(data_dir: str | None = None, media_root: str | None = None,
                 targets += store.jobs_for(rating_key=str(rk), server_id=sid)
             for sk in body.get("showKeys", []):
                 targets += store.jobs_for(show_key=str(sk), server_id=sid)
-            targets = list({j["id"]: j for j in targets}.values())
-            verified = resync.bind_legacy(store, gw, targets, sid)
-            for j in targets:
-                if not j["server_id"] and j["id"] not in verified:
-                    results["skipped"] = results.get("skipped", 0) + 1
-                    continue
+            for j in {j["id"]: j for j in targets}.values():
                 r = remove_job(j)
                 results[r] = results.get(r, 0) + 1
         return {"results": results}
 
-    # ---------------------------------------------------------- local files
     @app.get("/api/files")
     def files(path: str = "", offset: str = "0", limit: str = "200", token: str | None = None):
         if not (re.fullmatch(r"[0-9]{1,9}", offset) and re.fullmatch(r"[0-9]{1,3}", limit) and 1 <= int(limit) <= 500):
@@ -568,7 +567,7 @@ def create_app(data_dir: str | None = None, media_root: str | None = None,
         where = lambda rel: real_rel(media_root, rel)  # noqa: E731
         busy, cancelled = store.release_paths(kept, LOCAL_NOTE, where)
         if busy:
-            return err(409, f"{dl._label(busy)} is downloading into this folder. Cancel it in the Queue first.",
+            return err(409, f"{label(busy)} is downloading into this folder. Cancel it in the Queue first.",
                        "busy")
         out = {"deleted": 0, "bytes": 0, "files": 0, "cancelled": cancelled, "removed": 0, "errors": []}
         for t in kept:
@@ -592,7 +591,6 @@ def create_app(data_dir: str | None = None, media_root: str | None = None,
                 dl.cleanup(j["id"])
         return out
 
-    # --------------------------------------------------------------- images
     @app.get("/api/thumb")
     def thumb(path: str, w: int = 240, h: int = 360):
         if not path.startswith("/library/"):
@@ -609,7 +607,6 @@ def create_app(data_dir: str | None = None, media_root: str | None = None,
         os.replace(cached + ".tmp", cached)
         return Response(data, media_type=ctype, headers=hdrs)
 
-    # --------------------------------------------------------------- static
     app.mount("/static", StaticFiles(directory=STATIC), name="static")
     with open(os.path.join(STATIC, "index.html"), encoding="utf-8") as fh:
         # a new version is a new URL, so browsers never run an old app.js after an update

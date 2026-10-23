@@ -29,7 +29,7 @@ import urllib3
 
 from .paths import PART_SUFFIX, SUB_EXT, PathError, abs_path, real_rel, remove_files, sidecar_rel
 from .plexgw import NotReady, OtherServer
-from .store import now, protected, staging_rel
+from .store import label, now, protected, staging_rel
 
 log = logging.getLogger("travelarr.worker")
 
@@ -206,7 +206,6 @@ class Downloader:
         self._later: dict[int, tuple[float, float]] = {}  # job id -> (not before, last delay)
         self._cleaned: dict[int, float] = {}  # row id -> last cleanup attempt
 
-    # ------------------------------------------------------------ control
     def start(self) -> None:
         if self._thread is None:
             self._thread = threading.Thread(target=self._loop, name="downloader", daemon=True)
@@ -225,12 +224,11 @@ class Downloader:
     def reserve_bytes(self) -> int:
         return int(float(self.store.get("reserve_gb", 10)) * (1 << 30))
 
-    # ------------------------------------------------------- live status
     def _begin(self, job: dict) -> None:
         with self._lock:
             self._received = 0
             self._samples = collections.deque([(time.monotonic(), 0)])
-            self.current = {"id": job["id"], "title": self._label(job), "size": int(job["size"] or 0),
+            self.current = {"id": job["id"], "title": label(job), "size": int(job["size"] or 0),
                             "bytes": int(job["bytes_done"] or 0), "state": "connecting", "attempt": 0,
                             "max_attempts": self.max_attempts, "retry_at": None, "error": None}
             self.transitions.append("connecting")
@@ -290,7 +288,6 @@ class Downloader:
         d["retry_in"] = max(0, round(retry_at - t)) if d["state"] == "retrying" and retry_at else None
         return d
 
-    # --------------------------------------------------------------- loop
     def _loop(self) -> None:
         try:
             self._reconcile_done()
@@ -341,13 +338,12 @@ class Downloader:
                 n += 1
         log.info("checked copied files in %.1fs; %d queued again", time.monotonic() - t, n)
 
-    # ------------------------------------------------------------ one job
     def _process(self, job: dict) -> None:
         """Cancel is best-effort until the file is being placed: the flag is read
         right after the claim, while the file streams or waits to retry, and just
         before placement. From then on the job finishes."""
         jid = job["id"]
-        if not self.store.claim(jid, self.store.get("server_id")):
+        if not self.store.claim(jid):
             return  # cancelled after it was picked
         job = self.store.job(jid)
         self._begin(job)
@@ -357,9 +353,9 @@ class Downloader:
         except OtherServer:
             # before anything was placed: wait, keeping the partial (never a failure)
             self.store.update(jid, status="queued", note=WAITING)
-            log.info("waiting for its server: %s", self._label(job))
+            log.info("waiting for its server: %s", label(job))
         except Superseded:
-            log.info("cancelled, the copy it would replace was removed: %s", self._label(job))
+            log.info("cancelled, the copy it would replace was removed: %s", label(job))
             self.cleanup(jid)
         except (_Handled, PlaceFailed):
             pass  # outcome already recorded
@@ -368,12 +364,12 @@ class Downloader:
             if job["mode"] != "refresh":
                 self._reset(job)
             self.cleanup(jid)
-            log.info("cancelled: %s", self._label(job))
+            log.info("cancelled: %s", label(job))
         except Changed as e:
             self._rm(self._temp(job))
             self._reset(job)
             self.store.update(jid, status="failed", finished_at=now(), error=f"{CHANGED}: {e}"[:500])
-            log.warning("changed on Plex: %s: %s", self._label(job), e)
+            log.warning("changed on Plex: %s: %s", label(job), e)
         except Exception as e:  # noqa: BLE001
             cur = self.store.job(jid)
             if cur and cur["phase"]:
@@ -384,11 +380,11 @@ class Downloader:
                 try:
                     self.store.update(jid, status="queued", note=f"finishing, retrying after: {e}"[:300])
                 except Exception:  # noqa: BLE001
-                    log.exception("could not record the retry of %s", self._label(job))
-                log.warning("finishing %s failed, retrying in %.0fs: %s", self._label(job), delay, e)
+                    log.exception("could not record the retry of %s", label(job))
+                log.warning("finishing %s failed, retrying in %.0fs: %s", label(job), delay, e)
             else:
                 self.store.update(jid, status="failed", finished_at=now(), error=str(e)[:500])
-                log.warning("failed: %s: %s", self._label(job), e)
+                log.warning("failed: %s: %s", label(job), e)
         finally:
             self._cancel.discard(jid)
             with self._lock:
@@ -515,13 +511,7 @@ class Downloader:
         else:
             self.store.transition(jid, lambda r: True, **fields)
         self.cleanup(jid)
-        log.info("done: %s", self._label(job))
-
-    @staticmethod
-    def _label(job: dict) -> str:
-        if job["kind"] == "episode":
-            return f"{job['show_title']} S{(job['season'] or 0):02d}E{(job['episode'] or 0):02d} {job['title']}"
-        return f"{job['title']} ({job['year']})" if job.get("year") else job["title"]
+        log.info("done: %s", label(job))
 
     @staticmethod
     def _rm(path: str) -> None:
@@ -573,7 +563,7 @@ class Downloader:
                     restarts += 1
                     if restarts > MAX_RESTARTS:
                         raise JobError(f"the file content differs between requests: {e}") from None
-                    log.warning("starting %s again from the beginning: %s", self._label(job), e)
+                    log.warning("starting %s again from the beginning: %s", label(job), e)
                     self._reset(job, fd)
                     have = 0
                 except RETRYABLE as e:
@@ -587,7 +577,7 @@ class Downloader:
                         raise JobError(f"gave up after {attempts} attempts: {why}") from None
                     self.gw.invalidate()
                     wait = min(60.0, self.backoff * 2 ** (attempts - 1))
-                    log.info("retry %d for %s in %.0fs: %s", attempts, self._label(job), wait, e)
+                    log.info("retry %d for %s in %.0fs: %s", attempts, label(job), wait, e)
                     self._set(state="retrying", retry_at=time.monotonic() + wait, attempt=attempts,
                               error=why[:300])
                     if self._stop.wait(wait):
@@ -632,11 +622,11 @@ class Downloader:
                 self._reset(job)
             return 0
         if (size and have > size) or have < durable:
-            log.info("not resuming %s: the partial file cannot be trusted", self._label(job))
+            log.info("not resuming %s: the partial file cannot be trusted", label(job))
             self._reset(job, fd)
             return 0
         if have > durable:
-            log.info("discarding %d unconfirmed bytes of %s", have - durable, self._label(job))
+            log.info("discarding %d unconfirmed bytes of %s", have - durable, label(job))
             os.ftruncate(fd, durable)
             have = durable
         self._set(bytes=have)
@@ -843,7 +833,6 @@ class Downloader:
         out["error"] = ("subtitles: " + "; ".join(problems))[:500] if problems else None
         return out
 
-    # ------------------------------------------------------------- cleanup
     def cleanup(self, row_id: int) -> list[str]:
         """Delete what a row gave up (its cleanup list). A path still owned by a
         copy on the NAS is left alone and cleared; one still needed by an unfinished

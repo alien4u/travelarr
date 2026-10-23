@@ -67,7 +67,6 @@ class Auth:
         self._locked: dict[str, float] = {}
         self._lock = threading.Lock()
 
-    # -- settings ----------------------------------------------------------------
     def config(self) -> dict:
         return self.store.get("auth") or {}
 
@@ -97,7 +96,6 @@ class Auth:
         self.store.set("auth", {**self.config(), "enabled": False, "hash": None, "changed": now()})
         self.store.exec("DELETE FROM sessions")
 
-    # -- sessions ----------------------------------------------------------------
     def new_session(self) -> str:
         token = secrets.token_urlsafe(32)
         t = int(time.time())
@@ -120,7 +118,7 @@ class Auth:
     def end_session(self, token: str) -> None:
         self.store.exec("DELETE FROM sessions WHERE token_hash=?", (_digest(token),))
 
-    # -- wrong-password lock, per client IP ----------------------------------------
+    # wrong-password lock, per client IP
     def locked_for(self, ip: str) -> int:
         with self._lock:
             left = self._locked.get(ip, 0) - time.monotonic()
@@ -143,25 +141,14 @@ class Auth:
         with self._lock:
             self._fails.pop(ip, None)
 
-    # -- startup -----------------------------------------------------------------
     def startup(self, env=os.environ) -> None:
-        """TRAVELARR_RESET_LOGIN=yes turns sign-in off; otherwise a 2.x password
-        (TRAVELARR_PASSWORD / TRAVELARR_USERNAME) is imported once."""
+        """TRAVELARR_RESET_LOGIN=yes turns sign-in off."""
         if (env.get("TRAVELARR_RESET_LOGIN") or "").strip().lower() == "yes":
             self.store.set("auth", {**self.config(), "user": self.user() or "admin", "enabled": False,
                                     "hash": None, "changed": now()})
             self.store.exec("DELETE FROM sessions")
             log.warning("TRAVELARR_RESET_LOGIN is set: sign-in is off. Remove the variable, then turn sign-in "
                         "on again in Settings > Authentication")
-        elif not self.store.get("auth") and env.get("TRAVELARR_PASSWORD"):
-            user = (env.get("TRAVELARR_USERNAME") or "").strip() or "admin"
-            if not USERNAME_RE.fullmatch(user):
-                log.warning("TRAVELARR_USERNAME is not a valid user name; imported the password for user admin")
-                user = "admin"
-            self.store.set("auth", {"enabled": True, "user": user, "hash": hash_password(env["TRAVELARR_PASSWORD"]),
-                                    "changed": now()})
-            log.info("imported the web UI password for user %s; TRAVELARR_USERNAME and TRAVELARR_PASSWORD are no "
-                     "longer used and can be removed", user)
         self.store.exec("DELETE FROM sessions WHERE expires <= ?", (int(time.time()),))
         if self.enabled():
             log.info("web UI sign-in is on for %s", self.user())

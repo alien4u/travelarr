@@ -209,7 +209,7 @@ class PlexGateway:
         plexapi.X_PLEX_PRODUCT = "travelarr"
         plexapi.X_PLEX_IDENTIFIER = cid
         plexapi.X_PLEX_VERSION = version
-        plexapi.X_PLEX_DEVICE_NAME = store.get("device_name", "travelarr")
+        plexapi.X_PLEX_DEVICE_NAME = "travelarr"
         plexapi.BASE_HEADERS = plexapi.config.reset_base_headers()
 
         self.plex_tv = PLEX_TV
@@ -217,17 +217,15 @@ class PlexGateway:
         self._lock = threading.RLock()
         self._account = None
         self._server = None
-        self._resource = None
         self.conn: dict | None = None
         self._fail: tuple[float, str] | None = None
         self._pin: dict | None = None
         self._sections: dict[tuple, object] = {}  # (server id, section key) -> section
 
-    # ------------------------------------------------------------------ auth
     def _headers(self) -> dict:
         return {"Accept": "application/json", "X-Plex-Product": "travelarr",
                 "X-Plex-Client-Identifier": self.client_id, "X-Plex-Version": self.version,
-                "X-Plex-Device-Name": self.store.get("device_name", "travelarr"),
+                "X-Plex-Device-Name": "travelarr",
                 "X-Plex-Platform": "Linux"}
 
     def token(self) -> str | None:
@@ -274,7 +272,7 @@ class PlexGateway:
 
     def reset(self) -> None:
         with self._lock:
-            self._account = self._server = self._resource = self.conn = None
+            self._account = self._server = self.conn = None
             self._fail = None
             self._sections.clear()
 
@@ -294,7 +292,6 @@ class PlexGateway:
                 self._account = MyPlexAccount(token=tok, session=self.session, timeout=20)
             return self._account
 
-    # ---------------------------------------------------------------- server
     def servers(self) -> list[dict]:
         out = []
         for r in self.account().resources():
@@ -374,7 +371,7 @@ class PlexGateway:
             raise
         except Exception as e:  # noqa: BLE001
             raise NotReady(f"{res.name} answered at {url} but the connection failed: {e}") from None
-        self._server, self._resource = srv, res
+        self._server = srv
         self._fail = None
         self.conn = {"name": res.name, "url": srv._baseurl, "kind": kind}
         log.info("connected to %s via %s (%s)", res.name, kind, srv._baseurl)
@@ -459,7 +456,6 @@ class PlexGateway:
             raise Unauthorized("Plex rejected the token")
         return None, futures.count(None)
 
-    # ---------------------------------------------------------------- browse
     def _section(self, key, srv: PlexServer | None = None) -> object:
         srv = srv or self.server()
         ck = (getattr(srv, "machineIdentifier", None), str(key))
@@ -535,7 +531,8 @@ class PlexGateway:
             out.append(d)
         return out
 
-    def _part(self, video, part, sec) -> dict:
+    @staticmethod
+    def _part(part, sec) -> dict:
         return {"id": part.id, "key": part.key, "size": part.size or 0, "file": part.file,
                 "dest": dest_rel_for(part.file, sec.locations, sec.title)}
 
@@ -545,7 +542,7 @@ class PlexGateway:
         d = self.summary(it)
         d["summary"] = getattr(it, "summary", "")
         if it.type in ("movie", "episode"):
-            d["parts"] = [self._part(it, p, sec) for p in it.iterParts()]
+            d["parts"] = [self._part(p, sec) for p in it.iterParts()]
             d["size"] = sum(p["size"] for p in d["parts"])
             if it.type == "episode":
                 d["showKey"] = str(it.grandparentRatingKey)
@@ -556,7 +553,7 @@ class PlexGateway:
                 s = seasons.setdefault(ep.parentIndex if ep.parentIndex is not None else -1,
                                        {"index": ep.parentIndex, "title": ep.parentTitle,
                                         "ratingKey": str(ep.parentRatingKey), "episodes": []})
-                parts = [self._part(ep, p, sec) for p in ep.iterParts()]
+                parts = [self._part(p, sec) for p in ep.iterParts()]
                 s["episodes"].append({"ratingKey": str(ep.ratingKey), "index": ep.index,
                                       "title": ep.title, "watched": ep.isWatched,
                                       "size": sum(p["size"] for p in parts),
@@ -565,7 +562,6 @@ class PlexGateway:
             d["size"] = sum(e["size"] for s in d["seasons"] for e in s["episodes"])
         return d
 
-    # ------------------------------------------------------------------ plan
     def plan(self, keys: list[str], mode: str = "unwatched", source: str = "browse",
              only: set[str] | None = None, server_id: str | None = None) -> list[dict]:
         """Expand movies / episodes / seasons / shows into one job per file.
@@ -615,23 +611,8 @@ class PlexGateway:
             "guid": getattr(v, "guid", None),
         }
 
-    def batch(self, srv: PlexServer, keys: list[str]) -> dict[str, object]:
-        """Full metadata (parts and streams) for many items, 100 per request."""
-        out: dict[str, object] = {}
-        for i in range(0, len(keys), 100):
-            chunk = keys[i:i + 100]
-            for it in srv.fetchItems("/library/metadata/" + ",".join(chunk)):
-                it._autoReload = False
-                # plexapi gives every item the container's library, the first item's
-                own = it._data.attrib.get("librarySectionID")
-                if own:
-                    it.librarySectionID = int(own)
-                out[str(it.ratingKey)] = it
-        return out
-
-    # -------------------------------------------------------------- download
-    def file_request(self, part_key: str, srv: PlexServer | None = None) -> tuple[str, dict]:
-        srv = srv or self.server()
+    @staticmethod
+    def file_request(part_key: str, srv: PlexServer) -> tuple[str, dict]:
         return f"{srv._baseurl}{part_key}?download=1", {"X-Plex-Token": srv._token}
 
     def read_range(self, srv: PlexServer, part_key: str, size: int, start: int, length: int) -> bytes | None:
@@ -654,18 +635,16 @@ class PlexGateway:
                  "hi": bool(s.hearingImpaired), "title": s.displayTitle}
                 for s in part.subtitleStreams() if s.key]
 
-    def subtitle_streams(self, rating_key: str, part_id: int,
-                         srv: PlexServer | None = None) -> tuple[list[dict], str | None]:
+    def subtitle_streams(self, rating_key: str, part_id: int, srv: PlexServer) -> tuple[list[dict], str | None]:
         """The part's external subtitles and the item's guid."""
-        it = (srv or self.server()).fetchItem(int(rating_key))
+        it = srv.fetchItem(int(rating_key))
         for p in it.iterParts():
             if p.id == part_id:
                 return self.text_streams(p), getattr(it, "guid", None)
         # not "no subtitles": the file is not on Plex any more, so nothing can be compared
         raise ValueError("the file on Plex changed again; run Re-sync")
 
-    def fetch_bytes(self, key: str, max_bytes: int = 20 << 20, srv: PlexServer | None = None) -> bytes:
-        srv = srv or self.server()
+    def fetch_bytes(self, key: str, srv: PlexServer, max_bytes: int = 20 << 20) -> bytes:
         with self.session.get(f"{srv._baseurl}{key}", headers={"X-Plex-Token": srv._token},
                               stream=True, timeout=(15, 60)) as r:
             r.raise_for_status()
@@ -677,8 +656,11 @@ class PlexGateway:
             return bytes(buf)
 
     def thumb(self, path: str, width: int, height: int) -> tuple[bytes, str]:
+        """The token goes in a header, never the URL: request errors quote the URL
+        and are shown to the browser (plexapi's transcodeImage puts it in the URL)."""
         srv = self.server()
-        url = srv.transcodeImage(path, height, width)
-        r = self.session.get(url, timeout=20)
+        q = urllib.parse.urlencode({"url": path, "height": height, "width": width, "minSize": 1, "upscale": 1})
+        r = self.session.get(f"{srv._baseurl}/photo/:/transcode?{q}", headers={"X-Plex-Token": srv._token},
+                             timeout=20)
         r.raise_for_status()
         return r.content, r.headers.get("Content-Type", "image/jpeg")
