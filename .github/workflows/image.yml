@@ -1,4 +1,4 @@
-# Tests every change, then publishes ghcr.io/alien4u/travelarr:
+# Publishes ghcr.io/alien4u/travelarr (tests run locally before every push, see DEVELOPMENT.md):
 #   main      -> :latest (the only tag that moves; every main push runs, so the newest commit always publishes)
 #   tag vX.Y.Z -> :X.Y.Z (must match VERSION in src/app/main.py; never overwritten)
 name: image
@@ -19,30 +19,16 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  test:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-      - run: pip install -r src/requirements.txt -r src/requirements-dev.txt
-      - name: Unit tests
-        working-directory: src
-        run: python -m unittest discover -s tests -t .
-
   image:
-    needs: test
-    # A manual run on any other branch or tag tests only.
     if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
       packages: write
     env:
       IMAGE: ghcr.io/alien4u/travelarr
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Pick the tag
         id: tag
         run: |

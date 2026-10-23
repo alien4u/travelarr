@@ -38,7 +38,7 @@ a { color: var(--busy); }
 .view { padding: 16px; max-width: 1200px; margin: 0 auto 80px; }
 .bar { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-bottom: 14px; }
 .bar .grow { flex: 1 1 200px; }
-input[type=search], input[type=text], input[type=url], input[type=number], select {
+input[type=search], input[type=text], input[type=password], input[type=url], input[type=number], select {
   width: 100%; padding: 9px 12px; border-radius: 10px; border: 1px solid var(--line); background: var(--panel); }
 select { width: auto; }
 .btn { border: 1px solid var(--line); background: var(--panel); padding: 8px 14px; border-radius: 10px; font-weight: 600; }
@@ -159,3 +159,14 @@ select { width: auto; }
   .row .actions { width: 100%; justify-content: flex-end; }
   .files-actions { margin: 14px -12px 0; padding: 12px; }
 }
+
+/* travelarr login */
+.login-wrap { position: fixed; inset: 0; z-index: 50; background: var(--bg); display: flex; align-items: flex-start;
+  justify-content: center; padding: 12vh 16px 16px; overflow-y: auto; }
+.login { width: 100%; max-width: 360px; }
+.login-brand { display: flex; align-items: center; justify-content: center; gap: 10px; font-weight: 700;
+  font-size: 22px; margin: 4px 0 18px; }
+.login-brand .logo { width: 30px; height: 30px; border-radius: 8px; }
+.login-brand .logo::after { left: 9px; top: 6px; width: 8px; height: 14px; }
+.login .btn { width: 100%; margin-top: 6px; }
+.auth-form { max-width: 360px; }

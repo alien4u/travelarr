@@ -45,6 +45,11 @@ CREATE INDEX IF NOT EXISTS jobs_show   ON jobs(show_key);
 CREATE INDEX IF NOT EXISTS jobs_status ON jobs(status);
 CREATE INDEX IF NOT EXISTS jobs_part   ON jobs(part_id);
 CREATE INDEX IF NOT EXISTS jobs_dest   ON jobs(dest_rel);
+CREATE TABLE IF NOT EXISTS sessions (
+  token_hash  TEXT PRIMARY KEY,       -- sha256 of the cookie value
+  created     INTEGER NOT NULL,       -- Unix seconds
+  expires     INTEGER NOT NULL
+);
 """
 
 PRESENT = ("queued", "downloading", "done")

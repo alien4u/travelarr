@@ -4,7 +4,7 @@
 const $ = (s, el = document) => el.querySelector(s);
 const view = $('#view');
 const S = { state: null, tab: 'watchlist', libs: null, lib: {}, q: {}, sort: {}, rid: 0, timer: null, dirty: false, path: '',
-  pick: null };
+  pick: null, locked: false };
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 const dev = () => (S.state && S.state.device) || 'NAS';
 
@@ -34,6 +34,8 @@ async function api(path, opts = {}) {
   if (!r.ok) {
     const e = new Error((data && data.error) || `HTTP ${r.status}`);
     e.code = data && data.code;
+    e.retryAfter = Number(r.headers.get('Retry-After')) || 0;
+    if (r.status === 401 && e.code === 'signin' && !S.locked) renderLogin();
     throw e;
   }
   return data;
@@ -286,13 +288,14 @@ async function pickCopy() {
 
 /* ------------------------------------------------------------ state & nav */
 async function refreshState() {
+  if (S.locked) return;
   try {
     const prev = S.state;
     S.state = await api('/api/state');
     paintPill();
     if (prev && (prev.signedIn !== S.state.signedIn || prev.serverId !== S.state.serverId)) render();
   } catch (e) {
-    $('#pill').replaceChildren(h('span', { class: 'dot bad' }), 'travelarr unreachable');
+    if (e.code !== 'signin') $('#pill').replaceChildren(h('span', { class: 'dot bad' }), 'travelarr unreachable');
   }
 }
 
@@ -323,6 +326,7 @@ function setTab(tab) {
 function render() {
   S.rid++;
   clearInterval(S.timer);
+  if (S.locked) return;
   for (const b of document.querySelectorAll('#tabs button')) b.classList.toggle('on', b.dataset.tab === S.tab);
   const st = S.state;
   $('#tabs').hidden = !(st && st.signedIn && st.serverId);
@@ -338,6 +342,54 @@ $('#tabs').addEventListener('click', e => {
   if (b) setTab(b.dataset.tab);
 });
 $('#pill').addEventListener('click', () => setTab('settings'));
+
+/* -------------------------------------------------------- travelarr login */
+// A full-page overlay, so a tab still loading underneath cannot paint over it.
+function renderLogin() {
+  S.locked = true;
+  S.rid++;
+  S.dirty = false;
+  clearInterval(S.timer);
+  closeSheet();
+  view.replaceChildren();
+  $('#tabs').hidden = true;
+  const old = $('#login');
+  if (old) old.remove();
+  const user = h('input', { type: 'text', name: 'username', autocomplete: 'username', autocapitalize: 'none',
+    spellcheck: 'false', required: true });
+  const pw = h('input', { type: 'password', name: 'password', autocomplete: 'current-password', required: true });
+  const msg = h('p', { class: 'small warn', role: 'alert' });
+  const btn = h('button', { class: 'btn primary', type: 'submit' }, 'Sign in');
+  const form = h('form', {
+    class: 'login panel', onsubmit: async e => {
+      e.preventDefault();
+      btn.disabled = true;
+      msg.textContent = '';
+      try {
+        await post('/api/login', { user: user.value, password: pw.value });
+        S.locked = false;
+        wrap.remove();
+        await refreshState();
+        render();
+        return;
+      } catch (err) {
+        msg.textContent = err.code === 'throttled'
+          ? `Too many wrong passwords. Try again in ${Math.max(1, Math.ceil(err.retryAfter / 60))} min.`
+          : err.code === 'wrong' ? 'Wrong user name or password.' : err.message;
+        pw.value = '';
+        pw.focus();
+      }
+      btn.disabled = false;
+    },
+  },
+    h('div', { class: 'login-brand' }, h('span', { class: 'logo' }), 'travelarr'),
+    h('div', { class: 'field' }, h('label', {}, 'User name'), user),
+    h('div', { class: 'field' }, h('label', {}, 'Password'), pw),
+    btn, msg);
+  const wrap = h('div', { id: 'login', class: 'login-wrap' }, form);
+  document.body.append(wrap);
+  user.focus();
+}
 
 /* ---------------------------------------------------------------- sign-in */
 function renderSignIn() {
@@ -1012,6 +1064,7 @@ function renderSettings() {
           await post('/api/auth/signout'); await refreshState(); render();
         },
       }, 'Sign out')),
+    authPanel(),
     h('div', { class: 'panel' }, h('h2', {}, 'Server'),
       h('p', {}, st.serverName || ''), h('p', { class: `small ${st.conn ? 'muted' : 'warn'}` }, connLine),
       st.conn && st.conn.kind === 'relay' ? h('p', { class: 'small warn' }, 'Plex Relay is very slow. Fix Remote Access or set a VPN address.') : null,
@@ -1042,11 +1095,63 @@ function renderSettings() {
     h('p', { class: 'muted small' }, `travelarr ${st.version}`));
 }
 
+function authPanel() {
+  const st = S.state;
+  const panel = h('div', { class: 'panel' }, h('h2', {}, 'Authentication'));
+  const msg = h('p', { class: 'small warn', role: 'alert' });
+  const input = (type, ac, value) => h('input', { type, autocomplete: ac, value: value || '', required: true });
+  const field = (label, el) => h('div', { class: 'field' }, h('label', {}, label), el);
+  const submit = (fields, label, cls, body, done) => h('form', {
+    class: 'auth-form', onsubmit: async e => {
+      e.preventDefault();
+      msg.textContent = '';
+      try { await post('/api/security', body()); toast(done); await refreshState(); render(); }
+      catch (err) { if (err.code !== 'signin') msg.textContent = err.message; }
+    },
+  }, ...fields, h('button', { class: `btn small ${cls}`, type: 'submit' }, label));
+  if (!st.authEnabled) {
+    const user = input('text', 'username', 'admin'), pw = input('password', 'new-password'), rep = input('password', 'new-password');
+    panel.append(h('p', { class: 'small warn' }, 'Off: anyone on your network can open travelarr and use your Plex sign-in.'),
+      submit([field('User name', user), field('Password (8 or more characters)', pw), field('Repeat password', rep)],
+        'Require authentication', 'primary',
+        () => ({ action: 'enable', user: user.value, password: pw.value, repeat: rep.value }), 'Authentication is on'),
+      msg);
+    return panel;
+  }
+  const box = h('div');
+  const show = form => { msg.textContent = ''; box.replaceChildren(form); };
+  const cur = () => input('password', 'current-password');
+  const changeForm = () => {
+    const c = cur(), pw = input('password', 'new-password'), rep = input('password', 'new-password');
+    return submit([field('Current password', c), field('New password (8 or more characters)', pw), field('Repeat new password', rep)],
+      'Change password', 'primary', () => ({ action: 'change', current: c.value, password: pw.value, repeat: rep.value }),
+      'Password changed; other browsers were signed out');
+  };
+  const offForm = () => {
+    const c = cur();
+    return submit([field('Current password', c)], 'Turn off authentication', 'danger',
+      () => ({ action: 'disable', current: c.value }), 'Authentication is off');
+  };
+  panel.append(h('p', {}, `Required. User name: ${st.authUser}`),
+    h('div', { class: 'bar' },
+      h('button', { class: 'btn small', onclick: () => show(changeForm()) }, 'Change password'),
+      h('button', { class: 'btn small', onclick: () => show(offForm()) }, 'Turn off'),
+      h('button', {
+        class: 'btn small', onclick: async () => { await post('/api/logout'); renderLogin(); },
+      }, 'Sign out')),
+    box, msg);
+  return panel;
+}
+
 /* ------------------------------------------------------------------- boot */
 (async function init() {
   const tab = location.hash.slice(1);
   if (['watchlist', 'movies', 'tv', 'queue', 'history', 'files', 'settings'].includes(tab)) S.tab = tab;
+  try {
+    const s = await api('/api/session');
+    if (s.authRequired && !s.signedIn) renderLogin();
+  } catch { /* refreshState reports it */ }
   await refreshState();
-  render();
+  if (!S.locked) render();
   setInterval(refreshState, 5000);
 })();

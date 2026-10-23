@@ -2,13 +2,12 @@
 files (plus subtitles) to this box over HTTPS."""
 from __future__ import annotations
 
-import base64
 import hashlib
 import json
 import logging
+import math
 import os
 import re
-import secrets
 import shutil
 import socket
 from contextlib import asynccontextmanager
@@ -20,6 +19,7 @@ from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from plexapi.exceptions import NotFound, Unauthorized
 
+from . import auth as auth_mod
 from . import resync
 from .paths import (ListingChanged, PathError, abs_path, delete_entry, list_dir, local_entry, real_rel,
                     touches)
@@ -28,19 +28,11 @@ from .resync import ResyncError
 from .store import Store, now
 from .worker import CHANGED, Downloader
 
-VERSION = "2.5.0"
+VERSION = "3.0.0"
 STATIC = os.path.join(os.path.dirname(__file__), "static")
 LOCAL_NOTE = "deleted in Local Files"
 MAX_QUEUE_KEYS = 200  # bounds the Plex requests one queue call makes
-USERNAME_RE = re.compile(r"[A-Za-z0-9._@-]{1,64}")  # no ':' (impossible in Basic auth), safe to log
 log = logging.getLogger("travelarr")
-
-
-def ui_username(value: str | None = None) -> str:
-    """The web UI user name: value, else TRAVELARR_USERNAME; empty means admin."""
-    if value is None:
-        value = os.environ.get("TRAVELARR_USERNAME")
-    return (value or "").strip() or "admin"
 
 
 def device_name() -> str:
@@ -58,16 +50,10 @@ def device_name() -> str:
 
 
 def create_app(data_dir: str | None = None, media_root: str | None = None,
-               password: str | None = None, gateway_factory=None,
-               start_worker: bool = True, device: str | None = None,
-               username: str | None = None) -> FastAPI:
+               gateway_factory=None, start_worker: bool = True, device: str | None = None,
+               env=None) -> FastAPI:
     data_dir = data_dir or os.environ.get("TRAVELARR_DATA", "/config")
     media_root = media_root or os.environ.get("TRAVELARR_MEDIA", "/media")
-    if password is None:
-        password = os.environ.get("TRAVELARR_PASSWORD") or None
-    username = ui_username(username)
-    if password and not USERNAME_RE.fullmatch(username):
-        raise ValueError("TRAVELARR_USERNAME must be 1 to 64 characters: letters, digits, '.', '_', '@' or '-'")
     device = device or device_name()
     os.makedirs(data_dir, exist_ok=True)
     thumbs = os.path.join(data_dir, "cache", "thumbs")
@@ -75,6 +61,8 @@ def create_app(data_dir: str | None = None, media_root: str | None = None,
 
     store = Store(os.path.join(data_dir, "travelarr.db"))
     store.media_root = media_root
+    auth = auth_mod.Auth(store)
+    auth.startup(os.environ if env is None else env)
     gw = (gateway_factory or (lambda s: PlexGateway(s, VERSION)))(store)
     dl = Downloader(store, gw, media_root, device)
 
@@ -92,28 +80,6 @@ def create_app(data_dir: str | None = None, media_root: str | None = None,
     app = FastAPI(title="travelarr", version=VERSION, lifespan=lifespan,
                   docs_url=None, redoc_url=None, openapi_url=None)
     app.state.store, app.state.gw, app.state.dl = store, gw, dl
-
-    # ------------------------------------------------------------- security
-    if password:
-        want_user, want_pw = username.encode(), password.encode()
-
-        @app.middleware("http")
-        async def basic_auth(request: Request, call_next):
-            scheme, _, token = request.headers.get("authorization", "").partition(" ")
-            ok = False
-            if scheme.lower() == "basic":
-                try:
-                    user, sep, pw = base64.b64decode(token.strip(), validate=True).decode().partition(":")
-                    # Both comparisons always run, so timing does not tell which one failed.
-                    user_ok = secrets.compare_digest(user.encode(), want_user)
-                    pw_ok = secrets.compare_digest(pw.encode(), want_pw)
-                    ok = bool(sep) and user_ok and pw_ok
-                except Exception:  # noqa: BLE001
-                    ok = False
-            if not ok:
-                return Response("Authentication required", status_code=401,
-                                headers={"WWW-Authenticate": 'Basic realm="travelarr", charset="UTF-8"'})
-            return await call_next(request)
 
     # --------------------------------------------------------------- errors
     def err(status: int, msg: str, code: str = "error") -> JSONResponse:
@@ -204,6 +170,113 @@ def create_app(data_dir: str | None = None, media_root: str | None = None,
             return "busy"
         return "removed" if not dl.cleanup(jid) else "deferred"
 
+    # -------------------------------------------------------------- sign-in
+    # Open while sign-in is off. When it is on, every /api/ path but these needs a session.
+    public = {"/api/session", "/api/login", "/api/logout", "/api/security"}
+
+    def set_session_cookie(resp: Response, token: str, request: Request) -> None:
+        resp.set_cookie(auth_mod.COOKIE, token, max_age=auth_mod.SESSION, path="/", httponly=True,
+                        samesite="strict", secure=request.url.scheme == "https")
+
+    @app.middleware("http")
+    async def require_session(request: Request, call_next):
+        request.state.session = None
+        renewed = False
+        if request.url.path.startswith("/api/") and auth.enabled():
+            token = request.cookies.get(auth_mod.COOKIE)
+            ok = auth.session(token)
+            if not ok and request.url.path not in public:
+                return err(401, "Sign in to travelarr", "signin")
+            request.state.session = token if ok else None
+            renewed = ok == "renewed"
+        response = await call_next(request)
+        if renewed:
+            set_session_cookie(response, request.state.session, request)
+        return response
+
+    def client_ip(request: Request) -> str:
+        return request.client.host if request.client else "unknown"
+
+    def locked(wait: int) -> JSONResponse:
+        r = err(429, f"Too many wrong passwords; try again in {math.ceil(wait / 60)} min", "throttled")
+        r.headers["Retry-After"] = str(wait)
+        return r
+
+    def password_ok(request: Request, user, password) -> JSONResponse | None:
+        """None when right; otherwise the response to send (wrong, or locked out)."""
+        ip = client_ip(request)
+        wait = auth.locked_for(ip)
+        if wait:
+            return locked(wait)
+        if auth.check(user, password):
+            auth.succeeded(ip)
+            return None
+        auth.failed(ip)
+        log.warning("wrong web UI password from %s", ip)
+        return err(401 if request.url.path == "/api/login" else 403, "Wrong user name or password", "wrong")
+
+    @app.get("/api/session")
+    def session(request: Request):
+        signed = auth.enabled() and request.state.session is not None
+        return {"authRequired": auth.enabled(), "signedIn": signed, "user": auth.user() if signed else None}
+
+    @app.post("/api/login")
+    def login(request: Request, body: dict = Body(...)):
+        if not auth.enabled():
+            return err(409, "Sign-in is off", "signin_off")
+        bad = password_ok(request, body.get("user"), body.get("password"))
+        if bad:
+            return bad
+        resp = JSONResponse({"user": auth.user()})
+        set_session_cookie(resp, auth.new_session(), request)
+        return resp
+
+    @app.post("/api/logout")
+    def logout(request: Request):
+        token = request.cookies.get(auth_mod.COOKIE)
+        if token:
+            auth.end_session(token)
+        resp = JSONResponse({"ok": True})
+        resp.delete_cookie(auth_mod.COOKIE, path="/")
+        return resp
+
+    @app.post("/api/security")
+    def security(request: Request, body: dict = Body(...)):
+        action = body.get("action")
+        if action == "enable":
+            if auth.enabled():
+                return err(409, "Sign-in is already on", "signin_on")
+            why = auth_mod.problem(body.get("user"), body.get("password"), body.get("repeat"))
+            if why:
+                return err(400, why, "invalid")
+            auth.enable(body["user"], body["password"])
+            log.info("web UI sign-in turned on for %s", body["user"])
+            resp = JSONResponse({"user": body["user"]})
+            set_session_cookie(resp, auth.new_session(), request)
+            return resp
+        if action not in ("change", "disable"):
+            return err(400, "Unknown action", "bad_request")
+        if not auth.enabled():
+            return err(409, "Sign-in is off", "signin_off")
+        if request.state.session is None:
+            return err(401, "Sign in to travelarr", "signin")
+        if action == "change":
+            why = auth_mod.problem(auth.user(), body.get("password"), body.get("repeat"))
+            if why:
+                return err(400, why, "invalid")
+        bad = password_ok(request, auth.user(), body.get("current"))
+        if bad:
+            return bad
+        if action == "change":
+            auth.change(body["password"], keep=request.state.session)
+            log.info("web UI password changed")
+            return {"ok": True}
+        auth.disable()
+        log.warning("web UI sign-in turned off")
+        resp = JSONResponse({"ok": True})
+        resp.delete_cookie(auth_mod.COOKIE, path="/")
+        return resp
+
     # ---------------------------------------------------------------- state
     @app.get("/api/state")
     def state():
@@ -212,6 +285,8 @@ def create_app(data_dir: str | None = None, media_root: str | None = None,
             "device": device,
             "signedIn": bool(gw.token()),
             "user": store.get("username"),
+            "authEnabled": auth.enabled(),
+            "authUser": auth.user() if auth.enabled() else None,
             "serverId": store.get("server_id"),
             "serverName": store.get("server_name"),
             "preferredUrl": store.get("preferred_url"),
@@ -337,7 +412,7 @@ def create_app(data_dir: str | None = None, media_root: str | None = None,
     @app.get("/api/jobs")
     def jobs(view: str = "active", q: str | None = None, limit: int = 200, offset: int = 0):
         sid = store.get("server_id")
-        rows = store.jobs(view, q, min(limit, 1000), offset)
+        rows = store.jobs(view, q, min(max(limit, 1), 1000), max(offset, 0))
         for j in rows:
             j["waiting"] = j["status"] == "queued" and bool(j["server_id"]) and j["server_id"] != sid
         return {"jobs": rows, "current": dl.snapshot(),
@@ -546,8 +621,4 @@ def create_app(data_dir: str | None = None, media_root: str | None = None,
         return FileResponse(os.path.join(STATIC, "index.html"),
                             headers={"Cache-Control": "no-cache"})
 
-    if password:
-        log.info("web UI sign-in: user name %s", username)
-    else:
-        log.warning("TRAVELARR_PASSWORD is not set: the web UI has no password")
     return app

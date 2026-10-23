@@ -13,7 +13,7 @@
 
 Sign in with Plex, browse your watchlist and libraries, and pick movies, whole shows, seasons or single episodes. travelarr copies the original files, with their external subtitles, into a share on this server in the same folder layout as at home. Play them with Infuse or any player that reads a network share. No transcoding, and no Plex server needed on this NAS.
 
-Downloads resume after dropped connections and restarts, and every resume is checked so a bad connection never leaves a corrupt file. At home it copies over your LAN; away it uses Plex Remote Access. Local Files lets you browse the share and delete what you have watched.</Overview>
+Downloads resume after dropped connections and restarts, and every resume is checked so a bad connection never leaves a corrupt file. At home it copies over your LAN; away it uses Plex Remote Access. Local Files lets you browse the share and delete what you have watched. Turn on sign-in with a user name and password in Settings.</Overview>
   <Category>Downloaders: MediaApp:Video</Category>
   <ExtraSearchTerms>plex travel offline download copy sync infuse movies tv nas</ExtraSearchTerms>
   <Date>2026-10-22</Date>
@@ -26,8 +26,7 @@ Downloads resume after dropped connections and restarts, and every resume is che
   <Config Name="WebUI port" Target="8484" Default="8484" Mode="tcp" Description="Port for the travelarr web interface." Type="Port" Display="always" Required="true" Mask="false">8484</Config>
   <Config Name="Appdata" Target="/config" Default="/mnt/user/appdata/travelarr" Mode="rw" Description="Settings, copy history and the Plex sign-in (travelarr.db)." Type="Path" Display="always" Required="true" Mask="false">/mnt/user/appdata/travelarr</Config>
   <Config Name="Media share" Target="/media" Default="/mnt/user/Media" Mode="rw" Description="Where copies land, in the same layout as at home (Movies/..., TV-Shows/...). Local Files can delete anything inside its library folders." Type="Path" Display="always" Required="true" Mask="false">/mnt/user/Media</Config>
-  <Config Name="Username" Target="TRAVELARR_USERNAME" Default="admin" Mode="" Description="User name for the web interface. Up to 64 letters, digits, dots, underscores, @ or dashes; case-sensitive." Type="Variable" Display="always" Required="true" Mask="false">admin</Config>
-  <Config Name="Password" Target="TRAVELARR_PASSWORD" Default="" Mode="" Description="Password for the web interface. Required: after sign-in travelarr holds a Plex token for your account." Type="Variable" Display="always" Required="true" Mask="true"/>
+  <Config Name="Reset sign-in" Target="TRAVELARR_RESET_LOGIN" Default="" Mode="" Description="Forgot the web UI password? Set to yes and restart: sign-in turns off. Then remove it and turn sign-in on again in Settings." Type="Variable" Display="advanced" Required="false" Mask="false"/>
   <Config Name="Device name" Target="TRAVELARR_NAME" Default="" Mode="" Description="Optional. What the UI calls this NAS (Copy to ..., On ...). Empty uses the Unraid server name." Type="Variable" Display="advanced" Required="false" Mask="false"/>
   <Config Name="Log level" Target="TRAVELARR_LOG" Default="INFO" Mode="" Description="DEBUG, INFO, WARNING or ERROR. Shown under Logs in the Docker tab." Type="Variable" Display="advanced" Required="false" Mask="false">INFO</Config>
 </Container>

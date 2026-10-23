@@ -4,7 +4,6 @@ against a fake Plex server over real HTTP, writing to a temp media folder.
 
 Run:  python -m unittest discover -s tests -v
 """
-import base64
 import contextlib
 import hashlib
 import json
@@ -28,6 +27,7 @@ import urllib3  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 
 from app import paths, plexgw, worker  # noqa: E402
+from app import auth as auth_mod  # noqa: E402
 from app import main as main_mod  # noqa: E402
 from app import store as store_mod  # noqa: E402
 from app.main import create_app  # noqa: E402
@@ -56,7 +56,7 @@ class PlexFixture(unittest.TestCase):
             return gw
 
         self.app = create_app(data_dir=os.path.join(self.tmp, "config"), media_root=self.media,
-                              password="", gateway_factory=factory, start_worker=False)
+                              env={}, gateway_factory=factory, start_worker=False)
         self.store, self.gw, self.dl = self.app.state.store, self.app.state.gw, self.app.state.dl
         self.dl.backoff = 0.01
         self.dl.chunk = 16 * 1024
@@ -1611,7 +1611,7 @@ class DeviceNameTest(unittest.TestCase):
     def test_state_and_worker_use_it(self):
         tmp = tempfile.mkdtemp()
         try:
-            app = create_app(data_dir=tmp, media_root=tmp, password="", start_worker=False, device="Road NAS",
+            app = create_app(data_dir=tmp, media_root=tmp, env={}, start_worker=False, device="Road NAS",
                              gateway_factory=lambda s: PlexGateway(s, "t"))
             with TestClient(app) as c:
                 self.assertEqual(c.get("/api/state").json()["device"], "Road NAS")
@@ -2422,105 +2422,207 @@ class MigrationTest(unittest.TestCase):
         self.assertEqual((row["replaces"], row["cleanup"], row["server_id"]), ("[]", "[]", None))
 
 
-class PasswordTest(unittest.TestCase):
+class AuthTest(unittest.TestCase):
     PW = "Zq9-pw-7731"  # distinctive, so a log line can only contain it if it was built from it
 
     def setUp(self):
         self.tmp = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, self.tmp, True)
-        env = mock.patch.dict(os.environ)
-        env.start()
-        self.addCleanup(env.stop)
-        os.environ.pop("TRAVELARR_USERNAME", None)
-        os.environ.pop("TRAVELARR_PASSWORD", None)
 
-    def app(self, password=PW, **kw):
-        return create_app(data_dir=self.tmp, media_root=self.tmp, password=password, start_worker=False,
-                          gateway_factory=lambda s: PlexGateway(s, "t"), **kw)
+    def app(self, env=None):
+        return create_app(data_dir=self.tmp, media_root=self.tmp, env=env or {}, start_worker=False,
+                          gateway_factory=lambda s: PlexGateway(s, "t"))
+
+    def client(self, env=None):
+        c = TestClient(self.app(env))
+        c.__enter__()
+        self.addCleanup(c.__exit__, None, None, None)
+        return c
+
+    def enable(self, c, user="admin", pw=PW):
+        r = c.post("/api/security", json={"action": "enable", "user": user, "password": pw, "repeat": pw})
+        self.assertEqual(r.status_code, 200, r.text)
+        return r
+
+    def test_hashing(self):
+        a, b = auth_mod.hash_password(self.PW), auth_mod.hash_password(self.PW)
+        self.assertNotEqual(a, b)                                   # a new salt every time
+        self.assertTrue(a.startswith("scrypt$16384$8$1$"))
+        self.assertTrue(auth_mod.verify_password(self.PW, a))
+        self.assertFalse(auth_mod.verify_password(self.PW + "x", a))
+        for junk in (None, "", "scrypt$1$2", "plain"):
+            self.assertFalse(auth_mod.verify_password(self.PW, junk))
+
+    def test_off_by_default(self):
+        with self.assertLogs("travelarr", "INFO") as cm:
+            c = self.client()
+        self.assertTrue(any(r.levelname == "WARNING" and "sign-in is off" in r.getMessage() for r in cm.records))
+        self.assertEqual(c.get("/api/state").status_code, 200)
+        self.assertEqual(c.get("/api/session").json(), {"authRequired": False, "signedIn": False, "user": None})
+        self.assertEqual(c.post("/api/login", json={"user": "admin", "password": "x"}).status_code, 409)
+
+    def test_turn_on_sign_in_and_out(self):
+        c = self.client()
+        for body, why in [({"user": "ad min", "password": self.PW, "repeat": self.PW}, "User name"),
+                          ({"user": "admin", "password": "short", "repeat": "short"}, "8 to 256"),
+                          ({"user": "admin", "password": self.PW, "repeat": "other"}, "do not match")]:
+            r = c.post("/api/security", json={"action": "enable", **body})
+            self.assertEqual(r.status_code, 400)
+            self.assertIn(why, r.json()["error"])
+        r = self.enable(c)
+        cookie = r.headers["set-cookie"]
+        for flag in ("travelarr_session=", "HttpOnly", "SameSite=strict", "Path=/", "Max-Age=2592000"):
+            self.assertIn(flag, cookie)
+        self.assertNotIn("Secure", cookie)
+        self.assertEqual(c.get("/api/state").json()["authUser"], "admin")
+        self.assertEqual(c.get("/api/session").json(), {"authRequired": True, "signedIn": True, "user": "admin"})
+        self.assertEqual(self.enable_again(c), 409)
+
+        other = TestClient(c.app)                                     # another browser, no session
+        r = other.get("/api/state")
+        self.assertEqual((r.status_code, r.json()["code"]), (401, "signin"))
+        self.assertEqual(other.get("/api/thumb?path=/library/x").status_code, 401)
+        self.assertEqual(other.get("/").status_code, 200)
+        self.assertEqual(other.get("/static/app.js").status_code, 200)
+        self.assertEqual(other.get("/api/session").json(), {"authRequired": True, "signedIn": False, "user": None})
+        r = other.post("/api/login", json={"user": "admin", "password": "nope"})
+        self.assertEqual((r.status_code, r.json()["code"]), (401, "wrong"))
+        self.assertEqual(other.post("/api/login", json={"user": "Admin", "password": self.PW}).status_code, 401)
+        self.assertEqual(other.post("/api/login", json={"user": "admin", "password": self.PW}).json(), {"user": "admin"})
+        self.assertEqual(other.get("/api/state").status_code, 200)
+
+        r = c.post("/api/logout", json={})
+        self.assertIn('travelarr_session=""', r.headers["set-cookie"])
+        self.assertEqual(c.get("/api/state").status_code, 401)
+        self.assertEqual(other.get("/api/state").status_code, 200)    # only that browser signed out
 
     @staticmethod
-    def basic(raw: str | bytes) -> dict:
-        raw = raw.encode() if isinstance(raw, str) else raw
-        return {"Authorization": "Basic " + base64.b64encode(raw).decode()}
+    def at(t):
+        return mock.patch.object(auth_mod, "time", types.SimpleNamespace(time=lambda: t, monotonic=time.monotonic))
 
-    @staticmethod
-    def codes(app, *headers) -> list[int]:
-        with TestClient(app) as c:
-            return [c.get("/api/state", headers=h).status_code for h in headers]
+    def enable_again(self, c):
+        return c.post("/api/security", json={"action": "enable", "user": "x", "password": self.PW,
+                                             "repeat": self.PW}).status_code
 
-    def test_user_name_is_checked(self):
-        pw = self.PW
-        self.assertEqual(self.codes(self.app(), {}, self.basic("admin:nope"), self.basic(f"anyone:{pw}"),
-                                    self.basic(f"Admin:{pw}"), self.basic(f"admin:{pw}")),
-                         [401, 401, 401, 401, 200])
+    def test_change_password_signs_out_other_browsers(self):
+        c = self.client()
+        self.enable(c)
+        other = TestClient(c.app)
+        other.post("/api/login", json={"user": "admin", "password": self.PW})
+        new = "new-" + self.PW
+        r = c.post("/api/security", json={"action": "change", "current": "nope", "password": new, "repeat": new})
+        self.assertEqual((r.status_code, r.json()["code"]), (403, "wrong"))
+        r = c.post("/api/security", json={"action": "change", "current": self.PW, "password": "short", "repeat": "short"})
+        self.assertEqual(r.status_code, 400)
+        r = c.post("/api/security", json={"action": "change", "current": self.PW, "password": new, "repeat": new})
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(c.get("/api/state").status_code, 200)        # this browser stays signed in
+        self.assertEqual(other.get("/api/state").status_code, 401)
+        self.assertEqual(other.post("/api/login", json={"user": "admin", "password": self.PW}).status_code, 401)
+        self.assertEqual(other.post("/api/login", json={"user": "admin", "password": new}).status_code, 200)
 
-    def test_challenge_and_static_page(self):
-        with TestClient(self.app()) as c:
-            r = c.get("/")
-            self.assertEqual((r.status_code, r.text), (401, "Authentication required"))
-            self.assertEqual(r.headers["www-authenticate"], 'Basic realm="travelarr", charset="UTF-8"')
-            self.assertEqual(c.get("/", headers=self.basic(f"admin:{self.PW}")).status_code, 200)
+    def test_change_and_disable_need_a_session(self):
+        c = self.client()
+        self.enable(c)
+        other = TestClient(c.app)
+        for body in ({"action": "change", "current": self.PW, "password": "x" * 9, "repeat": "x" * 9},
+                     {"action": "disable", "current": self.PW}):
+            self.assertEqual(other.post("/api/security", json=body).status_code, 401)
+        self.assertEqual(c.post("/api/security", json={"action": "nope"}).status_code, 400)
 
-    def test_custom_user_name(self):
-        self.assertEqual(self.codes(self.app(username="road"), self.basic(f"road:{self.PW}"),
-                                    self.basic(f"admin:{self.PW}")), [200, 401])
-        self.assertEqual(self.codes(self.app(username=" "), self.basic(f"admin:{self.PW}")), [200])
+    def test_turn_off(self):
+        c = self.client()
+        self.enable(c)
+        self.assertEqual(c.post("/api/security", json={"action": "disable", "current": "nope"}).status_code, 403)
+        r = c.post("/api/security", json={"action": "disable", "current": self.PW})
+        self.assertEqual(r.status_code, 200)
+        self.assertIn('travelarr_session=""', r.headers["set-cookie"])
+        self.assertEqual(TestClient(c.app).get("/api/state").status_code, 200)
+        self.assertEqual(c.app.state.store.rows("SELECT * FROM sessions"), [])
+        self.assertIsNone(c.app.state.store.get("auth")["hash"])
+        self.enable(c, user="road")                                   # and on again, with a new user name
+        self.assertEqual(c.get("/api/state").json()["authUser"], "road")
 
-    def test_user_name_from_env(self):
-        for value, user in [("bob", "bob"), (" bob ", "bob"), ("  ", "admin"), (None, "admin")]:
-            if value is None:
-                os.environ.pop("TRAVELARR_USERNAME", None)
-            else:
-                os.environ["TRAVELARR_USERNAME"] = value
-            self.assertEqual(self.codes(self.app(), self.basic(f"{user}:{self.PW}")), [200], value)
-        os.environ["TRAVELARR_USERNAME"] = " bob "
-        self.assertEqual(self.codes(self.app(), self.basic(f" bob:{self.PW}")), [401])
-        self.assertEqual(self.codes(self.app(username="road"), self.basic(f"road:{self.PW}"),
-                                    self.basic(f"bob:{self.PW}")), [200, 401])
+    def test_lockout_after_five_wrong_passwords(self):
+        c = self.client()
+        self.enable(c)
+        other = TestClient(c.app)
+        clock = [1000.0]
+        fake = types.SimpleNamespace(time=time.time, monotonic=lambda: clock[0])
+        with mock.patch.object(auth_mod, "time", fake):
+            codes = [other.post("/api/login", json={"user": "admin", "password": "nope"}).status_code
+                     for _ in range(5)]
+            self.assertEqual(codes, [401] * 5)
+            r = other.post("/api/login", json={"user": "admin", "password": self.PW})   # right, but locked
+            self.assertEqual((r.status_code, r.json()["code"], r.headers["retry-after"]), (429, "throttled", "300"))
+            clock[0] += auth_mod.LOCK
+            self.assertEqual(other.post("/api/login", json={"user": "admin", "password": self.PW}).status_code, 200)
 
-    def test_passwords_with_colons_and_non_ascii(self):
-        self.assertEqual(self.codes(self.app(password="pa:ss"), self.basic("admin:pa:ss")), [200])
-        self.assertEqual(self.codes(self.app(password="contraseña"), self.basic("admin:contraseña"),
-                                    self.basic("admin:contrasena")), [200, 401])
+    def test_session_expiry_and_renewal(self):
+        c = self.client()
+        t0 = time.time()
+        with self.at(t0):
+            self.enable(c)
+        day = 24 * 3600
+        with self.at(t0 + 10 * day):
+            r = c.get("/api/state")
+            self.assertEqual(r.status_code, 200)
+            self.assertNotIn("set-cookie", r.headers)
+        with self.at(t0 + 20 * day):
+            r = c.get("/api/state")                                   # past half its life: renewed
+            self.assertIn("travelarr_session=", r.headers["set-cookie"])
+        with self.at(t0 + 50 * day):                                  # 30 days after the renewal
+            self.assertEqual(c.get("/api/state").status_code, 401)
+        with self.at(t0 + 50 * day + 1):
+            self.assertEqual(c.get("/api/state").status_code, 401)
 
-    def test_malformed_headers(self):
-        raw = f"admin:{self.PW}".encode()
-        good = base64.b64encode(raw).decode()
-        self.assertTrue(good.endswith("="))
-        junk = [good[:4] + "!" + good[4:], good + "*", good[:8] + " " + good[8:]]
-        for token in junk:  # a lenient decoder skips the junk and gets the right credentials
-            self.assertEqual(base64.b64decode(token), raw)
-        hdrs = [{"Authorization": "basic " + good}, {"Authorization": "Basic  " + good},
-                {"Authorization": "Bearer " + good}, {"Authorization": "Basic"},
-                {"Authorization": "Basic " + good.rstrip("=")},
-                self.basic(b"admin" + self.PW.encode()), self.basic(b"admin:\xff\xfe")]
-        hdrs += [{"Authorization": "Basic " + t} for t in junk]
-        self.assertEqual(self.codes(self.app(), *hdrs), [200, 200, 401, 401, 401, 401, 401, 401, 401, 401])
-
-    def test_user_name_validation(self):
-        for name in ["admin", "alien.torres@home", "a", "A_b-9", "x" * 64]:
-            self.app(username=name)
-        for name in ["a:b", "ad min", "José", "ad\x01min", "x" * 65]:
-            with self.assertRaises(ValueError) as cm:
-                self.app(username=name)
-            self.assertIn("TRAVELARR_USERNAME", str(cm.exception))
-        self.assertEqual(self.codes(self.app(password="", username="a:b"), {}), [200])
-
-    def test_no_password_is_open(self):
-        self.assertEqual(self.codes(self.app(password=None), {}), [200])
-
-    def test_startup_log(self):
+    def test_password_from_2x_is_imported_once(self):
+        env = {"TRAVELARR_PASSWORD": "short", "TRAVELARR_USERNAME": " bob "}
         with self.assertLogs("travelarr", "INFO") as cm:
-            self.app(username="road")
-        lines = [(r.levelname, r.getMessage()) for r in cm.records]
-        self.assertEqual([x for x in lines if "sign-in" in x[1] or "password" in x[1]],
-                         [("INFO", "web UI sign-in: user name road")])
-        self.assertFalse(any(self.PW in m for _, m in lines))
+            c = self.client(env)
+        self.assertFalse(any("short" in r.getMessage() for r in cm.records))
+        self.assertEqual(c.post("/api/login", json={"user": "bob", "password": "short"}).status_code, 200)
+        c = self.client({"TRAVELARR_PASSWORD": "other", "TRAVELARR_USERNAME": "eve"})    # ignored from now on
+        self.assertEqual(c.post("/api/login", json={"user": "bob", "password": "short"}).status_code, 200)
+
+    def test_import_edge_cases(self):
+        with self.assertLogs("travelarr", "WARNING"):
+            c = self.client({"TRAVELARR_PASSWORD": self.PW, "TRAVELARR_USERNAME": "a:b"})
+        self.assertEqual(c.post("/api/login", json={"user": "admin", "password": self.PW}).status_code, 200)
+        shutil.rmtree(self.tmp)
+        self.tmp = tempfile.mkdtemp()
+        c = self.client({"TRAVELARR_PASSWORD": ""})
+        self.assertEqual(c.get("/api/session").json()["authRequired"], False)
+
+    def test_reset_variable(self):
+        c = self.client()
+        self.enable(c)
+        with self.assertLogs("travelarr", "WARNING") as cm:
+            c = self.client({"TRAVELARR_RESET_LOGIN": "yes", "TRAVELARR_PASSWORD": self.PW})
+        self.assertTrue(any("TRAVELARR_RESET_LOGIN" in r.getMessage() for r in cm.records))
+        self.assertEqual(TestClient(c.app).get("/api/state").status_code, 200)
+        self.assertEqual(c.app.state.store.rows("SELECT * FROM sessions"), [])
+        c = self.client()                                              # without it: still off, nothing imported
+        self.assertFalse(c.get("/api/session").json()["authRequired"])
+
+    def test_hash_and_password_never_leave(self):
         with self.assertLogs("travelarr", "INFO") as cm:
-            self.app(password="")
-        self.assertEqual([r.levelname for r in cm.records if "no password" in r.getMessage()], ["WARNING"])
-        with self.assertNoLogs("travelarr", "INFO"), self.assertRaises(ValueError):
-            self.app(username="a:b")
+            c = self.client()
+            self.enable(c)
+            TestClient(c.app).post("/api/login", json={"user": "admin", "password": "wrong-" + self.PW})
+        stored = c.app.state.store.get("auth")["hash"]
+        self.assertFalse(any(self.PW in r.getMessage() for r in cm.records))
+        body = c.get("/api/state").text + c.get("/api/session").text
+        self.assertNotIn(stored.split("$")[-1], body)
+        self.assertNotIn("hash", body)
+
+    def test_jobs_limit_is_bounded(self):
+        c = self.client()
+        seen = []
+        with mock.patch.object(c.app.state.store, "jobs", lambda *a: seen.append(a) or []):
+            c.get("/api/jobs?view=history&limit=-1&offset=-5")
+            c.get("/api/jobs?view=history&limit=5000")
+        self.assertEqual([(a[2], a[3]) for a in seen], [(1, 0), (1000, 0)])
 
 
 class PathsTest(unittest.TestCase):
