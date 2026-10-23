@@ -308,6 +308,25 @@ def _exists(media_root: str, rel: str) -> bool:
         return True
 
 
+def title_folder(media_root: str, d: dict) -> str | None:
+    """The NAS folder a movie or show page re-syncs: the show's folder, or the
+    movie's own folder (not a library folder); None when it is not on the NAS."""
+    if d["type"] == "show":
+        dests = [e["dest"] for s in d["seasons"] for e in s["episodes"] if e.get("dest")]
+        rel = "/".join(dests[0].split("/")[:2]) if dests else None
+    elif d["type"] == "movie":
+        rel = posixpath.dirname(d["parts"][0]["dest"]) if d.get("parts") else None
+    else:
+        return None
+    if not rel or "/" not in rel:
+        return None
+    try:
+        full = abs_path(media_root, rel)
+    except PathError:
+        return None
+    return rel if os.path.isdir(full) and os.path.realpath(full) == full else None
+
+
 def _public(item: dict) -> dict:
     return {k: v for k, v in item.items() if not k.startswith("_")}
 

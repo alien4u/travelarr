@@ -626,6 +626,7 @@ function videoBody(d) {
       class: 'btn small', onclick: async () => { for (const j of active) await post(`/api/jobs/${j.id}/cancel`); S.dirty = true; openItem(d.ratingKey); },
     }, 'Cancel'));
   }
+  actions.append(resyncButton(d));
   if (st === 'done') actions.append(h('button', {
     class: 'btn small danger', onclick: async () => {
       if (!confirm(`Delete "${d.title}" from ${dev()}?`)) return;
@@ -698,7 +699,14 @@ function showBody(d) {
       h('button', { class: 'btn small', onclick: pick(() => true) }, 'All'),
       h('button', { class: 'btn small', onclick: pick(() => false) }, 'None')),
     seasons,
-    h('div', { class: 'sticky-actions' }, copyBtn, removeBtn));
+    h('div', { class: 'sticky-actions' }, copyBtn, resyncButton(d), removeBtn));
+}
+
+/* the title's folder on the NAS, re-synced like that folder in Local Files */
+function resyncButton(d) {
+  return d.nasFolder ? h('button', {
+    class: 'btn small', onclick: () => openResync(d.nasFolder, () => openItem(d.ratingKey)),
+  }, 'Re-sync from Plex') : null;
 }
 
 /* ----------------------------------------------------------------- resync */
@@ -712,15 +720,15 @@ function resyncLine(i) {
   return (i.reason || i.kind).replace('the NAS', dev()) + (i.watched ? ' · watched' : '');
 }
 
-async function openResync(path) {
+async function openResync(path, back = closeSheet) {
   const head = h('div', { class: 'detail-head' }, h('div', {},
     h('h1', {}, `Re-sync ${path ? path.split('/').pop() : `everything on ${dev()}`}`),
     h('div', { class: 'muted small' }, `Compares the videos on ${dev()} with Plex and fetches their subtitles again.`)));
-  const backBtn = h('button', { class: 'btn small', onclick: closeSheet }, 'Back');
+  const backBtn = h('button', { class: 'btn small', onclick: () => back() }, 'Back');
   openSheet(head, h('div', { class: 'spinner' }), h('p', { class: 'muted small' }, 'Checking...'));
   let d;
   try { d = await post('/api/resync/check', { path }); }
-  catch (e) { return openSheet(head, errorPanel(e, () => openResync(path)), backBtn); }
+  catch (e) { return openSheet(head, errorPanel(e, () => openResync(path, back)), backBtn); }
   if (!d.checked && !d.items.length) {
     return openSheet(head, h('div', { class: 'empty' }, 'No videos from Plex in this folder.'), backBtn);
   }
@@ -745,7 +753,7 @@ async function openResync(path) {
       if (r.warning) setTimeout(() => toast(r.warning), 3600);
       S.dirty = true;
       refreshState();
-      closeSheet();
+      back();
     } catch (e) { toast(e.message); paint(); }
   };
   const rows = act.map(i => {

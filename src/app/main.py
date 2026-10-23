@@ -28,7 +28,7 @@ from .resync import ResyncError
 from .store import Store, now
 from .worker import CHANGED, Downloader
 
-VERSION = "3.3.0"
+VERSION = "3.4.0"
 STATIC = os.path.join(os.path.dirname(__file__), "static")
 LOCAL_NOTE = "deleted in Local Files"
 MAX_QUEUE_KEYS = 200  # bounds the Plex requests one queue call makes
@@ -379,6 +379,7 @@ def create_app(data_dir: str | None = None, media_root: str | None = None,
         jobs = (store.jobs_for(show_key=rk, server_id=sid) if d["type"] == "show"
                 else store.jobs_for(rating_key=rk, server_id=sid))
         d["history"] = jobs[-50:]
+        d["nasFolder"] = resync.title_folder(media_root, d)
         return d
 
     # ---------------------------------------------------------------- queue

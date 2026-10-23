@@ -1794,6 +1794,15 @@ class ResyncTest(PlexFixture):
         found = self.row("201", "removed")
         self.assertEqual((found["dest_rel"], found["note"]), (old, "replaced by a re-sync"))
 
+    def test_title_pages_name_their_folder_on_the_nas(self):
+        item = lambda rk: self.c.get(f"/api/item/{rk}").json()  # noqa: E731
+        self.assertEqual([item(rk)["nasFolder"] for rk in ("101", "200")], [None, None])   # not on the NAS
+        self.copy("101", "102", "201")
+        self.assertEqual(item("101")["nasFolder"], self.HEAT_DIR)
+        self.assertIsNone(item("102")["nasFolder"])                  # a loose movie: that is the library folder
+        self.assertEqual(item("200")["nasFolder"], self.SHOW)
+        self.assertEqual(self.kinds(item("200")["nasFolder"]), {"202": "absent"})
+
     def test_failed_copies_and_rows_of_another_server(self):
         self.copy("201")
         row = self.row("201")
