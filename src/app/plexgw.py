@@ -19,6 +19,7 @@ import requests
 from plexapi.exceptions import Unauthorized
 from plexapi.myplex import MyPlexAccount
 from plexapi.server import PlexServer
+from plexapi.sync import VIDEO_QUALITY_1_5_MBPS_480p, VIDEO_QUALITY_4_MBPS_720p, VIDEO_QUALITY_12_MBPS_1080p
 from requests.certs import where as ca_bundle
 
 from .paths import dest_rel_for, in_versions, unversioned, version_rel
@@ -247,6 +248,19 @@ def pick_media(video, pref: str):
             return min(media, key=_size)
         return max(fit, key=lambda m: (_lines(m), not _optimized(m), m.bitrate or 0, _size(m)))
     return max([m for m in media if not _optimized(m)] or media, key=_size)
+
+
+# A cap no version fits under can be met by asking Plex to Optimize the video:
+# Plex Pass transcodes it on the server into a new version beside the original,
+# which the cap then picks. Plex's "Universal TV" profile at these qualities.
+OPTIMIZE = {"1080": (VIDEO_QUALITY_12_MBPS_1080p, "1080p"), "720": (VIDEO_QUALITY_4_MBPS_720p, "720p"),
+            "sd": (VIDEO_QUALITY_1_5_MBPS_480p, "SD")}
+
+
+def above_cap(video, pref: str) -> bool:
+    """The version a cap picks is above it: no version fits."""
+    m = pick_media(video, pref) if pref in CAPS else None
+    return m is not None and (_lines(m) or CAPS[pref] + 1) > CAPS[pref]
 
 
 def _original(video, but=None):
@@ -652,6 +666,7 @@ class PlexGateway:
             d["parts"] = [self._part(p, dest) for p, dest in chosen_parts(it, sec, pref)]
             d["size"] = sum(p["size"] for p in d["parts"])
             d["versions"] = version_count(it)
+            d["optimize"] = self.optimize_state(it, pref)
             if it.type == "episode":
                 d["showKey"] = str(it.grandparentRatingKey)
         if it.type == "show":
@@ -671,6 +686,37 @@ class PlexGateway:
             d["seasons"] = [seasons[k] for k in sorted(seasons)]
             d["size"] = sum(e["size"] for s in d["seasons"] for e in s["episodes"])
         return d
+
+    def optimize_state(self, it, pref: str) -> dict | None:
+        """For a movie or episode a cap picks a version above it: whether Plex is
+        making a version (state 'optimizing', progress 0-100 once it started) or can
+        be asked to ('available'). None when nothing needs making."""
+        if pref not in OPTIMIZE or it.type not in ("movie", "episode") or not above_cap(it, pref):
+            return None
+        d = {"cap": pref, "label": OPTIMIZE[pref][1], "state": "available", "progress": None}
+        srv, rk = it._server, str(it.ratingKey)
+        try:
+            if any(str(c.ratingKey) == rk for c in srv.conversions()):
+                d["state"] = "optimizing"
+                job = next((j for j in srv.currentBackgroundProcess() if str(j.ratingKey) == rk), None)
+                if job is not None and job.progress is not None:
+                    d["progress"] = round(float(job.progress))
+        except Exception as e:  # noqa: BLE001 - the page still offers to ask
+            log.info("Plex's conversion queue: %s", e)
+        return d
+
+    def optimize(self, rating_key: str, pref: str) -> dict | None:
+        """Ask Plex to Optimize a movie or episode to the cap pref (once: not when
+        it is already being made, or a version already fits)."""
+        it = self.server().fetchItem(int(rating_key))
+        st = self.optimize_state(it, pref)
+        if st is None or st["state"] != "available":
+            return st
+        name = it.title if it.type == "movie" else f"{it.grandparentTitle} {it.seasonEpisode.upper()}"
+        it.optimize(title=f"{name} ({OPTIMIZE[pref][1]}, travelarr)", deviceProfile="Universal TV",
+                    videoQuality=OPTIMIZE[pref][0])
+        log.info("asked Plex to make a %s version of %s", OPTIMIZE[pref][1], name)
+        return self.optimize_state(it, pref)
 
     def plan(self, keys: list[str], mode: str = "unwatched", source: str = "browse",
              only: set[str] | None = None, server_id: str | None = None,

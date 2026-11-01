@@ -80,6 +80,11 @@ class FakePlex:
         self.versions = {pid: 1 for pid in self.parts}
         self.watchlist = [("movie", "plex://movie/heat", "Heat"), ("show", "plex://show/a", "Show A"),
                           ("movie", "plex://movie/nope", "Not Owned")]
+        # Plex's Optimize: the items asked for (Settings > Optimized Versions), and the
+        # conversion queue (rating key -> generator id, progress or None until started)
+        self.optimize_items: list[dict] = []
+        self.conversions: dict[int, dict] = {}
+        self.optimize_status: int | None = None    # makes the optimize request fail with this status
         outer = self
 
         class H(BaseHTTPRequestHandler):
@@ -97,6 +102,9 @@ class FakePlex:
             def do_HEAD(self):
                 outer.handle(self, "HEAD")
 
+            def do_PUT(self):
+                outer.handle(self, "PUT")
+
         self.httpd = ThreadingHTTPServer(("127.0.0.1", 0), H)
         self.url = f"http://127.0.0.1:{self.httpd.server_port}"
         threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
@@ -113,6 +121,54 @@ class FakePlex:
         self.parts[part] = content or bytes((i * 13 + part) % 251 for i in range(size))
         self.versions[part] = 1
         return x
+
+    def finish_optimize(self, rk, part, size, res="1080", width=1920, bitrate=12_000):
+        """Plex finishes the queued conversion of rk: it leaves the queue and the video
+        gains an Optimized Version in 'Plex Versions' beside the original."""
+        conv = self.conversions.pop(rk)
+        v = next(x for x in self.movies + self.episodes if x["rk"] == rk)
+        target = next(i["target"] for i in self.optimize_items if i["id"] == conv["generator"])
+        base = posixpath.splitext(posixpath.basename(v["file"]))[0]
+        file = f"{posixpath.dirname(v['file'])}/Plex Versions/{target}/{base}.mp4"
+        return self.add_version(v, part, file, size, res=res, width=width, bitrate=bitrate, optimized=True)
+
+    # ------------------------------------------------------------ optimize
+    TARGETS = [(1, "Optimized for Mobile", "Universal Mobile"), (2, "Optimized for TV", "Universal TV"),
+               (3, "Original Quality", "Universal TV")]
+
+    def optimize(self, h, q):
+        """PUT /playlists/900/items: Plex's Optimize request for one video (the
+        Item[...] parameters plexapi's Video.optimize sends)."""
+        if self.optimize_status:
+            return self.send(h, self.optimize_status, b"<html>refused</html>", "text/html")
+        m = re.fullmatch(r"library://u[12]/item/%2Flibrary%2Fmetadata%2F(\d+)", q.get("Item[Location][uri]", ""))
+        rk = int(m.group(1)) if m else None
+        known = {x["rk"] for x in self.movies + self.episodes}
+        tag = q.get("Item[targetTagID]")
+        if q.get("Item[type]") != "42" or rk not in known or not (
+                tag in {str(t[0]) for t in self.TARGETS} or (q.get("Item[Device][profile]")
+                                                              and q.get("Item[MediaSettings][videoResolution]"))):
+            return self.send(h, 400, b"<html>400 Bad Request</html>", "text/html")
+        target = q.get("Item[target]") or next(t[1] for t in self.TARGETS if str(t[0]) == tag)
+        item = dict(id=100 + len(self.optimize_items), rk=rk, title=q.get("Item[title]", ""), target=target,
+                    profile=q.get("Item[Device][profile]"),
+                    resolution=q.get("Item[MediaSettings][videoResolution]"),
+                    bitrate=q.get("Item[MediaSettings][maxVideoBitrate]"))
+        self.optimize_items.append(item)
+        self.conversions[rk] = dict(generator=item["id"], progress=None)
+        return self.mc(h, size=0)
+
+    def optimize_xml(self):
+        out = ""
+        for i in self.optimize_items:
+            sec = 1 if any(x["rk"] == i["rk"] for x in self.movies) else 2
+            out += "<Item " + attrs({"id": i["id"], "type": 42, "title": i["title"], "target": i["target"]}) + ">"
+            out += "<MediaSettings " + attrs({"videoResolution": i["resolution"],
+                                              "maxVideoBitrate": i["bitrate"]}) + "/>"
+            out += "<Location " + attrs({"uri": f"library://u{sec}/item/%2Flibrary%2Fmetadata%2F{i['rk']}",
+                                         "librarySectionID": sec}) + "/>"
+            out += "<Device " + attrs({"profile": i["profile"]}) + "/></Item>"
+        return out
 
     # ---------------------------------------------------------------- xml
     def part_xml(self, v, full, folder=None):
@@ -313,6 +369,28 @@ class FakePlex:
                     if s["id"] == sid and s.get("body"):
                         return self.send(h, 200, s["body"].encode(), "text/plain")
             return self.send(h, 404, b"<html>404</html>", "text/html")
+        # Optimize: the background processing list, its targets, the queue and the running job
+        if path == "/playlists" and q.get("type") == "42":
+            return self.mc(h, '<Playlist ratingKey="900" key="/playlists/900/items" type="playlist" '
+                              'title="Background Processing List" playlistType="backgroundProcessing"/>', size=1)
+        if path == "/library/tags" and q.get("type") == "42":
+            return self.mc(h, "".join("<Tag " + attrs({"id": i, "filter": f"mediaProcessingTarget={i}", "tag": t,
+                                                       "tagType": 42}) + f'><Device profile="{p}"/></Tag>'
+                                      for i, t, p in self.TARGETS), size=len(self.TARGETS))
+        if path == "/playlists/900/items" and method == "PUT":
+            return self.optimize(h, q)
+        if path == "/playlists/900/items":
+            return self.mc(h, self.optimize_xml(), size=len(self.optimize_items))
+        if path == "/playQueues/1":
+            items = "".join("<Video " + attrs({"ratingKey": rk, "generatorID": c["generator"], "playlistID": 900,
+                                               "type": "movie", "title": f"item {rk}"}) + "/>"
+                            for rk, c in self.conversions.items())
+            return self.mc(h, items, size=len(self.conversions), playQueueID=1)
+        if path == "/status/sessions/background":
+            jobs = "".join("<TranscodeJob " + attrs({"ratingKey": rk, "generatorID": c["generator"],
+                                                     "progress": c["progress"], "type": "transcode"}) + "/>"
+                           for rk, c in self.conversions.items() if c["progress"] is not None)
+            return self.mc(h, jobs, size=jobs.count("<TranscodeJob"))
         if path == "/photo/:/transcode":
             if "missing" in q.get("url", ""):
                 return self.send(h, 404, b"<html>404</html>", "text/html")
