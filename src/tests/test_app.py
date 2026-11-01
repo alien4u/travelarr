@@ -454,7 +454,7 @@ class AppTest(PlexFixture):
         self.assertIn("travelarr", r.text)
         self.assertEqual(r.headers["cache-control"], "no-cache")
         for asset in ("app.js", "style.css"):
-            url = f"/static/{asset}?v={main_mod.VERSION}"
+            url = f"/static/{asset}?v={main_mod.asset_hash(asset)}"   # changes whenever the file does
             self.assertIn(f'"{url}"', r.text)
             self.assertEqual(self.c.get(url).status_code, 200)
 

@@ -35,6 +35,11 @@ MAX_QUEUE_KEYS = 200  # bounds the Plex requests one queue call makes
 log = logging.getLogger("travelarr")
 
 
+def asset_hash(name: str) -> str:
+    with open(os.path.join(STATIC, name), "rb") as fh:
+        return hashlib.sha256(fh.read()).hexdigest()[:12]
+
+
 def device_name() -> str:
     """What the UI calls this box: TRAVELARR_NAME, else the Unraid server name
     (Unraid passes HOST_HOSTNAME to every container it creates), else the host
@@ -634,8 +639,9 @@ def create_app(data_dir: str | None = None, media_root: str | None = None,
 
     app.mount("/static", StaticFiles(directory=STATIC), name="static")
     with open(os.path.join(STATIC, "index.html"), encoding="utf-8") as fh:
-        # a new version is a new URL, so browsers never run an old app.js after an update
-        page = re.sub(r'"(/static/[\w.-]+\.(?:js|css))"', rf'"\1?v={VERSION}"', fh.read())
+        # changed contents are a new URL (not only a new version: a build between releases
+        # changes them too), so browsers never run an old app.js after an update
+        page = re.sub(r'"(/static/([\w.-]+\.(?:js|css)))"', lambda m: f'"{m[1]}?v={asset_hash(m[2])}"', fh.read())
 
     @app.get("/")
     def index():
