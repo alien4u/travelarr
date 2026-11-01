@@ -2817,7 +2817,8 @@ class OptimizeTest(PlexFixture):
     def test_make_a_version_follow_it_and_copy_it(self):
         self.prefer("1080")
         d = self.item()
-        self.assertEqual(d["optimize"], {"cap": "1080", "label": "1080p", "state": "available", "progress": None})
+        self.assertEqual(d["optimize"], {"cap": "1080", "label": "1080p", "state": "available", "progress": None,
+                                         "noVideo": False})
         self.assertEqual(self.pick(), ([(1001, HEAT)], 300_000))       # the smallest, above the cap
 
         r = self.ask()
@@ -2829,7 +2830,7 @@ class OptimizeTest(PlexFixture):
         self.assertEqual(self.ask().json()["optimize"]["state"], "optimizing")    # asked once, not twice
         self.assertEqual(len(self.fake.optimize_items), 1)
         self.assertEqual(self.item()["optimize"], {"cap": "1080", "label": "1080p", "state": "optimizing",
-                                                   "progress": None})               # queued, not started
+                                                   "progress": None, "noVideo": False})   # queued, not started
         self.fake.conversions[101]["progress"] = 41.6
         self.assertEqual(self.item()["optimize"]["progress"], 42)
 
@@ -2855,6 +2856,17 @@ class OptimizeTest(PlexFixture):
         self.assertIsNone(self.item()["optimize"])                           # a 720p version fits
         self.assertEqual(self.item(version="sd")["optimize"]["state"], "available")
         self.assertNotIn("optimize", self.item("200"))                       # a show page offers none
+
+    def test_a_version_plex_made_without_video_is_never_copied(self):
+        # Plex can finish a conversion as complete with only the audio in it (no video stream)
+        self.prefer("1080")
+        self.assertEqual(self.ask().json()["optimize"]["state"], "optimizing")
+        self.fake.finish_optimize(101, 1601, 9_000, res=None, width=None, bitrate=121)
+        d = self.item()
+        self.assertEqual((d["optimize"]["state"], d["optimize"]["noVideo"]), ("available", True))
+        self.assertEqual(self.pick(), ([(1001, HEAT)], 300_000))         # the original, not the audio
+        self.assertEqual(self.pick(version="smallest"), ([(1001, HEAT)], 300_000))
+        self.assertEqual(self.queue("101")["bytes"], 300_000)
 
     def test_an_episode_and_lower_caps(self):
         ep = next(e for e in self.fake.episodes if e["rk"] == 202)

@@ -656,7 +656,12 @@ function optimizeControl(d) {
         openItem(d.ratingKey, d.mediaVersion);
       },
     }, `Make ${o.label} version on ${server}`);
-    return btn;
+    if (!o.noVideo) return btn;
+    const both = document.createDocumentFragment();
+    both.append(btn, h('p', { class: 'small warn' },
+      `The version ${server} made before has no video (its conversion failed), so it is never copied. `
+      + `Delete it in Plex (Settings › Optimized Versions) before making another.`));
+    return both;
   }
   const text = p => `Making ${o.label} on ${server}${p == null ? ' (queued)' : ` · ${p}%`}`;
   const chip = h('span', { class: 'chip busy' }, text(o.progress));

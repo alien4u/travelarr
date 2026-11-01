@@ -229,14 +229,20 @@ def _lines(media) -> int | None:
     return next((lines for w, lines in ((3200, 2160), (2200, 1440), (1600, 1080), (1000, 720)) if width >= w), 480)
 
 
+def _no_video(media) -> bool:
+    """A version Plex optimized without a video stream: a failed conversion Plex
+    still lists as complete (seen on a 4K HEVC source), audio only."""
+    return _optimized(media) and not any(getattr(media, a, None) for a in ("videoCodec", "videoResolution", "width"))
+
+
 def pick_media(video, pref: str):
     """The version of video to copy; None when Plex has no file for it.
     'original': the largest version Plex did not optimize (what a single-version
     item always was); 'smallest': the fewest bytes; a cap ('2160' ... 'sd'): the
     highest resolution at or under it, then a version Plex did not optimize (an
     'Original Quality' optimized copy can be bigger than the original), then
-    bitrate; else the smallest."""
-    media = [m for m in video.media if m.parts]
+    bitrate; else the smallest. Never an optimized version without video."""
+    media = [m for m in video.media if m.parts and not _no_video(m)]
     if len(media) <= 1:
         return media[0] if media else None
     if pref == "smallest":
@@ -693,7 +699,8 @@ class PlexGateway:
         be asked to ('available'). None when nothing needs making."""
         if pref not in OPTIMIZE or it.type not in ("movie", "episode") or not above_cap(it, pref):
             return None
-        d = {"cap": pref, "label": OPTIMIZE[pref][1], "state": "available", "progress": None}
+        d = {"cap": pref, "label": OPTIMIZE[pref][1], "state": "available", "progress": None,
+             "noVideo": any(m.parts and _no_video(m) for m in it.media)}   # Plex made one before, without video
         srv, rk = it._server, str(it.ratingKey)
         try:
             if any(str(c.ratingKey) == rk for c in srv.conversions()):
