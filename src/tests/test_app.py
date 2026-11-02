@@ -2697,6 +2697,7 @@ class VersionTest(PlexFixture):
         self.assertEqual((r["added"], r["skipped"]), (0, 1))
         self.assertEqual(self.kinds(self.HEAT_DIR), {"101": "upgraded"})
         item = self.check(self.HEAT_DIR)["items"][0]
+        self.assertTrue(item["versionChange"])
         self.assertEqual(item["video"], {"from": {"file": "Heat (1995).mkv", "size": 300_000},
                                          "to": {"file": "Heat (1995).mp4", "size": 100_000}})
         r = self.apply(self.HEAT_DIR, "101").json()
@@ -2707,7 +2708,82 @@ class VersionTest(PlexFixture):
         self.assertEqual(self.read("Movies/Heat (1995)/Heat (1995).es.srt"), SRT_BODY("Hola").encode())
         self.assertEqual(self.check(self.HEAT_DIR)["items"], [])
         self.prefer("original")                                            # and back
-        self.assertEqual(self.kinds(self.HEAT_DIR), {"101": "upgraded"})
+        item = self.check(self.HEAT_DIR)["items"][0]
+        self.assertEqual((item["kind"], item["versionChange"]), ("upgraded", True))
+
+    def test_a_copy_chosen_on_its_page_is_a_version_change(self):
+        self.prefer("1080")
+        self.queue("101", mediaVersion="original")
+        self.drain()
+        item = self.check(self.HEAT_DIR)["items"][0]
+        self.assertEqual((item["kind"], item["versionChange"]), ("upgraded", True))
+        self.assertEqual(self.apply(self.HEAT_DIR).json()["upgrades"], 0)  # nothing ticked, nothing replaced
+        self.drain()
+        self.assertEqual(self.read(HEAT), self.fake.parts[1001])
+
+    def test_back_to_all_versions_is_a_version_change(self):
+        self.prefer("1080")
+        self.copy("101")
+        self.prefer("all")
+        item = self.check(self.HEAT_DIR)["items"][0]                       # the folder view has only the original
+        self.assertEqual((item["kind"], item["versionChange"]), ("upgraded", True))
+        self.assertEqual(self.apply(self.HEAT_DIR).json()["upgrades"], 0)
+        self.drain()
+        self.assertEqual(self.read(self.HEAT_MP4), self.fake.parts[1501])
+
+    def test_a_version_of_the_same_name_is_a_version_change(self):
+        same = f"{MOVIES}/Heat (1995)/Plex Versions/Optimized for TV/Heat (1995).mkv"
+        self.heat["versions"] = []
+        self.fake.add_version(self.heat, 1508, same, 100_000, res="1080", width=1920, bitrate=8_000, optimized=True)
+        self.prefer("original")
+        self.copy("101")
+        self.prefer("1080")
+        item = self.check(self.HEAT_DIR)["items"][0]
+        self.assertEqual((item["kind"], item["versionChange"]), ("changed", True))
+        self.apply(self.HEAT_DIR, "101")
+        self.drain()
+        self.assertEqual(self.read(HEAT), self.fake.parts[1508])
+        self.assertEqual(self.check(self.HEAT_DIR)["items"], [])
+
+    def test_a_new_file_on_plex_is_not_a_version_change(self):
+        self.prefer("original")
+        self.copy("101")
+        ResyncTest.new_part(self, self.heat, 1101, file=f"{MOVIES}/Heat (1995)/Heat (1995) Bluray-2160p.mkv",
+                            size=310_000)
+        item = self.check(self.HEAT_DIR)["items"][0]
+        self.assertEqual((item["kind"], item["versionChange"]), ("upgraded", False))
+        ResyncTest.new_part(self, self.heat, 1102, size=320_000)
+        item = self.check(self.HEAT_DIR)["items"][0]
+        self.assertEqual((item["kind"], item["versionChange"]), ("upgraded", False))
+
+    def test_versions_in_two_folders(self):
+        # as on a real server: Plex made one movie of two folders, and each folder lists only its own version
+        folder = "Movies/Heat 1080p (1995)"
+        file = "Heat (1995).mkv"
+        self.heat["versions"] = []
+        self.fake.add_version(self.heat, 1507, f"{MOVIES}/Heat 1080p (1995)/{file}", 100_000, res="1080", width=1920,
+                              bitrate=8_000)
+        self.prefer("1080")
+        self.copy("101")
+        self.assertEqual(self.read(f"{folder}/{file}"), self.fake.parts[1507])
+        self.assertEqual(self.check(folder)["items"], [])
+        self.prefer("original")
+        self.assertEqual(self.kinds(folder), {f"{folder}/{file}": "otherversion"})
+        self.assertTrue(os.path.isfile(self.m(f"{folder}/{file}")))
+
+    def test_all_versions_copies_two_files_of_one_name(self):
+        self.heat["versions"] = []
+        self.fake.add_version(self.heat, 1506, f"{MOVIES}/Heat (1995)/Heat (1995).mp4", 100_000, res="1080", width=1920,
+                              bitrate=8_000)
+        r = self.queue("101")
+        self.assertEqual((r["added"], r["skipped"], r["bytes"]), (2, 0, 400_000))
+
+    def test_title_pages_count_the_versions(self):
+        count = lambda rk: self.c.get(f"/api/item/{rk}").json()["versions"]  # noqa: E731
+        self.assertEqual((count(101), count(103), count(200)), (2, 1, 1))
+        ep = next(e for e in self.fake.episodes if e["rk"] == 202)
+        self.fake.add_version(ep, 2506, f"{TV}/Show A/Season 01/Show A - S01E02 - Second (copy).mkv", 30_000)
+        self.assertEqual((count(202), count(200)), (2, 2))
 
     def test_a_file_of_the_other_version_stays(self):
         self.prefer("1080")

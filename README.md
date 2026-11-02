@@ -33,14 +33,10 @@ travel NAS.
   not ticked), lists videos Plex no longer has without deleting them, and can fetch the subtitles of up-to-date
   videos again (Lingarr). It shows what changed before anything is downloaded, and an old file is only replaced once
   the new one is in place.
-- Original files only, plus the external subtitles Plex knows about (`Movie.es.srt`, `Movie.en.forced.srt`).
-  Subtitles inside the file come along automatically.
-- Versions: when Plex has several of a title (an Optimized Version, a 4K and a 1080p file), Settings chooses what is
-  copied: **All versions** (the default), **Original (largest)**, **Smallest**, or a maximum, **4K**, **1080p**,
-  **720p** or **SD**, which copies the best version at or under it (the smallest when none fits). A title page can
-  choose differently for one copy. Pair a maximum with Plex's **Optimize** to carry 1080p copies of 4K films. A
-  version copied alone lands in the normal folder under the original's name (`Heat (1995).mp4`), never in
-  `Plex Versions`, and an optimized one gets the original's external subtitles.
+- Files are copied exactly as Plex has them, plus the external subtitles Plex knows about (`Movie.es.srt`,
+  `Movie.en.forced.srt`). Subtitles inside the file come along automatically.
+- **Choose which version to copy** when Plex has several of a title (an Optimized Version, a 4K and a 1080p file). See
+  [Versions](#versions).
 - Same folder layout as your home library (`Movies/...`, `TV-Shows/...`).
 - Downloads resume after dropped connections and restarts, and every resume is checked against the file on Plex, so
   a bad connection never leaves a corrupt file.
@@ -63,8 +59,9 @@ travel NAS.
 
 ## Installation
 
-The image is published for `linux/amd64` and `linux/arm64` (Raspberry Pi 4 and 5) at `ghcr.io/alien4u/travelarr`. It runs as UID 99 / GID 100 (Unraid's
-`nobody:users`), so the files it copies are owned like everything else on your shares.
+The image is published for `linux/amd64` and `linux/arm64` (including Raspberry Pi 4 and 5) at
+`ghcr.io/alien4u/travelarr`. It runs as UID 99 / GID 100 (Unraid's `nobody:users`), so the files it copies are owned
+like everything else on your shares.
 
 ### Unraid
 
@@ -120,6 +117,32 @@ Everything else is set in the web UI under **Settings**.
 
 Fill the NAS at home if you can: copying over your own network is much faster than anything on the road.
 
+## Versions
+
+Plex can hold several files for one movie or episode, such as a 4K and a 1080p file, or an Optimized Version it made
+itself. **Settings** chooses what travelarr copies:
+
+| Choice | What is copied |
+|---|---|
+| **All versions** (default) | Every file, at the same paths as on Plex |
+| **Original (largest)** | The largest version Plex did not optimize |
+| **Smallest** | The version with the fewest bytes |
+| **Best up to 4K / 1080p / 720p / SD** | The highest resolution at or under the maximum, preferring an original over an optimized copy. If none fits, the smallest |
+
+Titles with only one version are copied as usual, whatever the choice.
+
+- To carry 1080p copies of 4K films, set a maximum of 1080p and use **Optimize** in Plex to make those copies first.
+  travelarr only copies files Plex already has; it never transcodes.
+- A title page with several versions has its own choice, for that one copy.
+- Sizes in lists, title pages and the Queue are the size of what would be copied.
+- A version copied alone lands in the normal folder, never in `Plex Versions`. An optimized one takes the original's
+  name with its own extension (`Heat (1995).mp4`) and gets the original's external subtitles if it has none of its own.
+- Changing the choice does not move or remove copies already on the NAS. A version that would land under the name of
+  one of them is not queued beside it. Use **Re-sync** to replace the copy.
+- **Re-sync** compares what the current choice picks. If the NAS has a different version that Plex still has, for
+  example after you changed the choice or picked a version on a title page, it is listed as **other version** and left
+  unticked, so it is only replaced if you tick it.
+
 ## Away from home
 
 - With the address left empty, travelarr finds your server through Plex. Away from home that needs Plex **Remote
@@ -143,8 +166,7 @@ Fill the NAS at home if you can: copying over your own network is much faster th
   again.
 - Image-based subtitles stored as separate files (PGS, VobSub) are skipped and noted in the History.
 - Re-sync spots a new video version by its file name, size and first and last 64 KB (Plex offers no checksums), and
-  only looks at folders that are on the NAS: a season or movie folder you deleted is not offered again. It compares
-  the version the setting picks, so after changing the setting it offers to replace copies of the other version.
+  only looks at folders that are on the NAS: a season or movie folder you deleted is not offered again.
 
 ## Support
 
@@ -153,7 +175,8 @@ travelarr is a personal project, shared as is. Bug reports are welcome in
 
 ## Credits
 
-Co-Authored with Claude Code.
+Co-Authored with Claude Code. Version choice and the arm64 image contributed by
+[Matt Cox](https://github.com/mgscox).
 
 ## License
 

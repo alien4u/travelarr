@@ -606,7 +606,8 @@ async function openItem(rk, version) {
       h('p', { class: 'summary' }, d.summary || '')));
   const pick = h('select', { onchange: () => openItem(rk, pick.value) },
     ...MEDIA_VERSIONS.map(([v, text]) => h('option', { value: v, selected: v === d.mediaVersion }, text)));
-  const versions = h('label', { class: 'small muted' }, 'Versions to copy ', pick);
+  const canCopy = d.type === 'show' || !d.copy || d.copy === 'failed';
+  const versions = d.versions > 1 && canCopy ? h('label', { class: 'small muted' }, 'Versions to copy ', pick) : null;
   openSheet(head, versions, d.type === 'show' ? showBody(d) : videoBody(d), historyBlock(d.history));
 }
 
@@ -713,7 +714,7 @@ const RESYNC_ACT = ['upgraded', 'changed', 'absent'];
 function resyncLine(i) {
   if (i.video) {
     const name = i.kind === 'upgraded' ? ` (${i.video.to.file})` : '';
-    return `new version: ${fmtBytes(i.video.from.size)} -> ${fmtBytes(i.video.to.size)}${name}`;
+    return `${i.versionChange ? 'other version' : 'new version'}: ${fmtBytes(i.video.from.size)} -> ${fmtBytes(i.video.to.size)}${name}`;
   }
   return (i.reason || i.kind).replace('the NAS', dev()) + (i.watched ? ' · watched' : '');
 }
@@ -732,7 +733,7 @@ async function openResync(path, back = closeSheet) {
   }
   const act = d.items.filter(i => RESYNC_ACT.includes(i.kind));
   const rest = d.items.filter(i => !RESYNC_ACT.includes(i.kind));
-  const sel = new Set(act.filter(i => !(i.kind === 'absent' && i.watched)).map(i => i.ratingKey));
+  const sel = new Set(act.filter(i => !i.versionChange && !(i.kind === 'absent' && i.watched)).map(i => i.ratingKey));
   const btn = h('button', { class: 'btn primary' });
   const subs = h('input', { type: 'checkbox', checked: !act.length && !!d.unchanged });
   const paint = () => {

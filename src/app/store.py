@@ -205,9 +205,9 @@ class Store:
                 f"SELECT id FROM jobs WHERE status IN ('queued','downloading','done') AND id NOT IN ({ignore}) "
                 "AND (dest_rel=? OR (part_id=? AND server_id IS ?))",
                 (j["dest_rel"], j["part_id"], j.get("server_id"))).fetchone()
-            if dup is None and j.get("rating_key"):
-                # another version of this video under the same name: its subtitles would be shared;
-                # Re-sync replaces it instead
+            if dup is None and j.get("alone") and j.get("rating_key"):
+                # copying one version, with another of this video already under the same name: its
+                # subtitles would be shared; Re-sync replaces it instead
                 stem = posixpath.splitext(j["dest_rel"])[0]
                 dup = next((r for r in self.db.execute(
                     f"SELECT dest_rel FROM jobs WHERE status IN ('queued','downloading','done') "

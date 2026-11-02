@@ -23,8 +23,8 @@ from concurrent.futures import ThreadPoolExecutor
 
 import requests
 
-from .paths import SUB_EXT, PathError, abs_path, dest_rel_for, local_rel, safe_name
-from .plexgw import chosen_parts
+from .paths import SUB_EXT, PathError, abs_path, local_rel, safe_name
+from .plexgw import chosen_parts, other_versions
 from .store import label
 
 LOCK = threading.Lock()  # one check or apply at a time; selecting a server waits for it
@@ -101,12 +101,23 @@ def _plex_dir(srv, key: str | None) -> tuple[list, dict[str, str]]:
     return videos, dirs
 
 
+def _every_version(srv, videos: list) -> list:
+    """The videos with all their versions: the folder view lists only the versions in
+    that folder (an Optimized Version sits in a subfolder of its own)."""
+    out = []
+    for i in range(0, len(videos), 200):
+        out += srv.fetchItems("/library/metadata/" + ",".join(str(v.ratingKey) for v in videos[i:i + 200]))
+    for v in out:
+        v._autoReload = False
+    return out
+
+
 def _item(kind: str, path: str, job: dict | None = None, **fields) -> dict:
     return {"ratingKey": job["rating_key"] if job else None,
             "title": (job["show_title"] or job["title"]) if job else posixpath.basename(path),
             "label": label(job) if job else posixpath.basename(path),
             "kind": kind, "reason": None, "video": None, "videoBytes": 0, "watched": False, "path": path,
-            "_job": job, **fields}
+            "versionChange": False, "_job": job, **fields}
 
 
 def _folder(rel: str, files: dict[str, int], videos: list, sec, sid: str, gw, root: bool) -> list[dict]:
@@ -119,8 +130,11 @@ def _folder(rel: str, files: dict[str, int], videos: list, sec, sid: str, gw, ro
     for v in videos:
         parts = chosen_parts(v, sec, pref)
         names = {posixpath.basename(dest) for _, dest in parts}
-        others |= {posixpath.basename(d) for p in v.iterParts()
-                   if posixpath.dirname(d := dest_rel_for(p.file, sec.locations, sec.title)) == rel} - names
+        other = other_versions(v, sec, {p.id for p, _ in parts})
+        picked = {dest for _, dest in parts}
+        other_names = {posixpath.basename(d) for d, _ in other if posixpath.dirname(d) == rel and d not in picked}
+        other_sizes = {size for _, size in other}
+        others |= other_names
         if len(parts) != 1:
             here = sorted(names & set(files))
             claimed |= names
@@ -130,20 +144,24 @@ def _folder(rel: str, files: dict[str, int], videos: list, sec, sid: str, gw, ro
             continue
         job = gw.job(v, parts[0][0], parts[0][1], sid, "resync")
         if posixpath.dirname(job["dest_rel"]) == rel:
-            plex.append((v, job))
+            plex.append((v, job, other_names, other_sizes))
     waiting = []
-    for v, job in plex:  # the same name: up to date, or a new version of the same file
+    # versionChange: the file on the NAS is another version Plex still has, so nothing new
+    # is on offer; replacing it is the user's call (a copy chosen on its page, a changed setting)
+    for v, job, other_names, other_sizes in plex:  # the same name: up to date, or a new version of the same file
         name = posixpath.basename(job["dest_rel"])
         if name not in files:
-            waiting.append((v, job))
+            waiting.append((v, job, other_names, other_sizes))
             continue
         claimed.add(name)
         if files[name] == job["size"]:
             out.append(_item("unchanged", job["dest_rel"], job))
         else:
-            out.append(_item("changed", job["dest_rel"], job, videoBytes=job["size"], video={
+            out.append(_item("changed", job["dest_rel"], job, videoBytes=job["size"],
+                             versionChange=files[name] in other_sizes, video={
                 "from": {"file": name, "size": files[name]}, "to": {"file": name, "size": job["size"]}}))
-    for v, job in waiting:  # a new name: the old file is the same episode, or the movie folder's only video
+    # a new name: the old file is the same episode, or the movie folder's only video
+    for v, job, other_names, other_sizes in waiting:
         free = [n for n in files if n not in claimed]
         if job["kind"] == "episode":
             same = [n for n in free if (m := EPISODE.search(n))
@@ -153,7 +171,8 @@ def _folder(rel: str, files: dict[str, int], videos: list, sec, sid: str, gw, ro
         if len(same) == 1:
             old = same[0]
             claimed.add(old)
-            out.append(_item("upgraded", job["dest_rel"], job, videoBytes=job["size"], _old=f"{rel}/{old}", video={
+            out.append(_item("upgraded", job["dest_rel"], job, videoBytes=job["size"], _old=f"{rel}/{old}",
+                             versionChange=old in other_names or files[old] in other_sizes, video={
                 "from": {"file": old, "size": files[old]},
                 "to": {"file": posixpath.basename(job["dest_rel"]), "size": job["size"]}}))
         elif not root:
@@ -165,6 +184,16 @@ def _folder(rel: str, files: dict[str, int], videos: list, sec, sid: str, gw, ro
         else:
             out.append(_item("notonplex", f"{rel}/{name}", reason="not on Plex; the file stays"))
     return out
+
+
+def _versions_elsewhere(srv, sec, items: list[dict]) -> None:
+    """With All versions the folder view hides a version in another folder, so a copy
+    of it made alone looks like an old file. Only items replacing a file need the read."""
+    for i in items:
+        if i["kind"] in ("upgraded", "changed"):
+            other = other_versions(srv.fetchItem(int(i["ratingKey"])), sec, {i["_job"]["part_id"]})
+            i["versionChange"] = (i["video"]["from"]["size"] in {size for _, size in other}
+                                  or i.get("_old") in {dest for dest, _ in other})
 
 
 def _same_bytes(gw, srv, media_root: str, job: dict) -> bool | None:
@@ -220,8 +249,14 @@ def _compute(store, gw, media_root: str, path: str, only: set | None = None) -> 
             return
         files, subdirs = nas
         videos, pdirs = _plex_dir(srv, key)
+        one_version = gw.version_pref() != "all"
+        if one_version:
+            videos = _every_version(srv, videos)
         checked += len(files)
-        items.extend(_folder(rel, files, videos, sec, sid, gw, root))
+        found = _folder(rel, files, videos, sec, sid, gw, root)
+        if not one_version:
+            _versions_elsewhere(srv, sec, found)
+        items.extend(found)
         for d in subdirs:
             walk(f"{rel}/{d}", pdirs.get(d), sec, False)
 

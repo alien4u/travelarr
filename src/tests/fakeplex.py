@@ -115,11 +115,13 @@ class FakePlex:
         return x
 
     # ---------------------------------------------------------------- xml
-    def part_xml(self, v, full):
-        """Every version of v, v's own first, each one a Media as Plex lists them."""
+    def part_xml(self, v, full, folder=None):
+        """Every version of v, v's own first, each one a Media as Plex lists them.
+        `folder`: the folder view, which lists only the versions in that folder."""
         if v.get("no_parts"):
             return ""
-        return "".join(self.media_xml(x, full) for x in [v] + v.get("versions", []))
+        return "".join(self.media_xml(x, full) for x in [v] + v.get("versions", [])
+                       if folder is None or posixpath.dirname(x["file"]) == folder)
 
     def media_xml(self, v, full):
         streams = ""
@@ -142,12 +144,12 @@ class FakePlex:
             "id": v["part"], "key": f"/library/parts/{v['part']}/1700000000/file.mkv",
             "file": v["file"], "size": v["size"], "container": "mkv"}) + f">{streams}</Part>{extra}</Media>")
 
-    def movie_xml(self, m, full=False):
+    def movie_xml(self, m, full=False, folder=None):
         return "<Video " + attrs({
             "ratingKey": m["rk"], "key": f"/library/metadata/{m['rk']}", "guid": m["guid"], "type": "movie",
             "title": m["title"], "titleSort": m["title"], "year": m["year"], "summary": f"About {m['title']}",
             "thumb": f"/library/metadata/{m['rk']}/thumb/1", "librarySectionID": 1, "addedAt": m["added"],
-            "viewCount": 1 if m["watched"] else None}) + ">" + self.part_xml(m, full) + "</Video>"
+            "viewCount": 1 if m["watched"] else None}) + ">" + self.part_xml(m, full, folder) + "</Video>"
 
     def show_xml(self):
         s = self.show
@@ -159,7 +161,7 @@ class FakePlex:
             "leafCount": len(self.episodes), "viewedLeafCount": watched, "childCount": 2,
             "summary": "A show"}) + "/>"
 
-    def ep_xml(self, e, full=False):
+    def ep_xml(self, e, full=False, folder=None):
         return "<Video " + attrs({
             "ratingKey": e["rk"], "key": f"/library/metadata/{e['rk']}", "type": "episode",
             "guid": f"plex://episode/{e['rk']}",
@@ -167,13 +169,14 @@ class FakePlex:
             "grandparentKey": "/library/metadata/200", "parentRatingKey": 200 + e["season"] * 10,
             "parentTitle": f"Season {e['season']}", "parentIndex": e["season"], "index": e["index"],
             "librarySectionID": 2, "viewCount": 1 if e["watched"] else None}) + ">" + \
-            self.part_xml(e, full) + "</Video>"
+            self.part_xml(e, full, folder) + "</Video>"
 
     def folder(self, h, sec: int, parent: str | None):
         """Plex's folder view: the library folder's subfolders and the videos in it."""
         root = MOVIES if sec == 1 else TV
-        videos = [(v, v["file"][len(root) + 1:]) for v in (self.movies if sec == 1 else self.episodes)
-                  if v["file"].startswith(root + "/") and not v.get("no_parts")]
+        videos = [(v, x["file"][len(root) + 1:]) for v in (self.movies if sec == 1 else self.episodes)
+                  for x in [v] + v.get("versions", [])
+                  if x["file"].startswith(root + "/") and not v.get("no_parts")]
         dirs = sorted({"/".join(r.split("/")[:i]) for _, r in videos for i in range(1, r.count("/") + 1)})
         ids = {d: str(1000 * sec + n) for n, d in enumerate(dirs)}
         here = "" if parent is None else next((d for d, i in ids.items() if i == parent), None)
@@ -182,8 +185,9 @@ class FakePlex:
         body = "".join("<Directory " + attrs({"key": f"/library/sections/{sec}/folder?parent={ids[d]}",
                                                "title": posixpath.basename(d)}) + "/>"
                        for d in dirs if posixpath.dirname(d) == here)
-        body += "".join(self.movie_xml(v) if sec == 1 else self.ep_xml(v)
-                        for v, r in videos if posixpath.dirname(r) == here)
+        folder = posixpath.join(root, here) if here else root
+        listed = {v["rk"]: v for v, r in videos if posixpath.dirname(r) == here}.values()  # once, with both here
+        body += "".join(self.movie_xml(v, folder=folder) if sec == 1 else self.ep_xml(v, folder=folder) for v in listed)
         return self.mc(h, body, librarySectionID=sec)
 
     # ------------------------------------------------------------- routing

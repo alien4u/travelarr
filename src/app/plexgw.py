@@ -255,15 +255,10 @@ def _original(video, but=None):
     return max(others, key=_size) if others else None
 
 
-def chosen_parts(video, sec, pref: str) -> list[tuple]:
-    """(part, dest_rel) for each file of the version of video to copy. An optimized
-    version lands where the original would, under the original's name with its own
-    extension, never inside 'Plex Versions'. 'all': every file, at Plex's paths."""
-    if pref == "all":
-        return [(p, dest_rel_for(p.file, sec.locations, sec.title)) for p in video.iterParts()]
-    m = pick_media(video, pref)
-    if m is None:
-        return []
+def _alone(video, m, sec) -> list[tuple]:
+    """(part, dest_rel) for each file of version m copied alone. An optimized version
+    lands where the original would, under the original's name with its own extension,
+    never inside 'Plex Versions'."""
     twin = _original(video, m) if _optimized(m) else None
     out = []
     for i, p in enumerate(m.parts):
@@ -273,6 +268,30 @@ def chosen_parts(video, sec, pref: str) -> list[tuple]:
             dest = dest_rel_for(unversioned(p.file), sec.locations, sec.title)
         out.append((p, dest))
     return out
+
+
+def chosen_parts(video, sec, pref: str) -> list[tuple]:
+    """(part, dest_rel) for each file of the version of video to copy.
+    'all': every file, at Plex's paths."""
+    if pref == "all":
+        return [(p, dest_rel_for(p.file, sec.locations, sec.title)) for p in video.iterParts()]
+    m = pick_media(video, pref)
+    return _alone(video, m, sec) if m else []
+
+
+def other_versions(video, sec, picked: set) -> list[tuple]:
+    """(dest_rel, size) of the files of the versions without the `picked` part ids, at
+    each path a copy of them can have: copied alone, and at Plex's own path ('all')."""
+    out = []
+    for m in video.media:
+        if m.parts and not any(p.id in picked for p in m.parts):
+            out += [(dest, p.size or 0) for p, dest in _alone(video, m, sec)]
+            out += [(dest_rel_for(p.file, sec.locations, sec.title), p.size or 0) for p in m.parts]
+    return out
+
+
+def version_count(video) -> int:
+    return sum(1 for m in video.media if m.parts)
 
 
 class PlexGateway:
@@ -632,12 +651,15 @@ class PlexGateway:
         if it.type in ("movie", "episode"):
             d["parts"] = [self._part(p, dest) for p, dest in chosen_parts(it, sec, pref)]
             d["size"] = sum(p["size"] for p in d["parts"])
+            d["versions"] = version_count(it)
             if it.type == "episode":
                 d["showKey"] = str(it.grandparentRatingKey)
         if it.type == "show":
             seasons: dict[int, dict] = {}
+            d["versions"] = 0  # of the episode with the most
             for ep in it.episodes():
                 ep._autoReload = False
+                d["versions"] = max(d["versions"], version_count(ep))
                 s = seasons.setdefault(ep.parentIndex if ep.parentIndex is not None else -1,
                                        {"index": ep.parentIndex, "title": ep.parentTitle,
                                         "ratingKey": str(ep.parentRatingKey), "episodes": []})
@@ -679,7 +701,8 @@ class PlexGateway:
                     videos = [v for v in videos if not v.isWatched]
             else:
                 continue
-            jobs += [self.job(v, p, dest, sid, source) for v in videos for p, dest in chosen_parts(v, sec, pref)]
+            jobs += [{**self.job(v, p, dest, sid, source), "alone": pref != "all"}
+                     for v in videos for p, dest in chosen_parts(v, sec, pref)]
         return jobs
 
     @staticmethod

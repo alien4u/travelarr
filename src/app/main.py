@@ -28,7 +28,7 @@ from .resync import ResyncError
 from .store import Store, label, now
 from .worker import CHANGED, Downloader
 
-VERSION = "3.5.1"
+VERSION = "3.6.0"
 STATIC = os.path.join(os.path.dirname(__file__), "static")
 LOCAL_NOTE = "deleted in Local Files"
 MAX_QUEUE_KEYS = 200  # bounds the Plex requests one queue call makes
