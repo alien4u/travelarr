@@ -552,9 +552,11 @@ async function renderLibrary(type) {
   load(true);
 }
 
-async function queue(keys, mode, source, only) {
+async function queue(keys, mode, source, only, mediaVersion) {
   try {
-    const r = await post('/api/queue', { keys, mode, source: source || 'browse', only, serverId: S.state && S.state.serverId });
+    const r = await post('/api/queue', {
+      keys, mode, source: source || 'browse', only, mediaVersion, serverId: S.state && S.state.serverId,
+    });
     const parts = [];
     if (r.added) parts.push(`Queued ${r.added} file(s), ${fmtBytes(r.bytes)}`);
     if (r.skipped) parts.push(`${r.skipped} already on ${dev()} or queued`);
@@ -590,17 +592,22 @@ function removedToast(results) {
     + `if ${busy === 1 ? 'it' : 'they'} had already finished, ${busy === 1 ? 'it is' : 'they are'} kept, remove again.`);
 }
 
-async function openItem(rk) {
+// version: the version choice for this title page and the copy it starts (the setting when unset)
+async function openItem(rk, version) {
   openSheet(h('div', { class: 'spinner' }));
   let d;
-  try { d = await api(`/api/item/${rk}`); }
-  catch (e) { return openSheet(errorPanel(e, () => openItem(rk))); }
+  try { d = await api(`/api/item/${rk}${version ? `?mediaVersion=${encodeURIComponent(version)}` : ''}`); }
+  catch (e) { return openSheet(errorPanel(e, () => openItem(rk, version))); }
+  d.mediaVersion = version || S.state.mediaVersion;
   const meta = [d.year, d.size ? fmtBytes(d.size) : null,
     d.type === 'show' ? `${d.episodes} episodes, ${d.unwatched} unwatched` : null].filter(Boolean).join(' · ');
   const head = h('div', { class: 'detail-head' }, poster(d, 220, 330),
     h('div', {}, h('h1', {}, d.title), h('div', { class: 'muted small' }, meta),
       h('p', { class: 'summary' }, d.summary || '')));
-  openSheet(head, d.type === 'show' ? showBody(d) : videoBody(d), historyBlock(d.history));
+  const pick = h('select', { onchange: () => openItem(rk, pick.value) },
+    ...MEDIA_VERSIONS.map(([v, text]) => h('option', { value: v, selected: v === d.mediaVersion }, text)));
+  const versions = h('label', { class: 'small muted' }, 'Versions to copy ', pick);
+  openSheet(head, versions, d.type === 'show' ? showBody(d) : videoBody(d), historyBlock(d.history));
 }
 
 function videoBody(d) {
@@ -609,7 +616,7 @@ function videoBody(d) {
   const active = (d.history || []).filter(j => j.status === 'queued' || j.status === 'downloading');
   if (!st || st === 'failed') {
     actions.append(h('button', {
-      class: 'btn primary', onclick: async () => { await queue([d.ratingKey], 'all'); openItem(d.ratingKey); },
+      class: 'btn primary', onclick: async () => { await queue([d.ratingKey], 'all', 'browse', undefined, d.mediaVersion); openItem(d.ratingKey, d.mediaVersion); },
     }, `Copy to ${dev()} · ${fmtBytes(d.size)}`));
   } else {
     actions.append(h('span', { class: `chip ${st}` }, statusOf(st)[0]));
@@ -617,7 +624,8 @@ function videoBody(d) {
       class: 'btn small', onclick: async () => { for (const j of active) await post(`/api/jobs/${j.id}/cancel`); S.dirty = true; openItem(d.ratingKey); },
     }, 'Cancel'));
   }
-  actions.append(resyncButton(d));
+  const resync = resyncButton(d);  // null until the title is on the device; append(null) would show "null"
+  if (resync) actions.append(resync);
   if (st === 'done') actions.append(h('button', {
     class: 'btn small danger', onclick: async () => {
       if (!confirm(`Delete "${d.title}" from ${dev()}?`)) return;
@@ -645,8 +653,8 @@ function showBody(d) {
   };
   copyBtn.onclick = async () => {
     copyBtn.disabled = true;
-    await queue([d.ratingKey], 'all', 'browse', [...sel]);
-    openItem(d.ratingKey);
+    await queue([d.ratingKey], 'all', 'browse', [...sel], d.mediaVersion);
+    openItem(d.ratingKey, d.mediaVersion);
   };
   const pick = fn => () => { sel.clear(); eps.filter(e => eligible(e) && fn(e)).forEach(e => sel.add(e.ratingKey)); refresh(); };
   const onDevice = eps.filter(e => e.copy === 'done').length;
@@ -1033,9 +1041,22 @@ async function renderFiles() {
   ].filter(Boolean));
 }
 
+const MEDIA_VERSIONS = [
+  ['all', 'All versions'],
+  ['original', 'Original (largest)'],
+  ['smallest', 'Smallest'],
+  ['2160', 'Best up to 4K'],
+  ['1080', 'Best up to 1080p'],
+  ['720', 'Best up to 720p'],
+  ['sd', 'Best up to SD'],
+];
+
 function renderSettings() {
   const st = S.state;
   const reserve = h('input', { type: 'number', min: '0', step: '1', value: st.reserveGb, style: 'width:110px' });
+  const version = h('select', {
+    onchange: async () => { await post('/api/settings', { mediaVersion: version.value }); toast('Saved'); refreshState(); },
+  }, ...MEDIA_VERSIONS.map(([v, text]) => h('option', { value: v, selected: v === st.mediaVersion }, text)));
   const connLine = st.conn
     ? `Connected via ${st.conn.kind}: ${st.conn.url}`
     : st.connError ? `Not connected: ${st.connError}` : 'Not connected yet';
@@ -1069,7 +1090,12 @@ function renderSettings() {
       h('div', { class: 'field' }, h('label', {}, `Always keep this much free on ${dev()} (GB)`),
         h('div', { class: 'bar', style: 'margin:0' }, reserve, h('button', {
           class: 'btn small', onclick: async () => { await post('/api/settings', { reserveGb: reserve.value }); toast('Saved'); refreshState(); },
-        }, 'Save')))),
+        }, 'Save'))),
+      h('div', { class: 'field' }, h('label', {}, 'When Plex has several versions of a title, copy'), version,
+        h('p', { class: 'muted small' },
+          'Any choice but All versions copies one version of each movie or episode; with a maximum, the best one ',
+          'at or under it, else the smallest. Use Plex\'s Optimize to make smaller versions; one is saved under ',
+          'the original\'s name, not in a Plex Versions folder. A title page can choose differently for one copy.'))),
     h('div', { class: 'panel' }, h('h2', {}, 'Storage'),
       h('p', {}, `Device name: ${st.device}`,
         h('span', { class: 'muted small' }, ' (the Unraid server name or host name; set TRAVELARR_NAME to change it)')),

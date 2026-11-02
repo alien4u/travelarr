@@ -4,6 +4,8 @@ and queue what changed.
 The NAS decides what is compared: every folder in the scope is listed next to Plex's
 folder of the same name (Plex's folder view mirrors the library folders), and videos
 are matched by file name and size. Folders that exist only on Plex are left alone.
+Of a title Plex has in several versions, only the one the version setting picks is
+compared, at the path a copy of it gets (an optimized version under the original's name).
 
 A check never changes anything. Apply recomputes the check and acts only on items
 that are still out of date: a new version replaces the old file once it is in place,
@@ -21,11 +23,13 @@ from concurrent.futures import ThreadPoolExecutor
 
 import requests
 
-from .paths import SUB_EXT, PathError, abs_path, local_rel, safe_name
+from .paths import SUB_EXT, PathError, abs_path, dest_rel_for, local_rel, safe_name
+from .plexgw import chosen_parts
 from .store import label
 
 LOCK = threading.Lock()  # one check or apply at a time; selecting a server waits for it
 ACTIONABLE = ("upgraded", "changed", "absent")
+OTHER_VERSION = "another version of this title on Plex; the version setting copies a different one. The file stays"
 VIDEO_EXT = {".mkv", ".mp4", ".m4v", ".avi", ".mov", ".wmv", ".ts", ".m2ts", ".mts", ".mpg", ".mpeg",
              ".webm", ".flv", ".vob", ".divx", ".ogm", ".3gp", ".asf", ".iso"}
 EPISODE = re.compile(r"S(\d{1,3})E(\d{1,4})", re.I)
@@ -110,9 +114,13 @@ def _folder(rel: str, files: dict[str, int], videos: list, sec, sid: str, gw, ro
     where only what is on the NAS is compared (Plex has every title there)."""
     out, plex = [], []
     claimed: set[str] = set()
+    others: set[str] = set()  # this folder's files of the versions not picked
+    pref = gw.version_pref()
     for v in videos:
-        parts = list(v.iterParts())
-        names = {posixpath.basename((p.file or "").replace("\\", "/")) for p in parts}
+        parts = chosen_parts(v, sec, pref)
+        names = {posixpath.basename(dest) for _, dest in parts}
+        others |= {posixpath.basename(d) for p in v.iterParts()
+                   if posixpath.dirname(d := dest_rel_for(p.file, sec.locations, sec.title)) == rel} - names
         if len(parts) != 1:
             here = sorted(names & set(files))
             claimed |= names
@@ -120,7 +128,7 @@ def _folder(rel: str, files: dict[str, int], videos: list, sec, sid: str, gw, ro
                 out.append(_item("multipart", f"{rel}/{here[0]}", reason="videos split into several files "
                                                                          "are not re-synced"))
             continue
-        job = gw.job(v, parts[0], sec, sid, "resync")
+        job = gw.job(v, parts[0][0], parts[0][1], sid, "resync")
         if posixpath.dirname(job["dest_rel"]) == rel:
             plex.append((v, job))
     waiting = []
@@ -152,7 +160,10 @@ def _folder(rel: str, files: dict[str, int], videos: list, sec, sid: str, gw, ro
             out.append(_item("absent", job["dest_rel"], job, videoBytes=job["size"], reason="not on the NAS",
                              watched=bool(getattr(v, "isWatched", False))))
     for name in sorted(set(files) - claimed):
-        out.append(_item("notonplex", f"{rel}/{name}", reason="not on Plex; the file stays"))
+        if name in others:
+            out.append(_item("otherversion", f"{rel}/{name}", reason=OTHER_VERSION))
+        else:
+            out.append(_item("notonplex", f"{rel}/{name}", reason="not on Plex; the file stays"))
     return out
 
 

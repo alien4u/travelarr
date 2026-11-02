@@ -21,7 +21,7 @@ from plexapi.myplex import MyPlexAccount
 from plexapi.server import PlexServer
 from requests.certs import where as ca_bundle
 
-from .paths import dest_rel_for
+from .paths import dest_rel_for, in_versions, unversioned, version_rel
 
 log = logging.getLogger("travelarr.plex")
 PLEX_TV = "https://plex.tv"
@@ -195,6 +195,86 @@ class _PlexSession(requests.Session):
             prepared_request.headers.pop("X-Plex-Token", None)
 
 
+# Which versions of a movie or episode are copied. Plex lists every file it has
+# for an item as a Media (the original, Optimized Versions, other editions).
+# 'all' copies every one, at Plex's own paths (travelarr before 3.6); any other
+# choice copies one: a cap takes the best version at or under it.
+CAPS = {"2160": 2160, "1080": 1080, "720": 720, "sd": 576}
+VERSION_PREFS = ("all", "original", "smallest", *CAPS)
+
+
+def _size(media) -> int:
+    return sum(p.size or 0 for p in media.parts)
+
+
+def _optimized(media) -> bool:
+    """Made by Plex's Optimize (marked so by Plex, or under its 'Plex Versions' folder)."""
+    return bool(getattr(media, "isOptimizedVersion", False)) or any(in_versions(p.file) for p in media.parts)
+
+
+def _lines(media) -> int | None:
+    """The version's resolution class: Plex's videoResolution ('4k', '1080', 'sd'),
+    else from its width, so a 1920x800 film counts as 1080p. None when unknown."""
+    res = (getattr(media, "videoResolution", None) or "").lower().rstrip("p")
+    if res == "4k":
+        return 2160
+    if res.isdigit():
+        return int(res)
+    if res == "sd":
+        return 480
+    width = getattr(media, "width", None)
+    if not width:
+        return None
+    return next((lines for w, lines in ((3200, 2160), (2200, 1440), (1600, 1080), (1000, 720)) if width >= w), 480)
+
+
+def pick_media(video, pref: str):
+    """The version of video to copy; None when Plex has no file for it.
+    'original': the largest version Plex did not optimize (what a single-version
+    item always was); 'smallest': the fewest bytes; a cap ('2160' ... 'sd'): the
+    highest resolution at or under it, then a version Plex did not optimize (an
+    'Original Quality' optimized copy can be bigger than the original), then
+    bitrate; else the smallest."""
+    media = [m for m in video.media if m.parts]
+    if len(media) <= 1:
+        return media[0] if media else None
+    if pref == "smallest":
+        return min(media, key=_size)
+    if pref in CAPS:
+        cap = CAPS[pref]
+        fit = [m for m in media if (_lines(m) or cap + 1) <= cap]
+        if not fit:
+            return min(media, key=_size)
+        return max(fit, key=lambda m: (_lines(m), not _optimized(m), m.bitrate or 0, _size(m)))
+    return max([m for m in media if not _optimized(m)] or media, key=_size)
+
+
+def _original(video, but=None):
+    """The largest version Plex did not optimize, other than `but`."""
+    others = [m for m in video.media if m is not but and m.parts and not _optimized(m)]
+    return max(others, key=_size) if others else None
+
+
+def chosen_parts(video, sec, pref: str) -> list[tuple]:
+    """(part, dest_rel) for each file of the version of video to copy. An optimized
+    version lands where the original would, under the original's name with its own
+    extension, never inside 'Plex Versions'. 'all': every file, at Plex's paths."""
+    if pref == "all":
+        return [(p, dest_rel_for(p.file, sec.locations, sec.title)) for p in video.iterParts()]
+    m = pick_media(video, pref)
+    if m is None:
+        return []
+    twin = _original(video, m) if _optimized(m) else None
+    out = []
+    for i, p in enumerate(m.parts):
+        if twin is not None and i < len(twin.parts):
+            dest = version_rel(dest_rel_for(twin.parts[i].file, sec.locations, sec.title), p.file)
+        else:
+            dest = dest_rel_for(unversioned(p.file), sec.locations, sec.title)
+        out.append((p, dest))
+    return out
+
+
 class PlexGateway:
     def __init__(self, store, version: str):
         self.store = store
@@ -230,6 +310,11 @@ class PlexGateway:
 
     def token(self) -> str | None:
         return self.store.get("token")
+
+    def version_pref(self, override: str | None = None) -> str:
+        """`override`: a choice for one transfer instead of the setting."""
+        pref = override or self.store.get("media_version")
+        return pref if pref in VERSION_PREFS else "all"
 
     def start_login(self) -> str:
         r = self.session.post(f"{self.plex_tv}/api/v2/pins", params={"strong": "true"},
@@ -473,8 +558,7 @@ class PlexGateway:
                 out.append({"key": str(s.key), "title": s.title, "type": s.type})
         return out
 
-    @staticmethod
-    def summary(it) -> dict:
+    def summary(self, it, pref: str | None = None) -> dict:
         it._autoReload = False  # listing data is enough; avoid a request per item
         d = {"ratingKey": str(it.ratingKey), "type": it.type, "title": it.title,
              "year": getattr(it, "year", None), "thumb": it.thumb}
@@ -483,7 +567,9 @@ class PlexGateway:
             d["addedAt"] = int(added.timestamp()) if added else None
             d["watched"] = bool(getattr(it, "viewCount", 0))
             try:
-                d["size"] = sum((p.size or 0) for m in it.media for p in m.parts)
+                pref = pref or self.version_pref()  # the size of what a copy would take
+                copied = it.media if pref == "all" else [m for m in [pick_media(it, pref)] if m]
+                d["size"] = sum(_size(m) for m in copied)
             except Exception:  # noqa: BLE001
                 d["size"] = None
         elif it.type == "show":
@@ -508,7 +594,8 @@ class PlexGateway:
         items = srv.fetchItems(key, container_start=start, container_size=size, maxresults=size)
         head = srv.query(key, headers={"X-Plex-Container-Start": "0", "X-Plex-Container-Size": "0"})
         total = int(head.attrib.get("totalSize") or head.attrib.get("size") or 0)
-        return {"items": [self.summary(i) for i in items], "total": total, "start": start}
+        pref = self.version_pref()
+        return {"items": [self.summary(i, pref) for i in items], "total": total, "start": start}
 
     def watchlist(self) -> list[dict]:
         srv = self.server()
@@ -532,17 +619,18 @@ class PlexGateway:
         return out
 
     @staticmethod
-    def _part(part, sec) -> dict:
-        return {"id": part.id, "key": part.key, "size": part.size or 0, "file": part.file,
-                "dest": dest_rel_for(part.file, sec.locations, sec.title)}
+    def _part(part, dest: str) -> dict:
+        return {"id": part.id, "key": part.key, "size": part.size or 0, "file": part.file, "dest": dest}
 
-    def item(self, rating_key: str) -> dict:
+    def item(self, rating_key: str, version: str | None = None) -> dict:
+        """`version`: the version choice for this page instead of the setting."""
         it = self.server().fetchItem(int(rating_key))
         sec = self._section(it.librarySectionID)
-        d = self.summary(it)
+        pref = self.version_pref(version)
+        d = self.summary(it, pref)
         d["summary"] = getattr(it, "summary", "")
         if it.type in ("movie", "episode"):
-            d["parts"] = [self._part(p, sec) for p in it.iterParts()]
+            d["parts"] = [self._part(p, dest) for p, dest in chosen_parts(it, sec, pref)]
             d["size"] = sum(p["size"] for p in d["parts"])
             if it.type == "episode":
                 d["showKey"] = str(it.grandparentRatingKey)
@@ -553,7 +641,7 @@ class PlexGateway:
                 s = seasons.setdefault(ep.parentIndex if ep.parentIndex is not None else -1,
                                        {"index": ep.parentIndex, "title": ep.parentTitle,
                                         "ratingKey": str(ep.parentRatingKey), "episodes": []})
-                parts = [self._part(p, sec) for p in ep.iterParts()]
+                parts = [self._part(p, dest) for p, dest in chosen_parts(ep, sec, pref)]
                 s["episodes"].append({"ratingKey": str(ep.ratingKey), "index": ep.index,
                                       "title": ep.title, "watched": ep.isWatched,
                                       "size": sum(p["size"] for p in parts),
@@ -563,14 +651,18 @@ class PlexGateway:
         return d
 
     def plan(self, keys: list[str], mode: str = "unwatched", source: str = "browse",
-             only: set[str] | None = None, server_id: str | None = None) -> list[dict]:
-        """Expand movies / episodes / seasons / shows into one job per file.
+             only: set[str] | None = None, server_id: str | None = None,
+             version: str | None = None) -> list[dict]:
+        """Expand movies / episodes / seasons / shows into one job per file of
+        the versions each video is copied in (see `chosen_parts`); `version`
+        overrides the setting for this transfer.
         `only` limits a show or season to those episode keys (one request
         for the whole show instead of one per episode). One server snapshot
         serves the whole plan, and every job records that server."""
         srv, sid = self.snapshot()
         if server_id and sid != server_id:  # rating keys mean something else on another server
             raise OtherServer("the selected Plex server changed")
+        pref = self.version_pref(version)
         jobs: list[dict] = []
         for rk in keys:
             it = srv.fetchItem(int(rk))
@@ -587,12 +679,12 @@ class PlexGateway:
                     videos = [v for v in videos if not v.isWatched]
             else:
                 continue
-            jobs += [self.job(v, p, sec, sid, source) for v in videos for p in v.iterParts()]
+            jobs += [self.job(v, p, dest, sid, source) for v in videos for p, dest in chosen_parts(v, sec, pref)]
         return jobs
 
     @staticmethod
-    def job(v, p, sec, sid: str, source: str) -> dict:
-        """The job that copies part p of movie or episode v."""
+    def job(v, p, dest: str, sid: str, source: str) -> dict:
+        """The job that copies part p of movie or episode v to dest."""
         return {
             "rating_key": str(v.ratingKey),
             "show_key": str(v.grandparentRatingKey) if v.type == "episode" else None,
@@ -605,7 +697,7 @@ class PlexGateway:
             "part_id": p.id,
             "part_key": p.key,
             "size": p.size or 0,
-            "dest_rel": dest_rel_for(p.file, sec.locations, sec.title),
+            "dest_rel": dest,
             "source": source,
             "server_id": sid,
             "guid": getattr(v, "guid", None),
@@ -636,11 +728,18 @@ class PlexGateway:
                 for s in part.subtitleStreams() if s.key]
 
     def subtitle_streams(self, rating_key: str, part_id: int, srv: PlexServer) -> tuple[list[dict], str | None]:
-        """The part's external subtitles and the item's guid."""
+        """The part's external subtitles and the item's guid. An optimized version
+        has none of its own: it gets the original's, made for the same timing."""
         it = srv.fetchItem(int(rating_key))
-        for p in it.iterParts():
-            if p.id == part_id:
-                return self.text_streams(p), getattr(it, "guid", None)
+        for m in it.media:
+            for i, p in enumerate(m.parts):
+                if p.id != part_id:
+                    continue
+                streams = self.text_streams(p)
+                twin = _original(it, m) if not streams and _optimized(m) else None
+                if twin is not None and i < len(twin.parts):
+                    streams = self.text_streams(twin.parts[i])
+                return streams, getattr(it, "guid", None)
         # not "no subtitles": the file is not on Plex any more, so nothing can be compared
         raise ValueError("the file on Plex changed again; run Re-sync")
 

@@ -105,8 +105,23 @@ class FakePlex:
         self.httpd.shutdown()
         self.httpd.server_close()
 
+    def add_version(self, v, part, file, size, content=None, **media):
+        """Plex has another version of movie/episode dict v (its own Media): media
+        holds res (videoResolution), width, bitrate, optimized and subs."""
+        x = dict(part=part, file=file, size=size, subs=media.pop("subs", []), **media)
+        v.setdefault("versions", []).append(x)
+        self.parts[part] = content or bytes((i * 13 + part) % 251 for i in range(size))
+        self.versions[part] = 1
+        return x
+
     # ---------------------------------------------------------------- xml
     def part_xml(self, v, full):
+        """Every version of v, v's own first, each one a Media as Plex lists them."""
+        if v.get("no_parts"):
+            return ""
+        return "".join(self.media_xml(x, full) for x in [v] + v.get("versions", []))
+
+    def media_xml(self, v, full):
         streams = ""
         if full:
             streams = '<Stream id="1" streamType="1" codec="h264" index="0"/>'
@@ -116,13 +131,14 @@ class FakePlex:
                     "languageCode": s["lang"], "forced": 1 if s.get("forced") else None,
                     "key": f"/library/streams/{s['id']}" if s["ext"] else None,
                     "index": None if s["ext"] else 2, "displayTitle": f"{s['lang']} {s['codec']}"}) + "/>"
-        if v.get("no_parts"):
-            return ""
         extra = ""
         for x in v.get("extra_parts", []):   # a video split into several files
             extra += "<Part " + attrs({"id": x["part"], "key": f"/library/parts/{x['part']}/1700000000/file.mkv",
                                        "file": x["file"], "size": x["size"], "container": "mkv"}) + "/>"
-        return (f'<Media id="{v["part"]}0" container="mkv"><Part ' + attrs({
+        media = attrs({"id": f'{v["part"]}0', "container": "mkv", "videoResolution": v.get("res"),
+                       "width": v.get("width"), "bitrate": v.get("bitrate"),
+                       "proxyType": 42 if v.get("optimized") else None})  # 42: an Optimized Version
+        return (f'<Media {media}><Part ' + attrs({
             "id": v["part"], "key": f"/library/parts/{v['part']}/1700000000/file.mkv",
             "file": v["file"], "size": v["size"], "container": "mkv"}) + f">{streams}</Part>{extra}</Media>")
 
@@ -289,7 +305,7 @@ class FakePlex:
         if m:
             sid = int(m.group(1))
             for v in self.movies + self.episodes:
-                for s in v["subs"]:
+                for s in v["subs"] + [x for o in v.get("versions", []) for x in o["subs"]]:
                     if s["id"] == sid and s.get("body"):
                         return self.send(h, 200, s["body"].encode(), "text/plain")
             return self.send(h, 404, b"<html>404</html>", "text/html")

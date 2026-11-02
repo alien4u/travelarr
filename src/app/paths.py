@@ -61,6 +61,32 @@ def dest_rel_for(part_file: str, locations: list[str], section_title: str) -> st
     return clean_rel(posixpath.join(safe_name(section_title), parent, posixpath.basename(f)))
 
 
+VERSIONS_DIR = "Plex Versions"  # where Plex keeps the files Optimize makes, by default
+
+
+def in_versions(file: str) -> bool:
+    return VERSIONS_DIR in PurePosixPath((file or "").replace("\\", "/")).parts[:-1]
+
+
+def unversioned(file: str) -> str:
+    """The path an optimized file would have without Plex's folders for it:
+    .../Heat (1995)/Plex Versions/Optimized for TV/Heat (1995).mp4
+    -> .../Heat (1995)/Heat (1995).mp4"""
+    parts = list(PurePosixPath((file or "").replace("\\", "/")).parts)
+    if VERSIONS_DIR not in parts[:-1]:
+        return file
+    i = parts.index(VERSIONS_DIR)
+    rest = parts[i + 1:]
+    return str(PurePosixPath(*parts[:i], *(rest[1:] if len(rest) > 1 else rest)))
+
+
+def version_rel(original_rel: str, file: str) -> str:
+    """Where another version of a video goes: the original's name with the
+    version's own extension, so 'Heat (1995).mkv' -> 'Heat (1995).mp4'."""
+    ext = posixpath.splitext(posixpath.basename((file or "").replace("\\", "/")))[1]
+    return clean_rel(posixpath.splitext(original_rel)[0] + ext)
+
+
 def abs_path(media_root: str, rel: str) -> str:
     rel = clean_rel(rel)
     root = os.path.realpath(media_root)

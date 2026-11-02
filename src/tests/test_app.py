@@ -38,7 +38,7 @@ HEAT = "Movies/Heat (1995)/Heat (1995).mkv"            # part 1001, 300,000 byte
 LOOSE = "Movies/Loose Movie.mkv"                        # part 1002, 120,000 bytes
 HEATHERS = "Movies/Heathers (1989)/Heathers (1989).mkv"  # part 1003, 50,000 bytes
 from tests.fakeplex import SRT as SRT_BODY  # noqa: E402
-from tests.fakeplex import TOKEN, FakeAccount, FakeConn, FakePlex  # noqa: E402
+from tests.fakeplex import MOVIES, TOKEN, TV, FakeAccount, FakeConn, FakePlex  # noqa: E402
 
 
 class TestClient(testclient.TestClient):
@@ -2526,6 +2526,200 @@ class ResyncTest(PlexFixture):
         self.assertEqual(self.store.status_map(["102"], "srv1"), {})
 
 
+class VersionTest(PlexFixture):
+    """Of a title Plex has in several versions, the version setting picks which are copied."""
+    HEAT_DIR = ResyncTest.HEAT_DIR
+    HEAT_MP4 = "Movies/Heat (1995)/Heat (1995).mp4"
+    HEAT_SUBS = ["Heat (1995).en.forced.srt", "Heat (1995).es.srt"]
+    OPT = f"{MOVIES}/Heat (1995)/Plex Versions/Optimized for TV/Heat (1995).mp4"
+    read, copy, check, kinds, apply, movie = (ResyncTest.read, ResyncTest.copy, ResyncTest.check, ResyncTest.kinds,
+                                              ResyncTest.apply, ResyncTest.movie)
+
+    def setUp(self):
+        super().setUp()
+        self.sign_in_and_connect()
+        self.heat = self.movie(101)
+        self.heat["subs"] = [x for x in self.heat["subs"] if x["id"] != 9005]   # the always-invalid one
+        self.heat.update(res="4k", width=3840, bitrate=40_000)
+        self.opt = self.fake.add_version(self.heat, 1501, self.OPT, 100_000, res="1080", width=1920, bitrate=8_000,
+                                         optimized=True)
+
+    def prefer(self, pref):
+        r = self.c.post("/api/settings", json={"mediaVersion": pref})
+        self.assertEqual((r.status_code, r.json().get("mediaVersion")), (200, pref), r.text)
+
+    def pick(self, rk="101", version=None):
+        """(part id, dest) of each file the movie page shows, and its size."""
+        d = self.c.get(f"/api/item/{rk}", params={"mediaVersion": version} if version else None).json()
+        return [(p["id"], p["dest"]) for p in d["parts"]], d["size"]
+
+    def listed_size(self, rk="101"):
+        return next(i["size"] for i in self.c.get("/api/library/1").json()["items"] if i["ratingKey"] == rk)
+
+    def queue(self, *keys, **body):
+        return self.c.post("/api/queue", json={"keys": list(keys), "mode": "all", **body}).json()
+
+    def test_setting(self):
+        self.assertEqual(self.c.get("/api/state").json()["mediaVersion"], "all")
+        for bad in ("4k", None, 1080, "480"):
+            self.assertEqual(self.c.post("/api/settings", json={"mediaVersion": bad}).status_code, 400, bad)
+        self.assertEqual(self.c.get("/api/state").json()["mediaVersion"], "all")
+        self.prefer("720")
+        self.assertEqual(self.c.get("/api/state").json()["mediaVersion"], "720")
+
+    def test_all_versions_is_the_default_and_copies_each_at_plexs_path(self):
+        opt = "Movies/Heat (1995)/Plex Versions/Optimized for TV/Heat (1995).mp4"
+        self.assertEqual(self.pick(), ([(1001, HEAT), (1501, opt)], 400_000))
+        self.assertEqual(self.listed_size(), 400_000)
+        r = self.queue("101")
+        self.assertEqual((r["added"], r["bytes"]), (2, 400_000))
+        self.drain()
+        self.assertEqual((self.read(HEAT), self.read(opt)), (self.fake.parts[1001], self.fake.parts[1501]))
+
+    def test_one_transfer_overrides_the_setting(self):
+        self.prefer("1080")
+        self.assertEqual(self.pick(version="original"), ([(1001, HEAT)], 300_000))
+        self.assertEqual(self.pick(), ([(1501, self.HEAT_MP4)], 100_000))
+        r = self.queue("101", mediaVersion="original")
+        self.assertEqual((r["added"], r["bytes"]), (1, 300_000))
+        self.drain()
+        self.assertTrue(os.path.isfile(self.m(HEAT)))
+        self.assertFalse(os.path.exists(self.m(self.HEAT_MP4)))
+        self.assertEqual(self.c.get("/api/state").json()["mediaVersion"], "1080")    # the setting is unchanged
+        self.assertEqual(self.c.post("/api/queue", json={"keys": ["101"], "mediaVersion": "4k"}).status_code, 400)
+        self.assertEqual(self.c.get("/api/item/101", params={"mediaVersion": "4k"}).status_code, 400)
+
+    def test_original_copies_only_the_original(self):
+        self.prefer("original")
+        self.assertEqual(self.pick(), ([(1001, HEAT)], 300_000))
+        self.assertEqual(self.listed_size(), 300_000)
+        r = self.queue("101")
+        self.assertEqual((r["added"], r["bytes"]), (1, 300_000))
+        self.drain()
+        self.assertEqual(self.read(HEAT), self.fake.parts[1001])
+        self.assertEqual(sorted(os.listdir(self.m(self.HEAT_DIR))), sorted(self.HEAT_SUBS + ["Heat (1995).mkv"]))
+        d = self.check(self.HEAT_DIR)                     # two versions on Plex: compared, not "multipart"
+        self.assertEqual((d["unchanged"], d["items"]), (1, []))
+
+    def test_optimized_version_lands_under_the_originals_name(self):
+        self.prefer("1080")
+        self.assertEqual(self.pick(), ([(1501, self.HEAT_MP4)], 100_000))
+        self.assertEqual(self.listed_size(), 100_000)
+        r = self.queue("101")
+        self.assertEqual((r["added"], r["bytes"]), (1, 100_000))
+        self.drain()
+        self.assertEqual(self.read(self.HEAT_MP4), self.fake.parts[1501])
+        # no Plex Versions folder, and the original's subtitles named after the copy
+        self.assertEqual(sorted(os.listdir(self.m(self.HEAT_DIR))), sorted(self.HEAT_SUBS + ["Heat (1995).mp4"]))
+        self.assertEqual(self.read("Movies/Heat (1995)/Heat (1995).es.srt"), SRT_BODY("Hola").encode())
+        d = self.check(self.HEAT_DIR)
+        self.assertEqual((d["unchanged"], d["items"]), (1, []))
+        self.assertEqual(self.c.get("/api/item/101").json()["nasFolder"], self.HEAT_DIR)
+        self.assertEqual(self.queue("101")["added"], 0)
+
+    def test_a_versions_own_subtitles_win(self):
+        self.opt["subs"] = [dict(id=9501, codec="srt", lang="fr", ext=True, body=SRT_BODY("Salut"))]
+        self.prefer("1080")
+        self.copy("101")
+        self.assertEqual(sorted(os.listdir(self.m(self.HEAT_DIR))), ["Heat (1995).fr.srt", "Heat (1995).mp4"])
+
+    def test_choosing_between_versions(self):
+        self.fake.add_version(self.heat, 1502, f"{MOVIES}/Heat (1995)/Plex Versions/Optimized for Mobile/Heat (1995).mp4",
+                              60_000, res="720", width=1280, bitrate=4_000, optimized=True)
+        other = f"{MOVIES}/Heat (1995)/Heat (1995) - 1080p.mkv"   # no videoResolution: its width says 1080p
+        self.fake.add_version(self.heat, 1503, other, 150_000, width=1920, bitrate=12_000)
+        mobile = "Movies/Heat (1995)/Heat (1995).mp4"
+        expect = {"original": (1001, HEAT, 300_000), "smallest": (1502, mobile, 60_000), "2160": (1001, HEAT, 300_000),
+                  "1080": (1503, "Movies/Heat (1995)/Heat (1995) - 1080p.mkv", 150_000), "720": (1502, mobile, 60_000),
+                  "sd": (1502, mobile, 60_000)}                     # nothing fits SD: the smallest
+        for pref, (pid, dest, size) in expect.items():
+            self.prefer(pref)
+            self.assertEqual(self.pick(), ([(pid, dest)], size), pref)
+            self.assertEqual(self.listed_size(), size, pref)
+        self.heat["versions"] = [v for v in self.heat["versions"] if v["part"] != 1502]
+        self.prefer("720")
+        self.assertEqual(self.pick(), ([(1501, self.HEAT_MP4)], 100_000))   # nothing fits 720p now: the smallest
+        r = self.queue("101")
+        self.assertEqual((r["added"], r["bytes"]), (1, 100_000))
+
+    def test_at_the_same_resolution_the_original_wins(self):
+        # as on a real server: an 'Original Quality' optimized copy of a 4K file, bigger and of a higher bitrate
+        big = f"{MOVIES}/Heat (1995)/Plex Versions/Original Quality/Heat (1995).mp4"
+        self.heat["versions"] = []
+        self.fake.add_version(self.heat, 1504, big, 600_000, res="4k", width=3840, bitrate=90_000, optimized=True)
+        for pref in ("2160", "original"):
+            self.prefer(pref)
+            self.assertEqual(self.pick(), ([(1001, HEAT)], 300_000), pref)
+        self.prefer("1080")                                                # nothing fits: the smallest
+        self.assertEqual(self.pick(), ([(1001, HEAT)], 300_000))
+
+    def test_two_originals_of_one_resolution(self):
+        loose = next(x for x in self.fake.movies if x["rk"] == 102)       # 120,000 bytes
+        loose.update(res="1080", width=1920, bitrate=2_000)
+        self.fake.add_version(loose, 1505, f"{MOVIES}/Loose Movie - Remux.mkv", 840_000, res="1080", width=1920,
+                              bitrate=14_000)
+        same = next(e for e in self.fake.episodes if e["rk"] == 201)      # two identical files
+        same.update(res="1080", width=1920, bitrate=5_000)
+        self.fake.add_version(same, 2505, f"{TV}/Show A/Season 01/Show A - S01E01 - Pilot (copy).mkv", same["size"],
+                              res="1080", width=1920, bitrate=5_000)
+        for pref, pid in (("2160", 1505), ("1080", 1505), ("720", 1002), ("sd", 1002)):
+            self.prefer(pref)
+            self.assertEqual(self.pick("102")[0][0][0], pid, pref)
+            self.assertEqual(len(self.pick("201")[0]), 1, pref)
+
+    def test_optimized_version_without_the_original(self):
+        self.prefer("original")
+        self.heat.update(file=self.OPT, part=1501, size=100_000, optimized=True, versions=[])
+        self.assertEqual(self.pick(), ([(1501, self.HEAT_MP4)], 100_000))
+
+    def test_episodes(self):
+        ep = next(e for e in self.fake.episodes if e["rk"] == 202)
+        ep["res"] = "4k"
+        self.fake.add_version(ep, 2502, f"{TV}/Show A/Season 01/Plex Versions/Optimized for TV/Show A - S01E02 - Second.mp4",
+                              30_000, res="720", optimized=True)
+        mp4 = "TV-Shows/Show A/Season 01/Show A - S01E02 - Second.mp4"
+        self.prefer("1080")
+        d = self.c.get("/api/item/200").json()
+        e = next(e for s in d["seasons"] for e in s["episodes"] if e["ratingKey"] == "202")
+        self.assertEqual((e["size"], e["dest"], d["size"]), (30_000, mp4, 80_000 + 30_000 + 70_000))
+        r = self.queue("200")
+        self.assertEqual((r["added"], r["bytes"]), (3, 180_000))
+        self.drain()
+        self.assertEqual(self.read(mp4), self.fake.parts[2502])
+        self.assertTrue(os.path.isfile(self.m("TV-Shows/Show A/Season 01/Show A - S01E02 - Second.es.srt")))
+        self.assertEqual(self.check("TV-Shows/Show A")["items"], [])
+
+    def test_resync_replaces_the_copy_of_the_other_version(self):
+        self.prefer("original")
+        self.copy("101")                                                   # the 4K original
+        self.prefer("1080")
+        r = self.queue("101")                                              # never a second copy beside it
+        self.assertEqual((r["added"], r["skipped"]), (0, 1))
+        self.assertEqual(self.kinds(self.HEAT_DIR), {"101": "upgraded"})
+        item = self.check(self.HEAT_DIR)["items"][0]
+        self.assertEqual(item["video"], {"from": {"file": "Heat (1995).mkv", "size": 300_000},
+                                         "to": {"file": "Heat (1995).mp4", "size": 100_000}})
+        r = self.apply(self.HEAT_DIR, "101").json()
+        self.assertEqual((r["upgrades"], r["videoBytes"]), (1, 100_000))
+        self.drain()
+        self.assertEqual(sorted(os.listdir(self.m(self.HEAT_DIR))), sorted(self.HEAT_SUBS + ["Heat (1995).mp4"]))
+        self.assertEqual(self.read(self.HEAT_MP4), self.fake.parts[1501])
+        self.assertEqual(self.read("Movies/Heat (1995)/Heat (1995).es.srt"), SRT_BODY("Hola").encode())
+        self.assertEqual(self.check(self.HEAT_DIR)["items"], [])
+        self.prefer("original")                                            # and back
+        self.assertEqual(self.kinds(self.HEAT_DIR), {"101": "upgraded"})
+
+    def test_a_file_of_the_other_version_stays(self):
+        self.prefer("1080")
+        self.copy("101")
+        with open(self.m(HEAT), "wb") as fh:                               # the original, copied some other way
+            fh.write(self.fake.parts[1001])
+        self.assertEqual(self.kinds(self.HEAT_DIR), {HEAT: "otherversion"})
+        r = self.apply(self.HEAT_DIR).json()
+        self.assertEqual((r["upgrades"], r["skipped"]), (0, 0))
+        self.assertTrue(os.path.isfile(self.m(HEAT)))
+
+
 class StoreIndexTest(unittest.TestCase):
     def test_duplicate_check_uses_dest_index_on_old_databases(self):
         tmp = tempfile.mkdtemp()
@@ -2795,6 +2989,15 @@ class PathsTest(unittest.TestCase):
             shutil.rmtree(outside)
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_version_paths(self):
+        opt = "/data/Movies/Heat (1995)/Plex Versions/Optimized for TV/Heat (1995).mp4"
+        self.assertTrue(paths.in_versions(opt))
+        self.assertFalse(paths.in_versions("/data/Movies/Plex Versions.mkv"))
+        self.assertEqual(paths.unversioned(opt), "/data/Movies/Heat (1995)/Heat (1995).mp4")
+        self.assertEqual(paths.unversioned("/data/Movies/M/Plex Versions/m.mp4"), "/data/Movies/M/m.mp4")
+        self.assertEqual(paths.unversioned("/data/Movies/M/m.mkv"), "/data/Movies/M/m.mkv")
+        self.assertEqual(paths.version_rel("Movies/Heat (1995)/Heat (1995).mkv", opt), "Movies/Heat (1995)/Heat (1995).mp4")
 
     def test_sidecar_names(self):
         used = set()

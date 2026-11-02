@@ -29,6 +29,7 @@ jobs:
       packages: write
     env:
       IMAGE: ghcr.io/alien4u/travelarr
+      PLATFORMS: linux/amd64,linux/arm64
     steps:
       - uses: actions/checkout@v7
       - name: Pick the tag
@@ -50,13 +51,16 @@ jobs:
           python3 -m venv /tmp/venv
           /tmp/venv/bin/pip install -q -r src/requirements.txt -r src/requirements-dev.txt
           cd src && /tmp/venv/bin/python -m unittest tests.test_app
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
       - name: Log in to GHCR
         run: echo "$TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
         env:
           TOKEN: ${{ secrets.GITHUB_TOKEN }}
       - name: Build
+        # every platform is built before anything is pushed; Push reuses this build from the builder's cache
         run: |
-          docker build --platform linux/amd64 \
+          docker buildx build --platform "$PLATFORMS" \
             --label org.opencontainers.image.revision="$GITHUB_SHA" \
             --label org.opencontainers.image.version="${{ steps.tag.outputs.version }}" \
             -t "$IMAGE:${{ steps.tag.outputs.tag }}" src
@@ -91,4 +95,7 @@ jobs:
               fi
             fi
           fi
-          docker push "$IMAGE:$tag"
+          docker buildx build --platform "$PLATFORMS" --push \
+            --label org.opencontainers.image.revision="$GITHUB_SHA" \
+            --label org.opencontainers.image.version="${{ steps.tag.outputs.version }}" \
+            -t "$IMAGE:$tag" src

@@ -1,3 +1,5 @@
+# A multi-arch base and pure-Python or wheel-only requirements: the same file builds
+# linux/amd64 and linux/arm64 (Raspberry Pi 4 and 5), natively or with buildx.
 FROM python:3.12-slim
 
 LABEL org.opencontainers.image.title="travelarr" \

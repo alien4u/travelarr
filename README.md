@@ -35,6 +35,12 @@ travel NAS.
   the new one is in place.
 - Original files only, plus the external subtitles Plex knows about (`Movie.es.srt`, `Movie.en.forced.srt`).
   Subtitles inside the file come along automatically.
+- Versions: when Plex has several of a title (an Optimized Version, a 4K and a 1080p file), Settings chooses what is
+  copied: **All versions** (the default), **Original (largest)**, **Smallest**, or a maximum, **4K**, **1080p**,
+  **720p** or **SD**, which copies the best version at or under it (the smallest when none fits). A title page can
+  choose differently for one copy. Pair a maximum with Plex's **Optimize** to carry 1080p copies of 4K films. A
+  version copied alone lands in the normal folder under the original's name (`Heat (1995).mp4`), never in
+  `Plex Versions`, and an optimized one gets the original's external subtitles.
 - Same folder layout as your home library (`Movies/...`, `TV-Shows/...`).
 - Downloads resume after dropped connections and restarts, and every resume is checked against the file on Plex, so
   a bad connection never leaves a corrupt file.
@@ -57,7 +63,7 @@ travel NAS.
 
 ## Installation
 
-The image is published for `linux/amd64` at `ghcr.io/alien4u/travelarr`. It runs as UID 99 / GID 100 (Unraid's
+The image is published for `linux/amd64` and `linux/arm64` (Raspberry Pi 4 and 5) at `ghcr.io/alien4u/travelarr`. It runs as UID 99 / GID 100 (Unraid's
 `nobody:users`), so the files it copies are owned like everything else on your shares.
 
 ### Unraid
@@ -137,7 +143,8 @@ Fill the NAS at home if you can: copying over your own network is much faster th
   again.
 - Image-based subtitles stored as separate files (PGS, VobSub) are skipped and noted in the History.
 - Re-sync spots a new video version by its file name, size and first and last 64 KB (Plex offers no checksums), and
-  only looks at folders that are on the NAS: a season or movie folder you deleted is not offered again.
+  only looks at folders that are on the NAS: a season or movie folder you deleted is not offered again. It compares
+  the version the setting picks, so after changing the setting it offers to replace copies of the other version.
 
 ## Support
 

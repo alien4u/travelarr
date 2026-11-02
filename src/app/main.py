@@ -23,7 +23,7 @@ from . import auth as auth_mod
 from . import resync
 from .paths import (ListingChanged, PathError, abs_path, delete_entry, list_dir, local_entry, real_rel,
                     touches)
-from .plexgw import NotReady, OtherServer, PlexGateway
+from .plexgw import VERSION_PREFS, NotReady, OtherServer, PlexGateway
 from .resync import ResyncError
 from .store import Store, label, now
 from .worker import CHANGED, Downloader
@@ -300,6 +300,7 @@ def create_app(data_dir: str | None = None, media_root: str | None = None,
             "connError": gw._fail[1] if getattr(gw, "_fail", None) else None,
             "paused": bool(store.get("paused", False)),
             "reserveGb": store.get("reserve_gb", 10),
+            "mediaVersion": gw.version_pref(),
             "mediaRoot": media_root,
             "disk": disk(),
             "current": dl.snapshot(),
@@ -350,6 +351,10 @@ def create_app(data_dir: str | None = None, media_root: str | None = None,
             if not math.isfinite(gb):
                 return err(400, "The free space to keep must be a number of GB", "bad_request")
             store.set("reserve_gb", max(0.0, gb))
+        if "mediaVersion" in body:
+            if body["mediaVersion"] not in VERSION_PREFS:
+                return err(400, f"mediaVersion must be one of {', '.join(VERSION_PREFS)}", "bad_request")
+            store.set("media_version", body["mediaVersion"])
         if "paused" in body:
             store.set("paused", bool(body["paused"]))
             dl.wake()
@@ -372,8 +377,10 @@ def create_app(data_dir: str | None = None, media_root: str | None = None,
         return {"items": annotate(gw.watchlist())}
 
     @app.get("/api/item/{rk}")
-    def item(rk: str):
-        d = gw.item(rk)
+    def item(rk: str, mediaVersion: str | None = None):  # noqa: N803 - the name the page sends
+        if mediaVersion is not None and mediaVersion not in VERSION_PREFS:
+            return err(400, f"mediaVersion must be one of {', '.join(VERSION_PREFS)}", "bad_request")
+        d = gw.item(rk, mediaVersion)
         if d["type"] == "show":
             eps = [e for s in d["seasons"] for e in s["episodes"]]
             sid = store.get("server_id")
@@ -399,9 +406,12 @@ def create_app(data_dir: str | None = None, media_root: str | None = None,
             return err(400, f"Too many titles at once (at most {MAX_QUEUE_KEYS})")
         mode = body.get("mode", "unwatched")
         only = {str(k) for k in body.get("only") or []} or None
+        version = body.get("mediaVersion")  # this transfer only; the setting otherwise
+        if version is not None and version not in VERSION_PREFS:
+            return err(400, f"mediaVersion must be one of {', '.join(VERSION_PREFS)}", "bad_request")
         try:
             jobs = gw.plan(keys, mode=mode, source=body.get("source", "browse"), only=only,
-                           server_id=body.get("serverId"))
+                           server_id=body.get("serverId"), version=version)
         except OtherServer:
             return err(409, "The Plex server changed; reload and try again", "other_server")
         added, skipped = store.add_jobs(jobs)

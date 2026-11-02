@@ -205,6 +205,14 @@ class Store:
                 f"SELECT id FROM jobs WHERE status IN ('queued','downloading','done') AND id NOT IN ({ignore}) "
                 "AND (dest_rel=? OR (part_id=? AND server_id IS ?))",
                 (j["dest_rel"], j["part_id"], j.get("server_id"))).fetchone()
+            if dup is None and j.get("rating_key"):
+                # another version of this video under the same name: its subtitles would be shared;
+                # Re-sync replaces it instead
+                stem = posixpath.splitext(j["dest_rel"])[0]
+                dup = next((r for r in self.db.execute(
+                    f"SELECT dest_rel FROM jobs WHERE status IN ('queued','downloading','done') "
+                    f"AND id NOT IN ({ignore}) AND rating_key=? AND server_id IS ?",
+                    (j["rating_key"], j.get("server_id"))) if posixpath.splitext(r["dest_rel"])[0] == stem), None)
             if dup or (replaces and self._replaced_by_other(replaces)):
                 skipped.append(j)
                 continue
