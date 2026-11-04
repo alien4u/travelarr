@@ -2818,7 +2818,7 @@ class OptimizeTest(PlexFixture):
         self.prefer("1080")
         d = self.item()
         self.assertEqual(d["optimize"], {"cap": "1080", "label": "1080p", "state": "available", "progress": None,
-                                         "noVideo": False})
+                                         "noVideo": False, "dolbyVision": None})
         self.assertEqual(self.pick(), ([(1001, HEAT)], 300_000))       # the smallest, above the cap
 
         r = self.ask()
@@ -2830,7 +2830,8 @@ class OptimizeTest(PlexFixture):
         self.assertEqual(self.ask().json()["optimize"]["state"], "optimizing")    # asked once, not twice
         self.assertEqual(len(self.fake.optimize_items), 1)
         self.assertEqual(self.item()["optimize"], {"cap": "1080", "label": "1080p", "state": "optimizing",
-                                                   "progress": None, "noVideo": False})   # queued, not started
+                                                   "progress": None, "noVideo": False,
+                                                   "dolbyVision": None})               # queued, not started
         self.fake.conversions[101]["progress"] = 41.6
         self.assertEqual(self.item()["optimize"]["progress"], 42)
 
@@ -2867,6 +2868,14 @@ class OptimizeTest(PlexFixture):
         self.assertEqual(self.pick(), ([(1001, HEAT)], 300_000))         # the original, not the audio
         self.assertEqual(self.pick(version="smallest"), ([(1001, HEAT)], 300_000))
         self.assertEqual(self.queue("101")["bytes"], 300_000)
+
+    def test_the_source_dolby_vision_profile_is_reported(self):
+        self.prefer("1080")
+        self.movie(101)["dovi"] = 7                     # a UHD Blu-ray remux: Plex's conversions lose the video
+        self.assertEqual(self.item()["optimize"]["dolbyVision"], 7)
+        self.movie(101)["dovi"] = 8
+        self.assertEqual(self.item()["optimize"]["dolbyVision"], 8)
+        self.assertEqual(self.ask().json()["optimize"]["state"], "optimizing")   # only a warning: still asked
 
     def test_an_episode_and_lower_caps(self):
         ep = next(e for e in self.fake.episodes if e["rk"] == 202)

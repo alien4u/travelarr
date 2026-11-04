@@ -182,7 +182,9 @@ class FakePlex:
     def media_xml(self, v, full):
         streams = ""
         if full:
-            streams = '<Stream id="1" streamType="1" codec="h264" index="0"/>'
+            streams = "<Stream " + attrs({"id": 1, "streamType": 1, "codec": "h264", "index": 0,
+                                          "DOVIPresent": 1 if v.get("dovi") else None,
+                                          "DOVIProfile": v.get("dovi")}) + "/>"
             for s in v["subs"]:
                 streams += "<Stream " + attrs({
                     "id": s["id"], "streamType": 3, "codec": s["codec"], "languageTag": s["lang"],

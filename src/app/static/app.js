@@ -644,10 +644,13 @@ function videoBody(d) {
 // progress until the new version is there and the page can copy it.
 function optimizeControl(d) {
   const o = d.optimize, server = S.state.serverName || 'Plex';
+  const dv7 = o.dolbyVision === 7 && `This is Dolby Vision profile 7 (a UHD Blu-ray), and Plex's conversions `
+    + 'of it have come out with no video. A 1080p release, or converting it with Tdarr or HandBrake, works better.';
   if (o.state === 'available') {
     const btn = h('button', {
       class: 'btn small', title: `Plex transcodes it on ${server} into a ${o.label} version beside the original`,
       onclick: async () => {
+        if (dv7 && !confirm(`${dv7} Ask ${server} anyway?`)) return;
         btn.disabled = true;
         try {
           await post('/api/optimize', { ratingKey: d.ratingKey, mediaVersion: o.cap });
@@ -656,12 +659,11 @@ function optimizeControl(d) {
         openItem(d.ratingKey, d.mediaVersion);
       },
     }, `Make ${o.label} version on ${server}`);
-    if (!o.noVideo) return btn;
-    const both = document.createDocumentFragment();
-    both.append(btn, h('p', { class: 'small warn' },
-      `The version ${server} made before has no video (its conversion failed), so it is never copied. `
-      + `Delete it in Plex (Settings › Optimized Versions) before making another.`));
-    return both;
+    const notes = [dv7, o.noVideo && `The version ${server} made before has no video (its conversion failed), `
+      + 'so it is never copied. Delete it in Plex (Settings › Optimized Versions) before making another.'];
+    const all = document.createDocumentFragment();
+    all.append(btn, ...notes.filter(Boolean).map(n => h('p', { class: 'small warn' }, n)));
+    return all;
   }
   const text = p => `Making ${o.label} on ${server}${p == null ? ' (queued)' : ` · ${p}%`}`;
   const chip = h('span', { class: 'chip busy' }, text(o.progress));

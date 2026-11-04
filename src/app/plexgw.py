@@ -235,6 +235,16 @@ def _no_video(media) -> bool:
     return _optimized(media) and not any(getattr(media, a, None) for a in ("videoCodec", "videoResolution", "width"))
 
 
+def _dolby_vision(media) -> int | None:
+    """The Dolby Vision profile of a version's video, None without. Plex's Optimize
+    made an audio-only version of a profile 7 source (UHD Blu-ray's dual layer)."""
+    for p in media.parts:
+        for s in p.videoStreams():
+            if getattr(s, "DOVIPresent", False):
+                return getattr(s, "DOVIProfile", None)
+    return None
+
+
 def pick_media(video, pref: str):
     """The version of video to copy; None when Plex has no file for it.
     'original': the largest version Plex did not optimize (what a single-version
@@ -700,7 +710,13 @@ class PlexGateway:
         if pref not in OPTIMIZE or it.type not in ("movie", "episode") or not above_cap(it, pref):
             return None
         d = {"cap": pref, "label": OPTIMIZE[pref][1], "state": "available", "progress": None,
-             "noVideo": any(m.parts and _no_video(m) for m in it.media)}   # Plex made one before, without video
+             "noVideo": any(m.parts and _no_video(m) for m in it.media),   # Plex made one before, without video
+             "dolbyVision": None}
+        src = _original(it) or pick_media(it, pref)
+        try:
+            d["dolbyVision"] = _dolby_vision(src)
+        except Exception as e:  # noqa: BLE001 - only a warning depends on it
+            log.info("the video streams of %s: %s", it.title, e)
         srv, rk = it._server, str(it.ratingKey)
         try:
             if any(str(c.ratingKey) == rk for c in srv.conversions()):
