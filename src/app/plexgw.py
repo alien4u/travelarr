@@ -245,6 +245,11 @@ def _dolby_vision(media) -> int | None:
     return None
 
 
+def copyable(video) -> list:
+    """The versions a copy can take: with files, and not one Plex optimized without video."""
+    return [m for m in video.media if m.parts and not _no_video(m)]
+
+
 def pick_media(video, pref: str):
     """The version of video to copy; None when Plex has no file for it.
     'original': the largest version Plex did not optimize (what a single-version
@@ -252,7 +257,7 @@ def pick_media(video, pref: str):
     highest resolution at or under it, then a version Plex did not optimize (an
     'Original Quality' optimized copy can be bigger than the original), then
     bitrate; else the smallest. Never an optimized version without video."""
-    media = [m for m in video.media if m.parts and not _no_video(m)]
+    media = copyable(video)
     if len(media) <= 1:
         return media[0] if media else None
     if pref == "smallest":
@@ -304,7 +309,7 @@ def chosen_parts(video, sec, pref: str) -> list[tuple]:
     """(part, dest_rel) for each file of the version of video to copy.
     'all': every file, at Plex's paths."""
     if pref == "all":
-        return [(p, dest_rel_for(p.file, sec.locations, sec.title)) for p in video.iterParts()]
+        return [(p, dest_rel_for(p.file, sec.locations, sec.title)) for m in copyable(video) for p in m.parts]
     m = pick_media(video, pref)
     return _alone(video, m, sec) if m else []
 
@@ -321,7 +326,7 @@ def other_versions(video, sec, picked: set) -> list[tuple]:
 
 
 def version_count(video) -> int:
-    return sum(1 for m in video.media if m.parts)
+    return len(copyable(video))
 
 
 class PlexGateway:
@@ -617,7 +622,7 @@ class PlexGateway:
             d["watched"] = bool(getattr(it, "viewCount", 0))
             try:
                 pref = pref or self.version_pref()  # the size of what a copy would take
-                copied = it.media if pref == "all" else [m for m in [pick_media(it, pref)] if m]
+                copied = copyable(it) if pref == "all" else [m for m in [pick_media(it, pref)] if m]
                 d["size"] = sum(_size(m) for m in copied)
             except Exception:  # noqa: BLE001
                 d["size"] = None

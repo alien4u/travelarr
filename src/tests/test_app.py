@@ -2867,6 +2867,9 @@ class OptimizeTest(PlexFixture):
         self.assertEqual((d["optimize"]["state"], d["optimize"]["noVideo"]), ("available", True))
         self.assertEqual(self.pick(), ([(1001, HEAT)], 300_000))         # the original, not the audio
         self.assertEqual(self.pick(version="smallest"), ([(1001, HEAT)], 300_000))
+        self.assertEqual(self.pick(version="all"), ([(1001, HEAT)], 300_000))     # not with every version either
+        self.assertEqual(d["versions"], 1)                                         # no version choice for it
+        self.assertEqual(self.c.get("/api/item/101", params={"mediaVersion": "all"}).json()["size"], 300_000)
         self.assertEqual(self.queue("101")["bytes"], 300_000)
 
     def test_the_source_dolby_vision_profile_is_reported(self):
