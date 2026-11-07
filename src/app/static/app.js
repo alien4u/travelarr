@@ -627,6 +627,7 @@ function videoBody(d) {
   }
   const resync = resyncButton(d);  // null until the title is on the device; append(null) would show "null"
   if (resync) actions.append(resync);
+  if (d.optimize && (!st || st === 'failed')) actions.append(optimizeControl(d));
   if (st === 'done') actions.append(h('button', {
     class: 'btn small danger', onclick: async () => {
       if (!confirm(`Delete "${d.title}" from ${dev()}?`)) return;
@@ -637,6 +638,47 @@ function videoBody(d) {
   return h('div', {},
     (d.parts || []).map(p => h('div', { class: 'mono muted' }, `${dev()}: ${p.dest}`)),
     actions);
+}
+
+// Every version is above the cap: ask Plex to make one (its Optimize), then show its
+// progress until the new version is there and the page can copy it.
+function optimizeControl(d) {
+  const o = d.optimize, server = S.state.serverName || 'Plex';
+  const dv7 = o.dolbyVision === 7 && `This is Dolby Vision profile 7 (a UHD Blu-ray), and Plex's conversions `
+    + 'of it have come out with no video. A 1080p release, or converting it with Tdarr or HandBrake, works better.';
+  if (o.state === 'available') {
+    const btn = h('button', {
+      class: 'btn small', title: `Plex transcodes it on ${server} into a ${o.label} version beside the original`,
+      onclick: async () => {
+        if (dv7 && !confirm(`${dv7} Ask ${server} anyway?`)) return;
+        btn.disabled = true;
+        try {
+          await post('/api/optimize', { ratingKey: d.ratingKey, mediaVersion: o.cap });
+          toast(`Asked ${server} to make a ${o.label} version`);
+        } catch (e) { toast(e.message); }
+        openItem(d.ratingKey, d.mediaVersion);
+      },
+    }, `Make ${o.label} version on ${server}`);
+    const notes = [dv7, o.noVideo && `The version ${server} made before has no video (its conversion failed), `
+      + 'so it is never copied. Delete it in Plex (Settings › Optimized Versions) before making another.'];
+    const all = document.createDocumentFragment();
+    all.append(btn, ...notes.filter(Boolean).map(n => h('p', { class: 'small warn' }, n)));
+    return all;
+  }
+  const text = p => `Making ${o.label} on ${server}${p == null ? ' (queued)' : ` · ${p}%`}`;
+  const chip = h('span', { class: 'chip busy' }, text(o.progress));
+  const poll = async () => {
+    if (!chip.isConnected) return;   // the page was closed or replaced
+    try {
+      const n = await api(`/api/item/${d.ratingKey}?mediaVersion=${encodeURIComponent(o.cap)}`);
+      if (!chip.isConnected) return;
+      if (!n.optimize || n.optimize.state !== 'optimizing') return openItem(d.ratingKey, d.mediaVersion);
+      chip.textContent = text(n.optimize.progress);
+    } catch { /* try again next time */ }
+    setTimeout(poll, 15000);
+  };
+  setTimeout(poll, 15000);
+  return chip;
 }
 
 function showBody(d) {
@@ -1096,7 +1138,8 @@ function renderSettings() {
         h('p', { class: 'muted small' },
           'Any choice but All versions copies one version of each movie or episode; with a maximum, the best one ',
           'at or under it, else the smallest. Use Plex\'s Optimize to make smaller versions; one is saved under ',
-          'the original\'s name, not in a Plex Versions folder. A title page can choose differently for one copy.'))),
+          'the original\'s name, not in a Plex Versions folder. A title page can choose differently for one copy, ',
+          'and when every version is above the maximum it offers to have Plex make one (Optimize needs Plex Pass).'))),
     h('div', { class: 'panel' }, h('h2', {}, 'Storage'),
       h('p', {}, `Device name: ${st.device}`,
         h('span', { class: 'muted small' }, ' (the Unraid server name or host name; set TRAVELARR_NAME to change it)')),

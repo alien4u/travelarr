@@ -17,13 +17,13 @@ import requests
 from fastapi import Body, FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
-from plexapi.exceptions import NotFound, Unauthorized
+from plexapi.exceptions import BadRequest, NotFound, Unauthorized
 
 from . import auth as auth_mod
 from . import resync
 from .paths import (ListingChanged, PathError, abs_path, delete_entry, list_dir, local_entry, real_rel,
                     touches)
-from .plexgw import VERSION_PREFS, NotReady, OtherServer, PlexGateway
+from .plexgw import OPTIMIZE, VERSION_PREFS, NotReady, OtherServer, PlexGateway
 from .resync import ResyncError
 from .store import Store, label, now
 from .worker import CHANGED, Downloader
@@ -33,6 +33,11 @@ STATIC = os.path.join(os.path.dirname(__file__), "static")
 LOCAL_NOTE = "deleted in Local Files"
 MAX_QUEUE_KEYS = 200  # bounds the Plex requests one queue call makes
 log = logging.getLogger("travelarr")
+
+
+def asset_hash(name: str) -> str:
+    with open(os.path.join(STATIC, name), "rb") as fh:
+        return hashlib.sha256(fh.read()).hexdigest()[:12]
 
 
 def device_name() -> str:
@@ -397,6 +402,21 @@ def create_app(data_dir: str | None = None, media_root: str | None = None,
         d["nasFolder"] = resync.title_folder(media_root, d)
         return d
 
+    @app.post("/api/optimize")
+    def optimize(body: dict = Body(...)):
+        """Ask Plex to make a version of a movie or episode at a cap (Plex's Optimize)."""
+        rk, pref = str(body.get("ratingKey") or ""), body.get("mediaVersion")
+        if not rk.isdigit():
+            return err(400, "ratingKey is required", "bad_request")
+        if pref not in OPTIMIZE:
+            return err(400, f"mediaVersion must be one of {', '.join(OPTIMIZE)}", "bad_request")
+        try:
+            return {"optimize": gw.optimize(rk, pref)}
+        except Unauthorized:
+            return err(403, "Plex refused: only the server's owner can make versions", "plex_refused")
+        except BadRequest as e:
+            return err(502, f"Plex refused to make a version (Optimize needs Plex Pass): {e}", "plex_refused")
+
     @app.post("/api/queue")
     def queue(body: dict = Body(...)):
         keys = [str(k) for k in body.get("keys", []) if k]
@@ -619,8 +639,9 @@ def create_app(data_dir: str | None = None, media_root: str | None = None,
 
     app.mount("/static", StaticFiles(directory=STATIC), name="static")
     with open(os.path.join(STATIC, "index.html"), encoding="utf-8") as fh:
-        # a new version is a new URL, so browsers never run an old app.js after an update
-        page = re.sub(r'"(/static/[\w.-]+\.(?:js|css))"', rf'"\1?v={VERSION}"', fh.read())
+        # changed contents are a new URL (not only a new version: a build between releases
+        # changes them too), so browsers never run an old app.js after an update
+        page = re.sub(r'"(/static/([\w.-]+\.(?:js|css)))"', lambda m: f'"{m[1]}?v={asset_hash(m[2])}"', fh.read())
 
     @app.get("/")
     def index():
