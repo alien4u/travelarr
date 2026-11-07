@@ -733,10 +733,14 @@ class PlexGateway:
             log.info("Plex's conversion queue: %s", e)
         return d
 
-    def optimize(self, rating_key: str, pref: str) -> dict | None:
+    def optimize(self, rating_key: str, pref: str, server_id: str) -> dict | None:
         """Ask Plex to Optimize a movie or episode to the cap pref (once: not when
-        it is already being made, or a version already fits)."""
-        it = self.server().fetchItem(int(rating_key))
+        it is already being made, or a version already fits). `server_id` is the
+        server of the page that asked: raises OtherServer when another is selected."""
+        srv, sid = self.snapshot()
+        if sid != server_id:  # rating keys mean something else on another server
+            raise OtherServer("the selected Plex server changed")
+        it = srv.fetchItem(int(rating_key))
         st = self.optimize_state(it, pref)
         if st is None or st["state"] != "available":
             return st

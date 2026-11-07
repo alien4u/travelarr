@@ -405,13 +405,17 @@ def create_app(data_dir: str | None = None, media_root: str | None = None,
     @app.post("/api/optimize")
     def optimize(body: dict = Body(...)):
         """Ask Plex to make a version of a movie or episode at a cap (Plex's Optimize)."""
-        rk, pref = str(body.get("ratingKey") or ""), body.get("mediaVersion")
+        rk, pref, sid = str(body.get("ratingKey") or ""), body.get("mediaVersion"), body.get("serverId")
         if not rk.isdigit():
             return err(400, "ratingKey is required", "bad_request")
+        if not sid or not isinstance(sid, str):
+            return err(400, "serverId is required", "bad_request")
         if pref not in OPTIMIZE:
             return err(400, f"mediaVersion must be one of {', '.join(OPTIMIZE)}", "bad_request")
         try:
-            return {"optimize": gw.optimize(rk, pref)}
+            return {"optimize": gw.optimize(rk, pref, sid)}
+        except OtherServer:
+            return err(409, "The Plex server changed; reload and try again", "other_server")
         except Unauthorized:
             return err(403, "Plex refused: only the server's owner can make versions", "plex_refused")
         except BadRequest as e:

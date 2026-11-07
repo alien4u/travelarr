@@ -643,7 +643,7 @@ function videoBody(d) {
 // Every version is above the cap: ask Plex to make one (its Optimize), then show its
 // progress until the new version is there and the page can copy it.
 function optimizeControl(d) {
-  const o = d.optimize, server = S.state.serverName || 'Plex';
+  const o = d.optimize, server = S.state.serverName || 'Plex', serverId = S.state.serverId;
   const dv7 = o.dolbyVision === 7 && `This is Dolby Vision profile 7 (a UHD Blu-ray), and Plex's conversions `
     + 'of it have come out with no video. A 1080p release, or converting it with Tdarr or HandBrake, works better.';
   if (o.state === 'available') {
@@ -653,7 +653,7 @@ function optimizeControl(d) {
         if (dv7 && !confirm(`${dv7} Ask ${server} anyway?`)) return;
         btn.disabled = true;
         try {
-          await post('/api/optimize', { ratingKey: d.ratingKey, mediaVersion: o.cap });
+          await post('/api/optimize', { ratingKey: d.ratingKey, mediaVersion: o.cap, serverId });
           toast(`Asked ${server} to make a ${o.label} version`);
         } catch (e) { toast(e.message); }
         openItem(d.ratingKey, d.mediaVersion);
@@ -667,11 +667,13 @@ function optimizeControl(d) {
   }
   const text = p => `Making ${o.label} on ${server}${p == null ? ' (queued)' : ` · ${p}%`}`;
   const chip = h('span', { class: 'chip busy' }, text(o.progress));
+  // closing the sheet only hides it, and on another server the rating key is another title
+  const shown = () => chip.isConnected && !$('#sheet').hidden && S.state.serverId === serverId;
   const poll = async () => {
-    if (!chip.isConnected) return;   // the page was closed or replaced
+    if (!shown()) return;   // the page was closed or replaced
     try {
       const n = await api(`/api/item/${d.ratingKey}?mediaVersion=${encodeURIComponent(o.cap)}`);
-      if (!chip.isConnected) return;
+      if (!shown()) return;
       if (!n.optimize || n.optimize.state !== 'optimizing') return openItem(d.ratingKey, d.mediaVersion);
       chip.textContent = text(n.optimize.progress);
     } catch { /* try again next time */ }

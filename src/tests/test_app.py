@@ -2811,8 +2811,8 @@ class OptimizeTest(PlexFixture):
     def item(self, rk="101", version=None):
         return self.c.get(f"/api/item/{rk}", params={"mediaVersion": version} if version else None).json()
 
-    def ask(self, rk="101", pref="1080"):
-        return self.c.post("/api/optimize", json={"ratingKey": rk, "mediaVersion": pref})
+    def ask(self, rk="101", pref="1080", server="srv1"):
+        return self.c.post("/api/optimize", json={"ratingKey": rk, "mediaVersion": pref, "serverId": server})
 
     def test_make_a_version_follow_it_and_copy_it(self):
         self.prefer("1080")
@@ -2898,6 +2898,7 @@ class OptimizeTest(PlexFixture):
     def test_bad_requests_and_plex_refusing(self):
         for body in ({"ratingKey": "101", "mediaVersion": "2160"}, {"ratingKey": "101", "mediaVersion": "all"},
                      {"ratingKey": "101"}, {"ratingKey": "x", "mediaVersion": "1080"}, {"mediaVersion": "1080"}):
+            body = {**body, "serverId": "srv1"}
             self.assertEqual(self.c.post("/api/optimize", json=body).status_code, 400, body)
         self.fake.optimize_status = 403                                     # e.g. no Plex Pass
         r = self.ask()
@@ -2908,6 +2909,17 @@ class OptimizeTest(PlexFixture):
         self.assertEqual((self.fake.optimize_items, self.fake.conversions), ([], {}))
         self.fake.optimize_status = None
         self.assertEqual(self.ask().json()["optimize"]["state"], "optimizing")   # and works once Plex agrees
+
+    def test_a_page_of_another_server_asks_nothing(self):
+        # rating keys mean something else on another server: the page's server must still be the selected one
+        self.prefer("1080")
+        with self.assertRaises(plexgw.OtherServer):
+            self.gw.optimize("101", "1080", server_id="other")
+        r = self.ask(server="other")
+        self.assertEqual((r.status_code, r.json()["code"]), (409, "other_server"), r.text)
+        r = self.c.post("/api/optimize", json={"ratingKey": "101", "mediaVersion": "1080"})
+        self.assertEqual(r.status_code, 400, r.text)                         # the server is required
+        self.assertEqual(self.fake.optimize_items, [])
 
 
 class StoreIndexTest(unittest.TestCase):
