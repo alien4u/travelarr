@@ -454,7 +454,7 @@ class AppTest(PlexFixture):
         self.assertIn("travelarr", r.text)
         self.assertEqual(r.headers["cache-control"], "no-cache")
         for asset in ("app.js", "style.css"):
-            url = f"/static/{asset}?v={main_mod.VERSION}"
+            url = f"/static/{asset}?v={main_mod.asset_hash(asset)}"   # changes whenever the file does
             self.assertIn(f'"{url}"', r.text)
             self.assertEqual(self.c.get(url).status_code, 200)
 
@@ -2794,6 +2794,182 @@ class VersionTest(PlexFixture):
         r = self.apply(self.HEAT_DIR).json()
         self.assertEqual((r["upgrades"], r["skipped"]), (0, 0))
         self.assertTrue(os.path.isfile(self.m(HEAT)))
+
+
+class OptimizeTest(PlexFixture):
+    """A cap no version fits under: the title page asks Plex to Optimize the video, follows the
+    conversion, and copies the new version once Plex has made it."""
+    HEAT_MP4 = VersionTest.HEAT_MP4
+    movie, read = ResyncTest.movie, ResyncTest.read
+    prefer, pick, queue = VersionTest.prefer, VersionTest.pick, VersionTest.queue
+
+    def setUp(self):
+        super().setUp()
+        self.sign_in_and_connect()
+        self.assertIs(self.c.post("/api/settings", json={"plexOptimize": True}).json()["plexOptimize"], True)
+        self.movie(101).update(res="4k", width=3840, bitrate=40_000)     # Heat: only a 4K original
+
+    def item(self, rk="101", version=None):
+        return self.c.get(f"/api/item/{rk}", params={"mediaVersion": version} if version else None).json()
+
+    def ask(self, rk="101", pref="1080", server="srv1"):
+        return self.c.post("/api/optimize", json={"ratingKey": rk, "mediaVersion": pref, "serverId": server})
+
+    def test_make_a_version_follow_it_and_copy_it(self):
+        self.prefer("1080")
+        d = self.item()
+        self.assertEqual(d["optimize"], {"cap": "1080", "label": "1080p", "state": "available", "progress": None,
+                                         "noVideo": False, "dolbyVision": None})
+        self.assertEqual(self.pick(), ([(1001, HEAT)], 300_000))       # the smallest, above the cap
+
+        r = self.ask()
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(r.json()["optimize"]["state"], "optimizing")
+        [req] = self.fake.optimize_items
+        self.assertEqual((req["rk"], req["title"], req["target"], req["profile"], req["resolution"], req["bitrate"]),
+                         (101, "Heat (1080p, travelarr)", "Custom: Universal TV", "Universal TV", "1920x1080", "12000"))
+        self.assertEqual(self.ask().json()["optimize"]["state"], "optimizing")    # asked once, not twice
+        self.assertEqual(len(self.fake.optimize_items), 1)
+        self.assertEqual(self.item()["optimize"], {"cap": "1080", "label": "1080p", "state": "optimizing",
+                                                   "progress": None, "noVideo": False,
+                                                   "dolbyVision": None})               # queued, not started
+        self.fake.conversions[101]["progress"] = 41.6
+        self.assertEqual(self.item()["optimize"]["progress"], 42)
+
+        self.fake.finish_optimize(101, 1601, 90_000)
+        d = self.item()
+        self.assertIsNone(d["optimize"])
+        self.assertEqual(self.pick(), ([(1601, self.HEAT_MP4)], 90_000))
+        self.assertEqual(self.queue("101")["added"], 1)
+        self.drain()
+        self.assertEqual(self.read(self.HEAT_MP4), self.fake.parts[1601])
+        self.assertFalse(os.path.exists(self.m(HEAT)))
+
+    def test_offered_only_when_every_version_is_above_a_cap(self):
+        for pref in ("all", "original", "smallest", "2160"):
+            self.prefer(pref)
+            self.assertIsNone(self.item()["optimize"], pref)
+        self.prefer("720")
+        self.assertEqual(self.item()["optimize"]["label"], "720p")
+        self.assertIsNone(self.item(version="2160")["optimize"])             # the page's own choice
+        self.assertEqual(self.item(version="sd")["optimize"]["label"], "SD")
+        self.fake.add_version(self.movie(101), 1602, f"{MOVIES}/Heat (1995)/Heat 720.mkv", 60_000,
+                              res="720", width=1280, bitrate=4_000)
+        self.assertIsNone(self.item()["optimize"])                           # a 720p version fits
+        self.assertEqual(self.item(version="sd")["optimize"]["state"], "available")
+        self.assertNotIn("optimize", self.item("200"))                       # a show page offers none
+
+    def test_a_version_plex_made_without_video_is_never_copied(self):
+        # Plex can finish a conversion as complete with only the audio in it (no video stream)
+        self.prefer("1080")
+        self.assertEqual(self.ask().json()["optimize"]["state"], "optimizing")
+        self.fake.finish_optimize(101, 1601, 9_000, res=None, width=None, bitrate=121)
+        d = self.item()
+        self.assertEqual((d["optimize"]["state"], d["optimize"]["noVideo"]), ("available", True))
+        self.assertEqual(self.pick(), ([(1001, HEAT)], 300_000))         # the original, not the audio
+        self.assertEqual(self.pick(version="smallest"), ([(1001, HEAT)], 300_000))
+        self.assertEqual(self.pick(version="all"), ([(1001, HEAT)], 300_000))     # not with every version either
+        self.assertEqual(d["versions"], 1)                                         # no version choice for it
+        self.assertEqual(self.c.get("/api/item/101", params={"mediaVersion": "all"}).json()["size"], 300_000)
+        self.assertEqual(self.queue("101")["bytes"], 300_000)
+
+    def test_the_source_dolby_vision_profile_is_reported(self):
+        self.prefer("1080")
+        self.movie(101)["dovi"] = 7                     # a UHD Blu-ray remux: Plex's conversions lose the video
+        self.assertEqual(self.item()["optimize"]["dolbyVision"], 7)
+        self.movie(101)["dovi"] = 8
+        self.assertEqual(self.item()["optimize"]["dolbyVision"], 8)
+        self.assertEqual(self.ask().json()["optimize"]["state"], "optimizing")   # only a warning: still asked
+
+    def test_an_episode_and_lower_caps(self):
+        ep = next(e for e in self.fake.episodes if e["rk"] == 202)
+        ep.update(res="1080", width=1920, bitrate=10_000)
+        r = self.ask("202", "sd")
+        self.assertEqual(r.json()["optimize"]["state"], "optimizing", r.text)
+        [req] = self.fake.optimize_items
+        self.assertEqual((req["title"], req["resolution"], req["bitrate"]),
+                         ("Show A S01E02 (SD, travelarr)", "720x480", "1500"))
+
+    def test_nothing_to_make(self):
+        self.movie(101).update(res="1080", width=1920)
+        r = self.ask()
+        self.assertEqual((r.status_code, r.json()["optimize"]), (200, None))
+        self.assertEqual(self.fake.optimize_items, [])
+
+    def test_bad_requests_and_plex_refusing(self):
+        for body in ({"ratingKey": "101", "mediaVersion": "2160"}, {"ratingKey": "101", "mediaVersion": "all"},
+                     {"ratingKey": "101"}, {"ratingKey": "x", "mediaVersion": "1080"}, {"mediaVersion": "1080"}):
+            body = {**body, "serverId": "srv1"}
+            self.assertEqual(self.c.post("/api/optimize", json=body).status_code, 400, body)
+        self.fake.optimize_status = 403                                     # e.g. no Plex Pass
+        r = self.ask()
+        self.assertEqual((r.status_code, r.json()["code"]), (502, "plex_refused"), r.text)
+        self.fake.optimize_status = 401
+        r = self.ask()
+        self.assertEqual((r.status_code, r.json()["code"]), (403, "plex_refused"), r.text)
+        self.assertEqual((self.fake.optimize_items, self.fake.conversions), ([], {}))
+        self.fake.optimize_status = None
+        self.assertEqual(self.ask().json()["optimize"]["state"], "optimizing")   # and works once Plex agrees
+
+    def test_a_page_of_another_server_asks_nothing(self):
+        # rating keys mean something else on another server: the page's server must still be the selected one
+        self.prefer("1080")
+        with self.assertRaises(plexgw.OtherServer):
+            self.gw.optimize("101", "1080", server_id="other")
+        r = self.ask(server="other")
+        self.assertEqual((r.status_code, r.json()["code"]), (409, "other_server"), r.text)
+        r = self.c.post("/api/optimize", json={"ratingKey": "101", "mediaVersion": "1080"})
+        self.assertEqual(r.status_code, 400, r.text)                         # the server is required
+        self.assertEqual(self.fake.optimize_items, [])
+
+
+class OptimizeSettingTest(PlexFixture):
+    """Offering Plex's Optimize is opt-in: until it is turned on, travelarr only reads from Plex."""
+    movie = ResyncTest.movie
+    prefer, pick = VersionTest.prefer, VersionTest.pick
+
+    def setUp(self):
+        super().setUp()
+        self.sign_in_and_connect()
+        self.movie(101).update(res="4k", width=3840, bitrate=40_000)     # Heat: only a 4K original
+        self.prefer("1080")
+
+    def offer(self, value):
+        return self.c.post("/api/settings", json={"plexOptimize": value}).json()["plexOptimize"]
+
+    def state(self):
+        return self.c.get("/api/item/101").json()["optimize"]
+
+    def ask(self):
+        return self.c.post("/api/optimize", json={"ratingKey": "101", "mediaVersion": "1080", "serverId": "srv1"})
+
+    def test_off_by_default(self):
+        self.assertIs(self.c.get("/api/state").json()["plexOptimize"], False)
+        self.assertIsNone(self.state())
+        r = self.ask()
+        self.assertEqual((r.status_code, r.json()["code"]), (403, "optimize_off"), r.text)
+        self.assertEqual((self.fake.optimize_items, self.fake.conversions), ([], {}))
+        self.assertEqual([r for r in self.fake.requests if "/playQueues" in r[1] or "/playlists" in r[1]], [])
+
+    def test_turned_on_and_off_again(self):
+        self.assertIs(self.offer(True), True)
+        self.assertEqual(self.state()["state"], "available")
+        self.assertIs(self.c.get("/api/state").json()["plexOptimize"], True)
+        self.assertIs(self.offer(False), False)
+        self.assertIsNone(self.state())
+        self.assertEqual(self.ask().status_code, 403)
+        self.assertEqual(self.fake.optimize_items, [])
+
+    def test_only_true_turns_it_on(self):
+        for value in ("false", "true", 1, None):
+            self.assertIs(self.offer(value), False, value)
+
+    def test_a_version_plex_made_without_video_is_never_copied_with_the_setting_off(self):
+        file = f"{MOVIES}/Heat (1995)/Plex Versions/Optimized for TV/Heat (1995).mp4"
+        self.fake.add_version(self.movie(101), 1601, file, 9_000, bitrate=121, optimized=True)
+        self.assertEqual(self.pick(), ([(1001, HEAT)], 300_000))
+        self.assertEqual(self.pick(version="smallest"), ([(1001, HEAT)], 300_000))
+        self.assertEqual(self.pick(version="all"), ([(1001, HEAT)], 300_000))
 
 
 class StoreIndexTest(unittest.TestCase):

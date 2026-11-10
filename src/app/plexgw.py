@@ -19,6 +19,7 @@ import requests
 from plexapi.exceptions import Unauthorized
 from plexapi.myplex import MyPlexAccount
 from plexapi.server import PlexServer
+from plexapi.sync import VIDEO_QUALITY_1_5_MBPS_480p, VIDEO_QUALITY_4_MBPS_720p, VIDEO_QUALITY_12_MBPS_1080p
 from requests.certs import where as ca_bundle
 
 from .paths import dest_rel_for, in_versions, unversioned, version_rel
@@ -228,14 +229,35 @@ def _lines(media) -> int | None:
     return next((lines for w, lines in ((3200, 2160), (2200, 1440), (1600, 1080), (1000, 720)) if width >= w), 480)
 
 
+def _no_video(media) -> bool:
+    """A version Plex optimized without a video stream: a failed conversion Plex
+    still lists as complete (seen on a 4K HEVC source), audio only."""
+    return _optimized(media) and not any(getattr(media, a, None) for a in ("videoCodec", "videoResolution", "width"))
+
+
+def _dolby_vision(media) -> int | None:
+    """The Dolby Vision profile of a version's video, None without. Plex's Optimize
+    made an audio-only version of a profile 7 source (UHD Blu-ray's dual layer)."""
+    for p in media.parts:
+        for s in p.videoStreams():
+            if getattr(s, "DOVIPresent", False):
+                return getattr(s, "DOVIProfile", None)
+    return None
+
+
+def copyable(video) -> list:
+    """The versions a copy can take: with files, and not one Plex optimized without video."""
+    return [m for m in video.media if m.parts and not _no_video(m)]
+
+
 def pick_media(video, pref: str):
     """The version of video to copy; None when Plex has no file for it.
     'original': the largest version Plex did not optimize (what a single-version
     item always was); 'smallest': the fewest bytes; a cap ('2160' ... 'sd'): the
     highest resolution at or under it, then a version Plex did not optimize (an
     'Original Quality' optimized copy can be bigger than the original), then
-    bitrate; else the smallest."""
-    media = [m for m in video.media if m.parts]
+    bitrate; else the smallest. Never an optimized version without video."""
+    media = copyable(video)
     if len(media) <= 1:
         return media[0] if media else None
     if pref == "smallest":
@@ -247,6 +269,19 @@ def pick_media(video, pref: str):
             return min(media, key=_size)
         return max(fit, key=lambda m: (_lines(m), not _optimized(m), m.bitrate or 0, _size(m)))
     return max([m for m in media if not _optimized(m)] or media, key=_size)
+
+
+# A cap no version fits under can be met by asking Plex to Optimize the video:
+# Plex Pass transcodes it on the server into a new version beside the original,
+# which the cap then picks. Plex's "Universal TV" profile at these qualities.
+OPTIMIZE = {"1080": (VIDEO_QUALITY_12_MBPS_1080p, "1080p"), "720": (VIDEO_QUALITY_4_MBPS_720p, "720p"),
+            "sd": (VIDEO_QUALITY_1_5_MBPS_480p, "SD")}
+
+
+def above_cap(video, pref: str) -> bool:
+    """The version a cap picks is above it: no version fits."""
+    m = pick_media(video, pref) if pref in CAPS else None
+    return m is not None and (_lines(m) or CAPS[pref] + 1) > CAPS[pref]
 
 
 def _original(video, but=None):
@@ -274,7 +309,7 @@ def chosen_parts(video, sec, pref: str) -> list[tuple]:
     """(part, dest_rel) for each file of the version of video to copy.
     'all': every file, at Plex's paths."""
     if pref == "all":
-        return [(p, dest_rel_for(p.file, sec.locations, sec.title)) for p in video.iterParts()]
+        return [(p, dest_rel_for(p.file, sec.locations, sec.title)) for m in copyable(video) for p in m.parts]
     m = pick_media(video, pref)
     return _alone(video, m, sec) if m else []
 
@@ -291,7 +326,7 @@ def other_versions(video, sec, picked: set) -> list[tuple]:
 
 
 def version_count(video) -> int:
-    return sum(1 for m in video.media if m.parts)
+    return len(copyable(video))
 
 
 class PlexGateway:
@@ -334,6 +369,10 @@ class PlexGateway:
         """`override`: a choice for one transfer instead of the setting."""
         pref = override or self.store.get("media_version")
         return pref if pref in VERSION_PREFS else "all"
+
+    def optimize_on(self) -> bool:
+        """The user chose to offer Plex's Optimize (Settings). Off, travelarr only reads from Plex."""
+        return self.store.get("plex_optimize", False) is True
 
     def start_login(self) -> str:
         r = self.session.post(f"{self.plex_tv}/api/v2/pins", params={"strong": "true"},
@@ -587,7 +626,7 @@ class PlexGateway:
             d["watched"] = bool(getattr(it, "viewCount", 0))
             try:
                 pref = pref or self.version_pref()  # the size of what a copy would take
-                copied = it.media if pref == "all" else [m for m in [pick_media(it, pref)] if m]
+                copied = copyable(it) if pref == "all" else [m for m in [pick_media(it, pref)] if m]
                 d["size"] = sum(_size(m) for m in copied)
             except Exception:  # noqa: BLE001
                 d["size"] = None
@@ -652,6 +691,7 @@ class PlexGateway:
             d["parts"] = [self._part(p, dest) for p, dest in chosen_parts(it, sec, pref)]
             d["size"] = sum(p["size"] for p in d["parts"])
             d["versions"] = version_count(it)
+            d["optimize"] = self.optimize_state(it, pref)
             if it.type == "episode":
                 d["showKey"] = str(it.grandparentRatingKey)
         if it.type == "show":
@@ -671,6 +711,49 @@ class PlexGateway:
             d["seasons"] = [seasons[k] for k in sorted(seasons)]
             d["size"] = sum(e["size"] for s in d["seasons"] for e in s["episodes"])
         return d
+
+    def optimize_state(self, it, pref: str) -> dict | None:
+        """For a movie or episode a cap picks a version above it: whether Plex is
+        making a version (state 'optimizing', progress 0-100 once it started) or can
+        be asked to ('available'). None when nothing needs making or the setting is off."""
+        if (not self.optimize_on() or pref not in OPTIMIZE or it.type not in ("movie", "episode")
+                or not above_cap(it, pref)):
+            return None
+        d = {"cap": pref, "label": OPTIMIZE[pref][1], "state": "available", "progress": None,
+             "noVideo": any(m.parts and _no_video(m) for m in it.media),   # Plex made one before, without video
+             "dolbyVision": None}
+        src = _original(it) or pick_media(it, pref)
+        try:
+            d["dolbyVision"] = _dolby_vision(src)
+        except Exception as e:  # noqa: BLE001 - only a warning depends on it
+            log.info("the video streams of %s: %s", it.title, e)
+        srv, rk = it._server, str(it.ratingKey)
+        try:
+            if any(str(c.ratingKey) == rk for c in srv.conversions()):
+                d["state"] = "optimizing"
+                job = next((j for j in srv.currentBackgroundProcess() if str(j.ratingKey) == rk), None)
+                if job is not None and job.progress is not None:
+                    d["progress"] = round(float(job.progress))
+        except Exception as e:  # noqa: BLE001 - the page still offers to ask
+            log.info("Plex's conversion queue: %s", e)
+        return d
+
+    def optimize(self, rating_key: str, pref: str, server_id: str) -> dict | None:
+        """Ask Plex to Optimize a movie or episode to the cap pref (once: not when
+        it is already being made, or a version already fits). `server_id` is the
+        server of the page that asked: raises OtherServer when another is selected."""
+        srv, sid = self.snapshot()
+        if sid != server_id:  # rating keys mean something else on another server
+            raise OtherServer("the selected Plex server changed")
+        it = srv.fetchItem(int(rating_key))
+        st = self.optimize_state(it, pref)
+        if st is None or st["state"] != "available":
+            return st
+        name = it.title if it.type == "movie" else f"{it.grandparentTitle} {it.seasonEpisode.upper()}"
+        it.optimize(title=f"{name} ({OPTIMIZE[pref][1]}, travelarr)", deviceProfile="Universal TV",
+                    videoQuality=OPTIMIZE[pref][0])
+        log.info("asked Plex to make a %s version of %s", OPTIMIZE[pref][1], name)
+        return self.optimize_state(it, pref)
 
     def plan(self, keys: list[str], mode: str = "unwatched", source: str = "browse",
              only: set[str] | None = None, server_id: str | None = None,

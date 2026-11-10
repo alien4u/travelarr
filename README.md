@@ -132,7 +132,11 @@ itself. **Settings** chooses what travelarr copies:
 Titles with only one version are copied as usual, whatever the choice.
 
 - To carry 1080p copies of 4K films, set a maximum of 1080p and use **Optimize** in Plex to make those copies first.
-  travelarr only copies files Plex already has; it never transcodes.
+  travelarr only copies files Plex already has; it never transcodes anything itself.
+- **Offer Plex Optimize on title pages** (in **Settings**, off by default) adds a **Make 1080p version** button to a
+  title page when no version fits the maximum. Clicking it asks your Plex server to create that version with Optimize,
+  which needs Plex Pass. The conversion uses the Plex server's CPU or GPU, and the new file stays in your Plex library
+  until you delete it in Plex (Settings > Optimized Versions). With this off, travelarr only reads from Plex.
 - A title page with several versions has its own choice, for that one copy.
 - Sizes in lists, title pages and the Queue are the size of what would be copied.
 - A version copied alone lands in the normal folder, never in `Plex Versions`. An optimized one takes the original's
@@ -175,7 +179,7 @@ travelarr is a personal project, shared as is. Bug reports are welcome in
 
 ## Credits
 
-Co-Authored with Claude Code. Version choice and the arm64 image contributed by
+Co-Authored with Claude Code. Version choice, Plex Optimize from title pages and the arm64 image contributed by
 [Matt Cox](https://github.com/mgscox).
 
 ## License

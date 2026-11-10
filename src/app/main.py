@@ -17,22 +17,27 @@ import requests
 from fastapi import Body, FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
-from plexapi.exceptions import NotFound, Unauthorized
+from plexapi.exceptions import BadRequest, NotFound, Unauthorized
 
 from . import auth as auth_mod
 from . import resync
 from .paths import (ListingChanged, PathError, abs_path, delete_entry, list_dir, local_entry, real_rel,
                     touches)
-from .plexgw import VERSION_PREFS, NotReady, OtherServer, PlexGateway
+from .plexgw import OPTIMIZE, VERSION_PREFS, NotReady, OtherServer, PlexGateway
 from .resync import ResyncError
 from .store import Store, label, now
 from .worker import CHANGED, Downloader
 
-VERSION = "3.6.0"
+VERSION = "3.7.0"
 STATIC = os.path.join(os.path.dirname(__file__), "static")
 LOCAL_NOTE = "deleted in Local Files"
 MAX_QUEUE_KEYS = 200  # bounds the Plex requests one queue call makes
 log = logging.getLogger("travelarr")
+
+
+def asset_hash(name: str) -> str:
+    with open(os.path.join(STATIC, name), "rb") as fh:
+        return hashlib.sha256(fh.read()).hexdigest()[:12]
 
 
 def device_name() -> str:
@@ -301,6 +306,7 @@ def create_app(data_dir: str | None = None, media_root: str | None = None,
             "paused": bool(store.get("paused", False)),
             "reserveGb": store.get("reserve_gb", 10),
             "mediaVersion": gw.version_pref(),
+            "plexOptimize": gw.optimize_on(),
             "mediaRoot": media_root,
             "disk": disk(),
             "current": dl.snapshot(),
@@ -355,6 +361,8 @@ def create_app(data_dir: str | None = None, media_root: str | None = None,
             if body["mediaVersion"] not in VERSION_PREFS:
                 return err(400, f"mediaVersion must be one of {', '.join(VERSION_PREFS)}", "bad_request")
             store.set("media_version", body["mediaVersion"])
+        if "plexOptimize" in body:
+            store.set("plex_optimize", body["plexOptimize"] is True)
         if "paused" in body:
             store.set("paused", bool(body["paused"]))
             dl.wake()
@@ -396,6 +404,27 @@ def create_app(data_dir: str | None = None, media_root: str | None = None,
         d["history"] = jobs[-50:]
         d["nasFolder"] = resync.title_folder(media_root, d)
         return d
+
+    @app.post("/api/optimize")
+    def optimize(body: dict = Body(...)):
+        """Ask Plex to make a version of a movie or episode at a cap (Plex's Optimize)."""
+        if not gw.optimize_on():
+            return err(403, "Turn on Offer Plex Optimize on title pages in Settings first", "optimize_off")
+        rk, pref, sid =str(body.get("ratingKey") or ""), body.get("mediaVersion"), body.get("serverId")
+        if not rk.isdigit():
+            return err(400, "ratingKey is required", "bad_request")
+        if not sid or not isinstance(sid, str):
+            return err(400, "serverId is required", "bad_request")
+        if pref not in OPTIMIZE:
+            return err(400, f"mediaVersion must be one of {', '.join(OPTIMIZE)}", "bad_request")
+        try:
+            return {"optimize": gw.optimize(rk, pref, sid)}
+        except OtherServer:
+            return err(409, "The Plex server changed; reload and try again", "other_server")
+        except Unauthorized:
+            return err(403, "Plex refused: only the server's owner can make versions", "plex_refused")
+        except BadRequest as e:
+            return err(502, f"Plex refused to make a version (Optimize needs Plex Pass): {e}", "plex_refused")
 
     @app.post("/api/queue")
     def queue(body: dict = Body(...)):
@@ -619,8 +648,9 @@ def create_app(data_dir: str | None = None, media_root: str | None = None,
 
     app.mount("/static", StaticFiles(directory=STATIC), name="static")
     with open(os.path.join(STATIC, "index.html"), encoding="utf-8") as fh:
-        # a new version is a new URL, so browsers never run an old app.js after an update
-        page = re.sub(r'"(/static/[\w.-]+\.(?:js|css))"', rf'"\1?v={VERSION}"', fh.read())
+        # changed contents are a new URL (not only a new version: a build between releases
+        # changes them too), so browsers never run an old app.js after an update
+        page = re.sub(r'"(/static/([\w.-]+\.(?:js|css)))"', lambda m: f'"{m[1]}?v={asset_hash(m[2])}"', fh.read())
 
     @app.get("/")
     def index():
