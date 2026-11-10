@@ -2806,6 +2806,7 @@ class OptimizeTest(PlexFixture):
     def setUp(self):
         super().setUp()
         self.sign_in_and_connect()
+        self.assertIs(self.c.post("/api/settings", json={"plexOptimize": True}).json()["plexOptimize"], True)
         self.movie(101).update(res="4k", width=3840, bitrate=40_000)     # Heat: only a 4K original
 
     def item(self, rk="101", version=None):
@@ -2920,6 +2921,55 @@ class OptimizeTest(PlexFixture):
         r = self.c.post("/api/optimize", json={"ratingKey": "101", "mediaVersion": "1080"})
         self.assertEqual(r.status_code, 400, r.text)                         # the server is required
         self.assertEqual(self.fake.optimize_items, [])
+
+
+class OptimizeSettingTest(PlexFixture):
+    """Offering Plex's Optimize is opt-in: until it is turned on, travelarr only reads from Plex."""
+    movie = ResyncTest.movie
+    prefer, pick = VersionTest.prefer, VersionTest.pick
+
+    def setUp(self):
+        super().setUp()
+        self.sign_in_and_connect()
+        self.movie(101).update(res="4k", width=3840, bitrate=40_000)     # Heat: only a 4K original
+        self.prefer("1080")
+
+    def offer(self, value):
+        return self.c.post("/api/settings", json={"plexOptimize": value}).json()["plexOptimize"]
+
+    def state(self):
+        return self.c.get("/api/item/101").json()["optimize"]
+
+    def ask(self):
+        return self.c.post("/api/optimize", json={"ratingKey": "101", "mediaVersion": "1080", "serverId": "srv1"})
+
+    def test_off_by_default(self):
+        self.assertIs(self.c.get("/api/state").json()["plexOptimize"], False)
+        self.assertIsNone(self.state())
+        r = self.ask()
+        self.assertEqual((r.status_code, r.json()["code"]), (403, "optimize_off"), r.text)
+        self.assertEqual((self.fake.optimize_items, self.fake.conversions), ([], {}))
+        self.assertEqual([r for r in self.fake.requests if "/playQueues" in r[1] or "/playlists" in r[1]], [])
+
+    def test_turned_on_and_off_again(self):
+        self.assertIs(self.offer(True), True)
+        self.assertEqual(self.state()["state"], "available")
+        self.assertIs(self.c.get("/api/state").json()["plexOptimize"], True)
+        self.assertIs(self.offer(False), False)
+        self.assertIsNone(self.state())
+        self.assertEqual(self.ask().status_code, 403)
+        self.assertEqual(self.fake.optimize_items, [])
+
+    def test_only_true_turns_it_on(self):
+        for value in ("false", "true", 1, None):
+            self.assertIs(self.offer(value), False, value)
+
+    def test_a_version_plex_made_without_video_is_never_copied_with_the_setting_off(self):
+        file = f"{MOVIES}/Heat (1995)/Plex Versions/Optimized for TV/Heat (1995).mp4"
+        self.fake.add_version(self.movie(101), 1601, file, 9_000, bitrate=121, optimized=True)
+        self.assertEqual(self.pick(), ([(1001, HEAT)], 300_000))
+        self.assertEqual(self.pick(version="smallest"), ([(1001, HEAT)], 300_000))
+        self.assertEqual(self.pick(version="all"), ([(1001, HEAT)], 300_000))
 
 
 class StoreIndexTest(unittest.TestCase):

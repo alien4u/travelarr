@@ -28,7 +28,7 @@ from .resync import ResyncError
 from .store import Store, label, now
 from .worker import CHANGED, Downloader
 
-VERSION = "3.6.0"
+VERSION = "3.7.0"
 STATIC = os.path.join(os.path.dirname(__file__), "static")
 LOCAL_NOTE = "deleted in Local Files"
 MAX_QUEUE_KEYS = 200  # bounds the Plex requests one queue call makes
@@ -306,6 +306,7 @@ def create_app(data_dir: str | None = None, media_root: str | None = None,
             "paused": bool(store.get("paused", False)),
             "reserveGb": store.get("reserve_gb", 10),
             "mediaVersion": gw.version_pref(),
+            "plexOptimize": gw.optimize_on(),
             "mediaRoot": media_root,
             "disk": disk(),
             "current": dl.snapshot(),
@@ -360,6 +361,8 @@ def create_app(data_dir: str | None = None, media_root: str | None = None,
             if body["mediaVersion"] not in VERSION_PREFS:
                 return err(400, f"mediaVersion must be one of {', '.join(VERSION_PREFS)}", "bad_request")
             store.set("media_version", body["mediaVersion"])
+        if "plexOptimize" in body:
+            store.set("plex_optimize", body["plexOptimize"] is True)
         if "paused" in body:
             store.set("paused", bool(body["paused"]))
             dl.wake()
@@ -405,7 +408,9 @@ def create_app(data_dir: str | None = None, media_root: str | None = None,
     @app.post("/api/optimize")
     def optimize(body: dict = Body(...)):
         """Ask Plex to make a version of a movie or episode at a cap (Plex's Optimize)."""
-        rk, pref, sid = str(body.get("ratingKey") or ""), body.get("mediaVersion"), body.get("serverId")
+        if not gw.optimize_on():
+            return err(403, "Turn on Offer Plex Optimize on title pages in Settings first", "optimize_off")
+        rk, pref, sid =str(body.get("ratingKey") or ""), body.get("mediaVersion"), body.get("serverId")
         if not rk.isdigit():
             return err(400, "ratingKey is required", "bad_request")
         if not sid or not isinstance(sid, str):

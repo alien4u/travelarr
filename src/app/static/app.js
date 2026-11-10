@@ -1102,6 +1102,10 @@ function renderSettings() {
   const version = h('select', {
     onchange: async () => { await post('/api/settings', { mediaVersion: version.value }); toast('Saved'); refreshState(); },
   }, ...MEDIA_VERSIONS.map(([v, text]) => h('option', { value: v, selected: v === st.mediaVersion }, text)));
+  const plexOptimize = h('input', {
+    type: 'checkbox', checked: !!st.plexOptimize,
+    onchange: async () => { await post('/api/settings', { plexOptimize: plexOptimize.checked }); toast('Saved'); refreshState(); },
+  });
   const connLine = st.conn
     ? `Connected via ${st.conn.kind}: ${st.conn.url}`
     : st.connError ? `Not connected: ${st.connError}` : 'Not connected yet';
@@ -1140,8 +1144,14 @@ function renderSettings() {
         h('p', { class: 'muted small' },
           'Any choice but All versions copies one version of each movie or episode; with a maximum, the best one ',
           'at or under it, else the smallest. Use Plex\'s Optimize to make smaller versions; one is saved under ',
-          'the original\'s name, not in a Plex Versions folder. A title page can choose differently for one copy, ',
-          'and when every version is above the maximum it offers to have Plex make one (Optimize needs Plex Pass).'))),
+          'the original\'s name, not in a Plex Versions folder. A title page can choose differently for one copy.')),
+      h('div', { class: 'field' }, h('label', { class: 'check' }, plexOptimize, 'Offer Plex Optimize on title pages'),
+        h('p', { class: 'muted small' },
+          'When no version of a title fits your maximum, its page shows a "Make 1080p version" button. Clicking it ',
+          'asks your Plex server to create that version with Optimize, which needs Plex Pass. The conversion uses the ',
+          'Plex server\'s CPU or GPU, and the new file stays in your Plex library until you delete it in Plex ',
+          '(Settings > Optimized Versions). travelarr then copies it like any other version. With this off, ',
+          'travelarr only reads from Plex.'))),
     h('div', { class: 'panel' }, h('h2', {}, 'Storage'),
       h('p', {}, `Device name: ${st.device}`,
         h('span', { class: 'muted small' }, ' (the Unraid server name or host name; set TRAVELARR_NAME to change it)')),

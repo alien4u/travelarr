@@ -370,6 +370,10 @@ class PlexGateway:
         pref = override or self.store.get("media_version")
         return pref if pref in VERSION_PREFS else "all"
 
+    def optimize_on(self) -> bool:
+        """The user chose to offer Plex's Optimize (Settings). Off, travelarr only reads from Plex."""
+        return self.store.get("plex_optimize", False) is True
+
     def start_login(self) -> str:
         r = self.session.post(f"{self.plex_tv}/api/v2/pins", params={"strong": "true"},
                               headers=self._headers(), timeout=20)
@@ -711,8 +715,9 @@ class PlexGateway:
     def optimize_state(self, it, pref: str) -> dict | None:
         """For a movie or episode a cap picks a version above it: whether Plex is
         making a version (state 'optimizing', progress 0-100 once it started) or can
-        be asked to ('available'). None when nothing needs making."""
-        if pref not in OPTIMIZE or it.type not in ("movie", "episode") or not above_cap(it, pref):
+        be asked to ('available'). None when nothing needs making or the setting is off."""
+        if (not self.optimize_on() or pref not in OPTIMIZE or it.type not in ("movie", "episode")
+                or not above_cap(it, pref)):
             return None
         d = {"cap": pref, "label": OPTIMIZE[pref][1], "state": "available", "progress": None,
              "noVideo": any(m.parts and _no_video(m) for m in it.media),   # Plex made one before, without video
